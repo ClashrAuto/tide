@@ -1927,6 +1927,94 @@ func TestSuccessfulHandshakeSendsNothingToCover(t *testing.T) {
 	}
 }
 
+// QUIC/h3 路径也必须填充，且填充预算只花在判决窗口里。
+//
+// ★ QUIC 路径**恒为 bare**（服务端对每条 QUIC 连接都置 acceptModeBare）。
+// 而 newPath 曾经在 bare 分支里把填充整个关掉，理由是"要插填充就得在用户态碰载荷，
+// 那 splice 就没了"——那个理由已经不存在（§12.3 定稿：kTLS + splice 在多路复用协议里
+// 根本做不到）。一个为已被否决的优化让路的开关，就那么一直开着。
+//
+// 后果：QUIC/h3 路径既没有长度填充、也没有时序心跳，而 §8.1 恰恰把**批量**流往
+// QUIC 上偏——承载字节最多的那条路，防护是零。学界对 QUIC 的网站指纹攻击
+// 只要 40 个包就能到 95% 准确率，包长是主要特征之一。
+//
+// 这条测试守两头：判决窗口内**要**填充，批量阶段**不**填充（否则吞吐白白变差）。
+func TestQUICPathIsPaddedInDecisionWindowOnly(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var qp *path
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && qp == nil {
+		for _, p := range sess.pathsSnapshot() {
+			if p.kind == "quic" {
+				qp = p
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if qp == nil {
+		t.Skip("QUIC 路径没起来")
+	}
+
+	send := func(n, times int) uint64 {
+		t.Helper()
+		c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.(*Stream).pathID.Store(qp.id)
+		msg := bytes.Repeat([]byte("q"), n)
+		buf := make([]byte, n)
+		before := qp.txBytes.Load()
+		for i := 0; i < times; i++ {
+			if _, err := c.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			c.SetReadDeadline(time.Now().Add(10 * time.Second))
+			if _, err := io.ReadFull(c, buf); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return qp.txBytes.Load() - before
+	}
+
+	// 判决窗口：100 字节的小包必须被填到 HTTPS 量级，也就是远超载荷本身。
+	if qp.pad.Phase() != PhaseDecision {
+		t.Skipf("路径已经不在判决窗口了（%s），测不到", qp.pad.Phase())
+	}
+	grew := send(100, 20)
+	if raw := uint64(20 * (100 + 8)); grew < raw*4 {
+		t.Fatalf("判决窗口内 QUIC 路径只发出 %d 字节（裸载荷约 %d）—— 帧没有被填充，"+
+			"而 §8.1 把批量流往 QUIC 上偏，等于最重要的那条路裸奔", grew, raw)
+	}
+
+	// 把预算烧完，进入批量阶段。
+	for qp.pad.Phase() != PhaseBulk {
+		send(8192, 8)
+	}
+	// 批量阶段：填充必须归零，否则这个修复就是拿吞吐换来的。
+	big := send(8192, 16)
+	if raw := uint64(16 * 8192); big > raw+raw/4 {
+		t.Fatalf("批量阶段仍在填充：发 %d KiB 载荷用掉了 %d KiB —— "+
+			"填充预算本该只花在判决窗口", raw/1024, big/1024)
+	}
+	t.Logf("判决窗口 20×100B → %d 字节；批量阶段 16×8KiB → %d 字节（载荷 %d）",
+		grew, big, 16*8192)
+}
+
 // UDP 关联在开了 QUIC 路径的会话上也必须能通。
 //
 // ★ 这条专门守 spec §12.8 的回归：DATAGRAM 改走 RFC 9221 的 QUIC 数据报之后，

@@ -26,7 +26,6 @@ const (
 	PhaseDecision PaddingPhase = iota // 判决窗口：每帧填到采样目标长度
 	PhaseDecay                        // 衰减：填充概率线性降到 0
 	PhaseBulk                         // 批量：不填充
-	PhaseOff                          // 填充被关闭（bare 模式：用户态不碰载荷）
 )
 
 func (p PaddingPhase) String() string {
@@ -35,8 +34,6 @@ func (p PaddingPhase) String() string {
 		return "decision"
 	case PhaseDecay:
 		return "decay"
-	case PhaseOff:
-		return "off"
 	}
 	return "bulk"
 }
@@ -84,9 +81,6 @@ type paddingScheduler struct {
 	bytes  uint64
 	frames uint64
 	rng    *rand.Rand
-	// disabled 供 bare + kTLS 直通路径关闭填充：那条路径上用户态不碰载荷，
-	// 插不进填充，硬要插就得放弃 splice()。
-	disabled bool
 }
 
 func newPaddingScheduler() *paddingScheduler {
@@ -117,9 +111,6 @@ func (p *paddingScheduler) phase() PaddingPhase {
 func (p *paddingScheduler) Phase() PaddingPhase {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.disabled {
-		return PhaseOff
-	}
 	return p.phase()
 }
 
@@ -129,9 +120,6 @@ func (p *paddingScheduler) padFor(streamID uint64, bodyLen int) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.disabled {
-		return 0
-	}
 	wireLen := frameOverhead(streamID, bodyLen) + bodyLen
 	pad := 0
 	switch p.phase() {
@@ -201,7 +189,7 @@ func (p *paddingScheduler) sampleTarget() uint32 {
 func (p *paddingScheduler) maybeHeartbeat() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.disabled || p.phase() != PhaseDecision {
+	if p.phase() != PhaseDecision {
 		return false
 	}
 	return p.rng.Float64() <= 0.35
@@ -261,10 +249,4 @@ func cryptoIntn(n int) int {
 		return n / 2
 	}
 	return int(binary.BigEndian.Uint64(b[:]) % uint64(n))
-}
-
-func (p *paddingScheduler) disable() {
-	p.mu.Lock()
-	p.disabled = true
-	p.mu.Unlock()
 }

@@ -138,9 +138,17 @@ func (m *quicMux) write(t FrameType, flags uint8, sid uint64, payload []byte) er
 	if err != nil {
 		return err
 	}
-	// bare 内层：不加密、不填充，一帧就是一次 Write。quic-go 内部会攒包，
+	// bare 内层：不加密，一帧就是一次 Write。quic-go 内部会攒包，
 	// 这里再攒一层只会增加延迟。
-	buf := AppendFrame(nil, t, flags, sid, payload, 0)
+	//
+	// ★ 但**要填充**。这里曾经硬写 pad=0，注释把"不加密"和"不填充"当成一回事——
+	// 它们不是一回事（见 newPath 里的说明）。QUIC 路径恒为 bare，于是这一行让
+	// 每条 QUIC 数据流的帧全程裸奔，而 §8.1 又把批量流往 QUIC 上偏。
+	// 学界对 QUIC 的网站指纹攻击只要 40 个包就能到 95% 准确率，包长是主要特征之一。
+	//
+	// 填充预算仍然只花在判决窗口（前 64 KiB / 100 帧），批量阶段自动归零，
+	// 所以吞吐关键路径上一个字节都不多花。
+	buf := AppendFrame(nil, t, flags, sid, payload, m.path.pad.padFor(sid, len(payload)))
 	q.mu.Lock()
 	_, err = q.s.Write(buf)
 	q.mu.Unlock()

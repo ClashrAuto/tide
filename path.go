@@ -142,11 +142,20 @@ func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey
 		}
 		p.sealer = sl
 		src = op
-	} else {
-		// bare 模式下用户态不做任何 AEAD，这正是 kTLS/splice 能生效的前提；
-		// 填充也随之关闭——要插填充就得在用户态碰载荷，那 splice 就没了。
-		p.pad.disable()
 	}
+	// ★ bare **只**表示"用户态不做 AEAD"（外层信道已经提供了），它与要不要填充无关。
+	//
+	// 这里曾经在 bare 分支里 p.pad.disable()，理由写的是"要插填充就得在用户态碰载荷，
+	// 那 splice 就没了"。那个理由已经**不存在**：§12.3 定稿说 kTLS + splice 在本协议里
+	// 根本做不到（多路复用必须解帧，解帧就必须把数据读进用户态），与 kTLS 能不能用无关。
+	// 一个为已被否决的优化让路的开关，就这么一直开着。
+	//
+	// 后果不小：QUIC/h3 路径**恒为 bare**（服务端对每条 QUIC 连接都置 acceptModeBare），
+	// 于是这些路径既没有长度填充、也没有时序心跳（Phase() 返回 PhaseOff，
+	// heartbeatLoop 一进去就退出）。而 §8.1 恰恰把**批量**流往 QUIC 上偏——
+	// 承载字节最多的那条路，防护是零。
+	//
+	// 代价可以忽略：填充预算本来就只花在判决窗口（前 64 KiB / 100 帧），之后自动归零。
 	// 留一份开头字节，解帧失败时能看清到底收到了什么（见 peekReader）。
 	pk := newPeekReader(src, 48)
 	p.peek = pk
