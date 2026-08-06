@@ -2709,6 +2709,131 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 单用户的会话数必须有上界
+// ---------------------------------------------------------------------------
+
+func serverSessionsFor(srv *Server, user [16]byte) int {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	n := 0
+	for _, ss := range srv.sessions {
+		if ss.user == user {
+			n++
+		}
+	}
+	return n
+}
+
+// 会话是这个协议里**唯一没有上界**的那一级。路径有（maxPathsPerSession）、
+// 流有（maxStreams）、票据批次有（maxLiveBatchesPerUser），偏偏会话没有。
+//
+// ★ 它和那三个是同一个形状：**由对端驱动**。一次握手就建一条会话，而每条会话
+// 要付 7 个协程（ctrlLoop / ticketServeLoop / retransmitLoop / rebalanceLoop /
+// acceptLoop / 清理 watcher / graceWatcher）外加流表、路径表和一个宽限期定时器。
+// 关键在于会话**在路径全断之后还要活满宽限期**（编排默认 120 秒）——
+// 那正是它存在的理由，也正是它可以被拿来堆积的原因：
+// 握手、断开、再握手，一个已认证的对端就能让服务端替它攒下成千上万条"正在等主人
+// 回来"的会话，全程没有任何错误路径被触发。RFC 9000 §21.9（Peer Denial of Service）
+// 说的就是这一类：处理开销与状态变化相对带宽不成比例。
+//
+// 上界之外还要有淘汰顺序，而顺序必须挑对：**只能淘汰已经没有路径的那些**。
+// 一个正常重连的客户端会在旧会话还在宽限期里的时候建一条新的——
+// 那恰恰是这个协议存在的意义。直接拒绝新会话等于把恢复路径堵死；
+// 而淘汰一条**正在用**的会话则是直接掐断某个真实用户。
+// 宽限期里的会话此刻没有在服务任何人，淘汰它最多是少一次无缝恢复。
+func TestSessionsPerUserAreBounded(t *testing.T) {
+	const limit = 4
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		sc.MaxSessionsPerUser = limit
+		sc.SessionGrace = time.Minute // 让被丢下的会话确实停在宽限期里
+	})
+
+	ctx := context.Background()
+	// 先拿到这个用户的 user_id：用主 client 建一条会话即可。
+	first, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := first.user
+
+	// 反复"握手 → 走人"，每次都留下一条处于宽限期的会话。
+	for i := 0; i < limit*5; i++ {
+		cl, err := NewClient(h.client.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cl.Session(ctx); err != nil {
+			t.Fatalf("第 %d 次握手失败：%v —— 上界不该让合法用户连不上，只该淘汰闲置会话", i, err)
+		}
+		cl.Close()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if serverSessionsFor(h.srv, user) <= limit {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := serverSessionsFor(h.srv, user); got > limit {
+		t.Fatalf("一个用户攒下了 %d 条会话，上界是 %d —— "+
+			"握手、断开、再握手就能让服务端替对端无限攒状态", got, limit)
+	}
+}
+
+// 有路径在用的会话**不能**被淘汰掉，否则这个上界就成了对真实用户的攻击面：
+// 谁都能靠反复握手把别人正在用的连接挤掉。
+func TestBoundedSessionsNeverEvictALiveOne(t *testing.T) {
+	const limit = 2
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		sc.MaxSessionsPerUser = limit
+		sc.SessionGrace = time.Minute
+	})
+	ctx := context.Background()
+
+	// 一条**活着并且在用**的会话：建好之后一直保持连接。
+	live, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 再拿一堆握手去挤。
+	for i := 0; i < limit*5; i++ {
+		cl, err := NewClient(h.client.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cl.Session(ctx)
+		cl.Close()
+	}
+
+	// 那条在用的会话必须还在服务端手里，而且还能搬字节。
+	h.srv.mu.Lock()
+	_, alive := h.srv.sessions[live.id]
+	h.srv.mu.Unlock()
+	if !alive {
+		t.Fatal("正在用的会话被挤掉了 —— 上界变成了针对真实用户的攻击面")
+	}
+	msg := []byte("still-working")
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Write(msg); err != nil {
+		t.Fatalf("写失败：%v", err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("读失败：%v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatal("字节对不上")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // h3 的那条路径不能是全网常量
 // ---------------------------------------------------------------------------
 

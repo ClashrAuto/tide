@@ -111,6 +111,51 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// admitSession 决定能不能再给这个用户建一条会话。
+//
+// 返回 (victim, true) 表示可以建，且调用方**必须在锁外**关掉 victim（可能为 nil）；
+// 返回 (nil, false) 表示这个用户的会话全都在用，只能拒。
+//
+// ★ 淘汰顺序是这里唯一需要想清楚的事：**只淘汰已经没有路径的会话**。
+//
+// 一个正常重连的客户端，会在旧会话还停在宽限期里的时候建一条新的——那恰恰是这个
+// 协议存在的意义（spec §9）。所以：
+//   - 直接拒绝新会话 = 把恢复路径堵死，上界本身变成故障；
+//   - 淘汰一条**正在用**的会话 = 谁都能靠反复握手把别人的连接挤掉，
+//     上界本身变成针对真实用户的攻击面。
+//
+// 宽限期里的会话此刻没有在服务任何人，淘汰最老的那条，代价上限是少一次无缝恢复。
+// noPathSince 正好同时给出这两个信息：0 表示还有路径（不能动），
+// 非 0 则是最后一条路径消失的时刻（越小越老）。
+func (s *Server) admitSession(user [16]byte) (*Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n := 0
+	var victim *Session
+	var oldest int64
+	for _, ss := range s.sessions {
+		if ss.user != user {
+			continue
+		}
+		n++
+		idleSince := ss.sess.noPathSince.Load()
+		if idleSince == 0 {
+			continue // 还有路径，正在服务真实用户，不能动
+		}
+		if victim == nil || idleSince < oldest {
+			victim, oldest = ss.sess, idleSince
+		}
+	}
+	if n < s.cfg.maxSessionsPerUser() {
+		return nil, true
+	}
+	if victim == nil {
+		return nil, false
+	}
+	return victim, true
+}
+
 func (s *Server) sweepLoop() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -615,6 +660,30 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 	// 这把"QUIC 是加速通道"从一句部署建议变成了协议强制的性质。
 	if isQUICConn(t.Conn) && !joining {
 		return nil, nil, ErrProtocol
+	}
+
+	// ★ 会话数也要有上界，而且必须在写 ACCEPT **之前**判。
+	//
+	// 会话曾经是这个协议里唯一没有上界的一级——路径有 maxPathsPerSession、
+	// 流有 maxStreams、票据批次有 maxLiveBatchesPerUser，偏偏会话没有。
+	// 而它和那三个是同一个形状：**由对端驱动**。一次握手建一条会话，每条会话要付
+	// 7 个协程加流表、路径表、宽限期定时器，并且**在路径全断之后还要活满宽限期**
+	// （编排默认 120 秒）。那正是它存在的理由，也正是它可以被拿来堆积的原因：
+	// 握手、断开、再握手，一个已认证的对端就能让服务端替它攒下成千上万条
+	// "正在等主人回来"的会话，全程不触发任何错误路径
+	// （RFC 9000 §21.9 Peer Denial of Service 说的正是这一类）。
+	//
+	// 判在 ACCEPT 之前，是为了让拒绝走**和其它认证失败完全一样的那条路**
+	// （§7 失败关闭 → 掩护源站）。放在 ACCEPT 之后拒，客户端已经拿到 ACCEPT、
+	// 以为握手成功了，接着会把掩护源站的字节当 TIDE 帧解——既多一个可测的差异，
+	// 又让合法客户端的失败变得莫名其妙。
+	if !joining {
+		if victim, ok := s.admitSession(user); !ok {
+			return nil, nil, ErrProtocol
+		} else if victim != nil {
+			// 在锁外关：Close 会唤醒那条会话的清理协程，而它要拿 s.mu。
+			victim.Close()
+		}
 	}
 	sid := wantSession
 	if !joining {

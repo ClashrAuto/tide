@@ -37,6 +37,14 @@ const (
 
 	DefaultMaxStreams = 1024
 
+	// DefaultMaxSessionsPerUser 单个用户同时能有多少条会话。
+	//
+	// 正常形态是 **1** 条：TIDE 的整个设计就是一条长命会话跨路径活着。
+	// 多设备共用同一份凭据时会多几条，64 已经很宽裕。
+	// 上界必须存在，理由见 Server.admitSession：建会话由对端驱动，
+	// 而会话在路径全断之后还要活满宽限期。
+	DefaultMaxSessionsPerUser = 64
+
 	// DefaultUDPTimeout 是一条 UDP 关联多久没有任何方向的流量就被回收。
 	//
 	// 5 分钟不是拍脑袋：RFC 4787 REQ-5 规定 NAT 的 UDP 映射定时器 **MUST NOT**
@@ -203,6 +211,8 @@ type ServerConfig struct {
 	MaxStreams int
 	// UDPTimeout 覆盖 DefaultUDPTimeout：UDP 关联的空闲回收期。
 	UDPTimeout time.Duration
+	// MaxSessionsPerUser 覆盖 DefaultMaxSessionsPerUser。
+	MaxSessionsPerUser int
 
 	// Congestion 同 ClientConfig.Congestion。
 	Congestion string
@@ -253,6 +263,13 @@ func (c *ServerConfig) maxStreams() int {
 		return c.MaxStreams
 	}
 	return DefaultMaxStreams
+}
+
+func (c *ServerConfig) maxSessionsPerUser() int {
+	if c.MaxSessionsPerUser > 0 {
+		return c.MaxSessionsPerUser
+	}
+	return DefaultMaxSessionsPerUser
 }
 
 func (c *ServerConfig) udpTimeout() time.Duration {
