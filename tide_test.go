@@ -230,6 +230,97 @@ func TestTicketConsumeIsAtomic(t *testing.T) {
 	}
 }
 
+// 伪造的 ZERO_RTT **不得**烧掉票据。
+//
+// ★ ticket_id 是明文（服务端要靠它反查密钥，鸡生蛋只能这么解），而 MemTicketStore
+// 从一个全局单调计数器分配基址——于是 ticket_id 完全可预测：0、1、2……
+// 如果服务端在验证之前就置位，任何人都能把整台服务器上所有用户的票据挨个烧掉：
+// 每张只要一个 ~124 字节的伪造帧，服务端回的还是掩护站点，全程静默。
+// 后果是所有人永久退回 1-RTT——0-RTT 是 TIDE 两个招牌特性之一，
+// 而且"这台机器上每条连接都变慢一个 RTT"本身就是个可观测的指纹。
+//
+// RFC 8446 §8.2 给的顺序正相反：服务端**先验 PSK binder**，
+// 之后才去碰防重放记录。TIDE 这里对应的就是"先 AEAD 解开（证明持有密钥），
+// 再原子置位"。原子性由置位本身保证，不需要靠"先置位"来换。
+func TestForgedZeroRTTDoesNotBurnTickets(t *testing.T) {
+	h := newHarness(t, nil)
+	var user [16]byte
+	base, _, err := h.srv.store.Issue(user, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.srv.store.Remaining(user)
+
+	// 伪造：ticket_id 猜对（可预测），密文是垃圾。攻击者不持有任何密钥。
+	for id := base; id < base+uint64(before); id++ {
+		z := &zeroRTTMsg{version: ProtocolVersion, ticketID: id}
+		z.sealed = bytes.Repeat([]byte{0xAB}, zeroSealLen+16)
+		f := Frame{Type: FrameZeroRTT, Payload: z.marshal()}
+		tc := &teeConn{Conn: &nopConn{}}
+		if _, _, err := h.srv.handleZeroRTT(tc, f, [cbHashLen]byte{}); err == nil {
+			t.Fatal("伪造的 ZERO_RTT 竟然通过了认证")
+		}
+	}
+
+	if after := h.srv.store.Remaining(user); after != before {
+		t.Fatalf("%d 张票据被伪造帧烧掉了（%d → %d）—— 攻击者不持有任何密钥，"+
+			"却能把全服务器的票据挨个烧光，所有人永久退回 1-RTT", before-after, before, after)
+	}
+	// 烧不掉，但真正持有密钥的一方仍然必须能用掉它（别把功能一起关了）。
+	if _, _, ok := h.srv.store.(*MemTicketStore).consumeAny(base + 1); !ok {
+		t.Fatal("合法消费也被挡住了")
+	}
+}
+
+// 把"消费"挪到"认证"之后**不能**削弱重放保护。
+//
+// ★ 这是上面那个修复唯一真正的风险，所以要正面测：同一份**真实**的 ZERO_RTT
+// 并发重放 N 份，必须恰好只有一份把票据消费掉。原子性由 consume 那一步自己保证，
+// 不需要靠"先于解密"来换——这正是原来那条注释搞反的地方。
+func TestConcurrentGenuineZeroRTTConsumesExactlyOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	var user [16]byte
+	base, seed, err := h.srv.store.Issue(user, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.srv.store.Remaining(user)
+
+	// 造一份**真的**能解开的 ZERO_RTT：我们手上有 seed，所以能算出票据密钥。
+	id := base + 2
+	tkey, err := ticketKey(seed[:], id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z := &zeroRTTMsg{version: ProtocolVersion, ticketID: id}
+	ad := append(append([]byte{z.version}, appendU64(nil, id)...), z.nonce[:]...)
+	zs := &zeroSeal{timestamp: time.Now().Unix(), user: user}
+	zs.cbHash[0] = 0xFF // 与下面传进去的 cb 不同，认证通过后停在信道绑定这一步
+	if z.sealed, err = sealFixed(tkey, z.nonce[:], zs.marshal(nil), ad, false); err != nil {
+		t.Fatal(err)
+	}
+	f := Frame{Type: FrameZeroRTT, Payload: z.marshal()}
+
+	const racers = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			h.srv.handleZeroRTT(&teeConn{Conn: &nopConn{}}, f, [cbHashLen]byte{})
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := before - h.srv.store.Remaining(user); got != 1 {
+		t.Fatalf("%d 份并发重放消费掉了 %d 张票据，必须恰好 1 张 —— "+
+			"重放保护失效时不会有任何报错，重放的连接会正常建立", racers, got)
+	}
+}
+
 func TestTicketWalletFallsBackTo1RTT(t *testing.T) {
 	w := newTicketWallet()
 	now := time.Now()

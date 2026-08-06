@@ -327,14 +327,23 @@ func (s *Server) handleZeroRTT(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, 
 	if !ok || z.version != ProtocolVersion {
 		return nil, nil, ErrProtocol
 	}
-	// ⚠️ 顺序不能动（spec §3.3）：查位图 → **置位** → 再解密 early_data。
-	// 置位必须先于解密，且对同一 ticket_id 的并发必须原子化，否则重放保护失效——
-	// 而且不会有任何报错，重放的连接会正常建立。
+	// ⚠️ 顺序（spec §3.3）：**只读**取密钥 → 解密（= 证明持有密钥）→ **原子置位**。
 	//
-	// 这里还有一个鸡生蛋：要查位图得先知道 user_id，而 user_id 在密文里。
+	// 这里有一个鸡生蛋：要查位图得先知道 user_id，而 user_id 在密文里。
 	// 解法是位图按 (user, id) 存但允许按 id 反查所属用户批次——MemTicketStore 的
 	// Issue 用全局单调基址分配，所以 ticket_id 本身就唯一确定了批次。
-	seed, uid, okc := s.consumeTicket(z.ticketID)
+	//
+	// ★ 曾经这里是"查位图 → 置位 → 再解密"，注释还写着"置位必须先于解密"。那是错的，
+	// 而且是个能把 0-RTT 整个废掉的错：ticket_id 是**明文**（不然没法反查密钥），
+	// 基址又从全局单调计数器分配，于是 ticket_id 完全可预测——0、1、2……
+	// 先置位就意味着**任何人**都能用一个 ~124 字节的伪造帧烧掉任意一张票据，
+	// 不需要持有任何密钥。实测 32 张票据被 32 个垃圾帧烧得一张不剩。
+	// 攻击者顺着 id 数上去就能让整台服务器上所有用户永久退回 1-RTT，
+	// 而服务端回的还是掩护站点，全程没有任何日志或错误。
+	//
+	// 原子性不需要靠"先置位"来换：它由置位这一步**自己**保证。RFC 8446 §8.2 对
+	// TLS 1.3 的 0-RTT 给的正是这个顺序——服务端先验 PSK binder，之后才碰防重放记录。
+	seed, uid, burned, okc := s.peekTicket(z.ticketID)
 	if !okc {
 		return nil, nil, ErrBadTicket
 	}
@@ -350,6 +359,15 @@ func (s *Server) handleZeroRTT(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, 
 	plain, err := openFixed(tkey, z.nonce[:], z.sealed, ad, false)
 	if err != nil {
 		return nil, nil, ErrProtocol
+	}
+	// 解开了 = 对端确实持有这张票据的密钥。现在才动防重放状态。
+	// 并发的同一张票据在这里分胜负：consume 是原子的，只会有一个赢，其余判为重放。
+	// 之后的检查（时间戳/信道绑定/用户）失败仍然**保持**已消费——那时对端是真的
+	// 持有密钥的，这段密文已经上过线，放它回去就等于允许重放。
+	if !burned {
+		if _, _, ok := s.consumeTicket(z.ticketID); !ok {
+			return nil, nil, ErrBadTicket
+		}
 	}
 	zs, _, ok := parseZeroSeal(plain)
 	if !ok {
@@ -386,9 +404,40 @@ func (s *Server) consumeTicket(id uint64) ([32]byte, [16]byte, bool) {
 	return z1, z2, false
 }
 
+// peekTicket 只读地反查票据密钥。见 handleZeroRTT 里的顺序说明。
+//
+// 返回的 burned 表示"这次反查已经把票据消费掉了"——只有在 store 没实现 anyPeeker、
+// 只能退回旧的合并接口时才为 true。调用方据此跳过第二次消费，否则那次必然失败，
+// 0-RTT 会对这类部署彻底不可用。
+func (s *Server) peekTicket(id uint64) (seed [32]byte, user [16]byte, burned, ok bool) {
+	if ms, isMem := s.store.(*MemTicketStore); isMem {
+		seed, user, ok = ms.peekAny(id)
+		return seed, user, false, ok
+	}
+	if ap, has := s.store.(anyPeeker); has {
+		seed, user, ok = ap.PeekAny(id)
+		return seed, user, false, ok
+	}
+	// ⚠️ 只实现了 anyConsumer 的旧 store：退回"先消费再认证"。
+	// 这条路上伪造帧能烧票据（见 handleZeroRTT），所以集群 store **应当**实现 anyPeeker。
+	// 这里不直接失败，是因为失败会让这类部署的 0-RTT 彻底不可用，比弱一点更糟。
+	if ac, has := s.store.(anyConsumer); has {
+		seed, user, ok = ac.ConsumeAny(id)
+		return seed, user, true, ok
+	}
+	return seed, user, false, false
+}
+
 // anyConsumer 让集群 store 也能"按 ticket_id 反查用户并原子消费"。
 type anyConsumer interface {
 	ConsumeAny(id uint64) (seed [32]byte, user [16]byte, ok bool)
+}
+
+// anyPeeker 是 anyConsumer 的只读一半：取出密钥但不置位。
+// 集群 store **应当**同时实现它，否则 0-RTT 会退回到"先消费再认证"，
+// 而那条路上任何人都能用伪造帧烧掉别人的票据。
+type anyPeeker interface {
+	PeekAny(id uint64) (seed [32]byte, user [16]byte, ok bool)
 }
 
 func (s *Server) userAllowed(u [16]byte) bool {

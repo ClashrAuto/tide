@@ -54,6 +54,15 @@ type ticketBatch struct {
 	expires  time.Time
 }
 
+// isConsumed 只读地问一张票据用没用过。范围外一律当"用过"，调用方据此拒绝。
+func (b *ticketBatch) isConsumed(id uint64) bool {
+	if id < b.base || id >= b.base+uint64(b.count) {
+		return true
+	}
+	i := id - b.base
+	return b.consumed[i/64]&(1<<uint(i%64)) != 0
+}
+
 func (b *ticketBatch) consume(id uint64) bool {
 	if id < b.base || id >= b.base+uint64(b.count) {
 		return false
@@ -119,6 +128,41 @@ func (s *MemTicketStore) consumeAny(id uint64) ([32]byte, [16]byte, bool) {
 // ConsumeAny 是 anyConsumer 的导出版本，让外部 store 实现可以照抄这个契约。
 func (s *MemTicketStore) ConsumeAny(id uint64) ([32]byte, [16]byte, bool) {
 	return s.consumeAny(id)
+}
+
+// peekAny 只读地反查票据密钥，**不置位**。
+//
+// ★ 它存在的唯一理由是把"取密钥"和"消费"拆开，好让顺序变成
+// 取密钥 → 认证 → 原子消费（RFC 8446 §8.2 对 TLS 1.3 0-RTT 给的正是这个顺序：
+// 先验 PSK binder，之后才碰防重放记录）。
+//
+// 合并成一步的代价是致命的：ticket_id 是明文（服务端要靠它反查密钥），
+// 而基址从一个全局单调计数器分配，所以 ticket_id 完全可预测。
+// 先置位再解密，就等于任何人都能拿一个几十字节的伪造帧烧掉任意一张票据——
+// 不需要持有任何密钥，服务端回的还是掩护站点，全程静默。
+func (s *MemTicketStore) peekAny(id uint64) ([32]byte, [16]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := sort.Search(len(s.index), func(i int) bool {
+		return s.index[i].base+uint64(s.index[i].count) > id
+	})
+	if i >= len(s.index) || id < s.index[i].base {
+		var z1 [32]byte
+		var z2 [16]byte
+		return z1, z2, false
+	}
+	ref := s.index[i]
+	if s.now().After(ref.b.expires) || ref.b.isConsumed(id) {
+		var z1 [32]byte
+		var z2 [16]byte
+		return z1, z2, false
+	}
+	return ref.b.seed, ref.user, true
+}
+
+// PeekAny 是 anyPeeker 的导出版本。
+func (s *MemTicketStore) PeekAny(id uint64) ([32]byte, [16]byte, bool) {
+	return s.peekAny(id)
 }
 
 func (s *MemTicketStore) now() time.Time {
