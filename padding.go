@@ -207,6 +207,62 @@ func (p *paddingScheduler) maybeHeartbeat() bool {
 	return p.rng.Float64() <= 0.35
 }
 
+// handshakePad 给握手帧（HELLO / ZERO_RTT / ACCEPT）算一个填充量。
+//
+// ★ 这三个帧原先一律 pad=0，于是每条 TIDE 连接的**第一条应用记录**长度是个常量：
+// 它完全由协议结构决定（HELLO = 1 + kem_share + client_random + 2 + sealed，全定长），
+// 与用户、时间、内容都无关。DPI 只要问一句"TLS 握手之后的第一条应用记录是不是恰好
+// N 字节"，就把 TIDE 挑出来了——比周期性心跳还好用，因为它一条连接只需要看一个包。
+//
+// §8.3 的判决窗口救不了这一条：那套填充是**握手之后**才开始的，
+// 而握手帧走的是 writeFrameExact，压根不过填充调度器。
+//
+// 后量子（§3.1 的临时 ML-KEM 封装密钥）把这个常量顶到了 2.4 KB 以上，
+// 落在 HTTPS 记录长度分布的稀疏尾部，比原先更显眼——但它本来就不该是常量。
+//
+// 做法：在 [当前长度, 当前长度 + handshakePadSpan) 里均匀取一个目标长度。
+//
+// ⚠️ 这里**没有**沿用 §8.3 那张 HTTPS 分布表，是权衡过的：握手帧已经 2.4 KB，
+// 分布里能装下它的只剩三个尾部桶，按质量采样出来的均值是 6.6 KB——
+// 也就是每次握手平均多花 4.2 KB，而且 18% 的握手会发一条 11–16 KB 的记录，
+// 那本身比 2.5 KB 更不像正常流量。要消掉的是"**恒等于**某个值"这件事，
+// 不是把它挪到分布的另一个稀疏角落。均匀展宽 4 KiB 就够：
+// 常量没了，开销有上界，长度仍落在 1460–11000 这两个真实存在的桶里。
+//
+// 用 crypto/rand 而不是调度器那个 PCG：握手一条路径只发生一次，不在热路径上，
+// 而填充量若可预测，这层伪装就等于没有。
+const handshakePadSpan = 4096
+
+func handshakePad(bodyLen int) int {
+	// 上界：服务端对握手帧的 body 有独立的收紧上限（maxHandshakeBody），
+	// 填过头会被自己人按"声称长度超限"拒掉。
+	maxBody := maxHandshakeBody - 64
+	if bodyLen+2 >= maxBody {
+		return 0
+	}
+	pad := cryptoIntn(handshakePadSpan)
+	if bodyLen+pad+2 > maxBody {
+		pad = maxBody - bodyLen - 2
+	}
+	if pad < 0 {
+		return 0
+	}
+	return pad
+}
+
+func cryptoIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// crypto/rand 失败是系统级故障。返回 0 会让长度退回常量，
+		// 所以宁可给一个固定的非零值，也别悄悄把伪装关掉。
+		return n / 2
+	}
+	return int(binary.BigEndian.Uint64(b[:]) % uint64(n))
+}
+
 func (p *paddingScheduler) disable() {
 	p.mu.Lock()
 	p.disabled = true

@@ -725,6 +725,57 @@ func TestWalletBatchesBounded(t *testing.T) {
 	}
 }
 
+// 握手帧的线上长度**不得**是常量。
+//
+// ★ 每条 TIDE 连接的第一条应用记录就是 HELLO（或 ZERO_RTT）那一帧。
+// 它的长度完全由协议结构决定——`1 + kem_share + client_random + 2 + sealed`，
+// 全是定长——所以不填充的话，**每条连接都是同一个数**，与用户、时间、内容都无关。
+// DPI 只要问"TLS 握手后的第一条应用记录是不是恰好 N 字节"，看一个包就认出 TIDE 了。
+// 这比第 7 轮那个 1Hz 节拍器还好用：节拍器要观察一段时间，这个只要一个包。
+//
+// §8.3 的判决窗口救不了它：那套填充是**握手之后**才开始的，
+// 而握手帧走 writeFrameExact，压根不过填充调度器。
+// 后量子把这个常量从 1.2 KB 顶到 2.4 KB，更显眼，但它本来就不该是常量。
+func TestHandshakeFrameLengthIsNotConstant(t *testing.T) {
+	// 三种握手帧的真实 body 大小。
+	for _, tc := range []struct {
+		name string
+		body int
+	}{
+		{"HELLO", 1 + kemShareLen + 32 + 2 + authPlainLen + 16},
+		{"ZERO_RTT", 1 + 8 + 12 + 2 + zeroSealLen + 16},
+		{"ACCEPT", acceptFixed + 16},
+	} {
+		seen := map[int]int{}
+		const n = 400
+		for i := 0; i < n; i++ {
+			pad := handshakePad(tc.body)
+			seen[frameOverhead(0, tc.body+pad+2)+tc.body+pad+2]++
+		}
+		bare := frameOverhead(0, tc.body) + tc.body
+		if len(seen) < 64 {
+			t.Fatalf("%s：%d 次采样只有 %d 种线上长度（不填充时恒为 %d）—— "+
+				"接近常量，DPI 看一个包就能把这条连接认出来", tc.name, n, len(seen), bare)
+		}
+		lo, hi := 1<<30, 0
+		for k := range seen {
+			if k < lo {
+				lo = k
+			}
+			if k > hi {
+				hi = k
+			}
+		}
+		// 开销要有上界：往分布尾部乱填会让 1/5 的握手发出 11–16 KB 的记录，
+		// 那比 2.5 KB 更不像正常流量，而且白花带宽。
+		if grew := hi - bare; grew > handshakePadSpan+64 {
+			t.Fatalf("%s：最大填充 %d 字节，超过了 %d 的预算", tc.name, grew, handshakePadSpan)
+		}
+		t.Logf("%-9s 不填充恒为 %5d；填充后 %d 种取值，范围 %d..%d",
+			tc.name, bare, len(seen), lo, hi)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 填充
 // ---------------------------------------------------------------------------

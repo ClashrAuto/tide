@@ -637,7 +637,7 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := writeFrameExact(t.Conn, FrameAccept, FlagPush, 0, sealedAccept, 0); err != nil {
+	if err := writeFrameExact(t.Conn, FrameAccept, FlagPush, 0, sealedAccept, handshakePad(len(sealedAccept))); err != nil {
 		return nil, nil, err
 	}
 

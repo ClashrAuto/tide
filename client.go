@@ -421,7 +421,10 @@ func (c *Client) oneRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, flags uin
 		return nil, err
 	}
 	h := &helloMsg{version: ProtocolVersion, kemShare: kemShare, clientRandom: cr, sealed: sealed}
-	if err := writeFrameExact(conn, FrameHello, FlagPush, 0, h.marshal(), 0); err != nil {
+	// ★ 握手帧必须填充。不填的话，每条 TIDE 连接的第一条应用记录长度是个常量
+	// （全由协议结构决定），DPI 看一个包就能认出来。见 handshakePad。
+	helloBody := h.marshal()
+	if err := writeFrameExact(conn, FrameHello, FlagPush, 0, helloBody, handshakePad(len(helloBody))); err != nil {
 		return nil, err
 	}
 	return c.readAccept(s, conn, kHS, transcript, pathID, kind, eph)
@@ -455,7 +458,8 @@ func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID
 		return nil, err
 	}
 	z := &zeroRTTMsg{version: ProtocolVersion, ticketID: ticketID, nonce: nonce, sealed: sealed}
-	if err := writeFrameExact(conn, FrameZeroRTT, FlagPush, 0, z.marshal(), 0); err != nil {
+	zBody := z.marshal()
+	if err := writeFrameExact(conn, FrameZeroRTT, FlagPush, 0, zBody, handshakePad(len(zBody))); err != nil {
 		return nil, err
 	}
 	// 0-RTT 的 ACCEPT 用票据密钥派生的握手密钥保护。
