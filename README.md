@@ -92,10 +92,25 @@ go run ./cmd/tide-server -keygen
 go run ./cmd/tide-server -listen :8443 -quic-listen :8443 \
     -cover 127.0.0.1:8080 -users alice:<password> -advertise example.com
 
+# QUIC 面改走 HTTP/3（spec §12.6：对非 TIDE 的 h3 请求反代到掩护源站，
+# 而不是沉默）。★ 两端必须一致——客户端也要开 h3，否则 QUIC 通道**静默失效**。
+go run ./cmd/tide-server -h3 -listen :8443 -quic-listen :8443 \
+    -cover 127.0.0.1:8080 -users alice:<password>
+
 # 压测客户端（输出往返时延的尾部分位 + 每条路径的收发字节）
 go run ./cmd/tide-selftest -mode client -server host:8443 -key <public> \
-    -duration 60s -quic
+    -password <password> -target <可达的 host:port> -duration 60s -quic
 ```
+
+⚠️ 压测客户端的两个参数容易漏，漏了都不会给出有用的报错：
+
+- **`-password` 必须给**，且要和服务端 `-users` 里的口令一致。`tide-server` 要求
+  至少配置一个用户，而不带口令的客户端发的是全零 `user_id`，认证不过——
+  现象是 `initial handshake: unexpected EOF`（服务端按 §7 失败关闭，把你转给了掩护源站）。
+- **`-target` 要指向一个真实可达的地址**。它的默认值 `echo.invalid:80` 是
+  RFC 2606 保留的不可解析域名，只在 `-mode server` 那个**回声夹具**下成立
+  （夹具不真的去连）；对着 `tide-server` 这种真代理跑，每条流都会因为 DNS 失败被 RST，
+  现象是 `no blocks completed a round trip`。
 
 ⚠️ `tide-selftest -mode server` 把每条流**回声**回去，那是压测夹具，**不是代理**。
 要部署的是 `tide-server`。

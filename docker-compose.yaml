@@ -51,6 +51,8 @@ services:
       # 上游连接，所以 Wi-Fi 切换、基站切换、路由器重启都不会断连接。
       # 实测断网 60s 后恢复只花 274ms，且零字节丢失。
       TIDE_GRACE: "${TIDE_GRACE:-120s}"
+      # QUIC 面走 HTTP/3（spec §12.6）。非空即开启，客户端必须同步打开 h3。
+      TIDE_H3: "${TIDE_H3:-}"
     volumes:
       # ★ 持久卷不是可选的：静态密钥在这里面。删了它 = 换了 public-key =
       #   所有客户端配置作废。
