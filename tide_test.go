@@ -968,6 +968,184 @@ func TestFailClosedTimingDoesNotLeakHandshakeDepth(t *testing.T) {
 	}
 }
 
+// 一个终止并重建外层 TLS 的中间人 MUST 被拒（spec §5 信道绑定 / design.md §10 第 4 条）。
+//
+// ★ 这是整份威胁模型里最需要测、却一直一条测试都没有的一条。
+// 客户端在企业 CA / 被强装根证书的环境里**会**信任中间人的证书——
+// 测试里的 InsecureSkipVerify 正是这个场景的忠实模拟。TLS 那一层不会报任何错，
+// 于是信道绑定是用户与全量 MITM 之间**唯一**的东西。
+//
+// 它的原理：cb = TLS-Exporter(外层信道)。中间人两侧是两条独立的 TLS 会话，
+// 导出值必然不同；客户端把自己那份封进 sealed_auth，服务端拿自己这份比对，对不上就失败关闭。
+func TestMITMTerminatingTLSIsRejected(t *testing.T) {
+	mitmLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mitmLn.Close()
+
+	// 客户端被指向中间人，而不是真服务端。
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.Server = mitmLn.Addr().String()
+	})
+	realAddr := h.ln.Addr().String()
+
+	mitmCert := testTLSServer(t)
+	// relayed 统计"两条 TLS 都建起来了、而且真的搬过字节"的次数。
+	// 没有它，这条测试在"客户端压根没连上中间人"的情况下也会通过。
+	var relayed atomic.Int64
+	go func() {
+		for {
+			c, err := mitmLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				// 对客户端：用**自己的**证书建一条 TLS（客户端信任它）。
+				down := tls.Server(c, mitmCert)
+				if err := down.Handshake(); err != nil {
+					return
+				}
+				// 对服务端：另建一条 TLS，把解密出来的 TIDE 字节原样搬过去。
+				up, err := tls.Dial("tcp", realAddr, &tls.Config{
+					InsecureSkipVerify: true, ServerName: "tide.test", MinVersion: tls.VersionTLS13,
+				})
+				if err != nil {
+					return
+				}
+				defer up.Close()
+				go func() {
+					if n, _ := io.Copy(up, down); n > 0 {
+						relayed.Add(n)
+					}
+				}()
+				io.Copy(down, up)
+			}(c)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := h.client.Session(ctx); err == nil {
+		t.Fatal("中间人终止并重建了外层 TLS，TIDE 握手却成功了 —— 信道绑定没起作用。" +
+			"在被强装根证书的环境里，这等于代理内容对中间人完全透明")
+	}
+	// ★ 必须确认中间人**真的把 TLS 劫持成功了**：两条 TLS 都建起来、字节确实搬过去了。
+	// 否则这条拒绝可能只是"客户端连不上中间人"，与信道绑定毫无关系。
+	time.Sleep(200 * time.Millisecond) // 等中继协程把计数写完
+	if n := relayed.Load(); n == 0 {
+		t.Fatal("中间人一个字节都没中继成功 —— 这条用例没有真的测到信道绑定")
+	} else {
+		t.Logf("中间人成功劫持了外层 TLS 并中继了 %d 字节，TIDE 仍然拒绝了握手", n)
+	}
+
+	// ★ 对照组：同样的配置直连必须成功。没有它，上面那条断言在"客户端根本连不上"
+	// 的情况下也会通过——那就成了一条永远绿、什么也没守住的测试。
+	direct, err := NewClient(&ClientConfig{
+		Server:    realAddr,
+		PublicKey: h.client.cfg.PublicKey,
+		UserID:    h.client.cfg.UserID,
+		TLSConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "tide.test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer direct.Close()
+	if _, err := direct.Session(ctx); err != nil {
+		t.Fatalf("对照组直连也失败了（%v）—— 上面那条拒绝说明不了任何问题", err)
+	}
+}
+
+// 信道绑定值必须"同一条连接两端相同、不同连接互不相同"。
+//
+// ★ 这两条缺任何一条，§5 都会**静默**失效而所有功能测试照样全绿：
+// 两端算得不一样 → 合法握手全挂（这个至少看得见）；
+// 不同连接算出同一个值 → 比对永远通过，中间人畅通无阻，而且不会有任何症状。
+// 后者正是最危险的形态——一个退化成常量（或全零）的导出器长得和正常的一模一样。
+func TestChannelBindingIsPerConnection(t *testing.T) {
+	srvCfg := testTLSServer(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvCB := make(chan [cbHashLen]byte, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				tc := tls.Server(c, srvCfg)
+				if err := tc.Handshake(); err != nil {
+					return
+				}
+				exp, err := exporterFor(tc)
+				if err != nil {
+					return
+				}
+				cb, err := channelBinding(exp)
+				if err != nil {
+					return
+				}
+				srvCB <- cb
+			}(c)
+		}
+	}()
+
+	dial := func() [cbHashLen]byte {
+		t.Helper()
+		tc, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+			InsecureSkipVerify: true, ServerName: "tide.test", MinVersion: tls.VersionTLS13,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { tc.Close() })
+		exp, err := exporterFor(tc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cb, err := channelBinding(exp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cb
+	}
+
+	c1, c2 := dial(), dial()
+	var s1, s2 [cbHashLen]byte
+	for _, dst := range []*[cbHashLen]byte{&s1, &s2} {
+		select {
+		case v := <-srvCB:
+			*dst = v
+		case <-time.After(10 * time.Second):
+			t.Fatal("服务端没算出信道绑定值")
+		}
+	}
+
+	var zero [cbHashLen]byte
+	for i, cb := range [][cbHashLen]byte{c1, c2, s1, s2} {
+		if cb == zero {
+			t.Fatalf("第 %d 个信道绑定值是全零 —— 导出器没真的工作，比对形同虚设", i)
+		}
+	}
+	// 两条连接的 cb 必须不同。相同就意味着中间人可以把一条连接上认证过的
+	// sealed_auth 原样搬到另一条连接上用。
+	if c1 == c2 {
+		t.Fatal("两条不同的 TLS 连接算出了相同的信道绑定值 —— 导出器退化成常量了，" +
+			"中间人可以把一条连接上的认证材料搬到另一条上，§5 完全失效")
+	}
+	// 同一条连接的两端必须一致（顺序：服务端按 accept 顺序回，与 dial 顺序一致）。
+	if c1 != s1 || c2 != s2 {
+		t.Fatalf("同一条连接两端算出的信道绑定值不一致 —— 合法握手会全部失败\n"+
+			"  client1=%x server1=%x\n  client2=%x server2=%x", c1[:8], s1[:8], c2[:8], s2[:8])
+	}
+}
+
 func TestUDPAssociation(t *testing.T) {
 	h := newHarness(t, nil)
 	// UDP 回声上游
