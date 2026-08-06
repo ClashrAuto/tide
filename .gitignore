@@ -1,5 +1,21 @@
 /data/
 .env
-tide-server
-tide-selftest
+
+# ★ 这两条**必须**带前导斜杠。
+#
+# 它们要忽略的是 `go build` 落在仓库根目录的两个二进制。但 gitignore 的模式只要
+# 不含斜杠，就会在**任意层级**上匹配，而且同时匹配文件与目录（gitignore(5)）。
+# 于是不带斜杠的 `tide-server` 会顺手把 `cmd/tide-server/` 这个**源码目录**一起忽略掉。
+#
+# 这不是假设，它真的发生了，而且十八轮都没人发现——cmd/ 下那两个程序
+# （tide-server、tide-selftest）从来没有被提交进仓库：
+#   · `git status` 一直干净（被忽略的文件根本不显示）；
+#   · 本地工作区里文件都在，编也能编、跑也能跑；
+#   · 唯一的症状是 CI 从第一天起就是红的：
+#       test 任务第 7 步  `go run ./cmd/tide-selftest -mode local` → directory not found
+#       docker 任务       Dockerfile 里 `go build ./cmd/tide-server` → 构建失败
+#   · 而克隆这个仓库的人拿到的是一个**没有任何入口程序**的库，
+#     README 里的每一条命令都跑不了。
+/tide-server
+/tide-selftest
 *.exe
