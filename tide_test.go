@@ -2709,6 +2709,89 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 三处调度必须用同一套偏好
+// ---------------------------------------------------------------------------
+
+// fakePath 造一条评分可控的路径。score() 只看 srtt/rttvar/loss，设好就行。
+func fakePath(s *Session, id uint32, kind string, srtt time.Duration) *path {
+	p := &path{id: id, kind: kind, sess: s, pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p.wcond = sync.NewCond(&p.wmu)
+	p.conn = &nopConn{}
+	p.pad = newPaddingScheduler()
+	p.state.Store(uint32(pathActive))
+	p.lastRecv.Store(time.Now().UnixNano())
+	p.hmu.Lock()
+	p.srtt = srtt
+	p.hmu.Unlock()
+	return p
+}
+
+// 从前偏好只写在 pickPathLocked 里，而每 2 秒跑一次的 rebalance 用的是**裸**评分。
+// 三处调度于是各说各话：
+//
+//	migrateBulkAway  只迁批量流（注释写明"交互流也迁走反而更糟"）；
+//	pickPathLocked   建流时批量偏 QUIC、交互偏 TCP；
+//	rebalance        取一条全局最优路径，把**所有**流都迁过去。
+//
+// 而 rebalance 是周期性的，所以它赢：前两处的判断活不过 2 秒就被覆盖。
+//
+// ★ 量化一下影响，别夸大：偏好是 ±20%，而迁移门槛是 migrateAdvantage=2，
+// 所以偏好只挪动**触发点**，不会把一个 4 倍的差距翻过来。具体地，
+// 交互流迁往 QUIC 的条件从"TCP 差 2 倍"变成"TCP 差 2.5 倍"
+// （q < 0.5t 变成 q < 0.4t）。所以这不是"交互流被随便赶走"，
+// 而是"它被赶走得比设计意图早了 25%"，且每迁一条都要 rewind() 重发未确认字节。
+// 这个用例挑的就是那条带里的取值（t=40ms、q=18ms），老实现会迁、新实现不迁。
+func TestRebalanceHonoursPerStreamPreference(t *testing.T) {
+	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+
+	// 取值落在"偏好说了算"的那条带里：0.4t < q < 0.5t。
+	// 老实现按裸评分算 18*2=36 < 40，交互流会被迁走；
+	// 新实现按有效评分算 18*2=36 >= 32，交互流留在 TCP。批量流两边都该迁。
+	tcp := fakePath(s, 1, "tcp", 40*time.Millisecond)
+	quic := fakePath(s, 2, "quic", 18*time.Millisecond)
+	s.mu.Lock()
+	s.paths = append(s.paths, tcp, quic)
+	s.mu.Unlock()
+
+	mk := func(id uint64, bulk bool) *Stream {
+		st := newStream(s, id, "10.0.0.1:80", DefaultStreamWindow)
+		st.pathID.Store(tcp.id) // 两条都先钉在 TCP 上
+		if bulk {
+			st.bytesSent.Store(bulkThreshold + 1)
+		}
+		s.mu.Lock()
+		s.streams[id] = st
+		s.mu.Unlock()
+		return st
+	}
+	bulk := mk(1, true)
+	inter := mk(3, false)
+
+	// 跑够票数，让滞回不再是拦路虎。
+	for i := 0; i < migrateVotesNeeded+2; i++ {
+		s.rebalance()
+	}
+
+	if bulk.pathID.Load() != quic.id {
+		t.Fatal("批量流没有迁到明显更好的 QUIC 路径上 —— 调度器没在干活")
+	}
+	if inter.pathID.Load() != tcp.id {
+		t.Fatalf("交互流被迁到了 QUIC（path %d）—— 这正是 migrateBulkAway 与 "+
+			"pickPathLocked 两处都明确不做的事，却被每 2 秒一次的 rebalance 覆盖掉了",
+			inter.pathID.Load())
+	}
+
+	// 偏好本身也直接断言一次：同一条路径对两类流的有效评分必须不同。
+	if s.scoreFor(quic, bulk) >= s.scoreFor(quic, inter) {
+		t.Fatal("QUIC 对批量流没有比对交互流更受偏好")
+	}
+	if s.scoreFor(tcp, inter) >= s.scoreFor(tcp, bulk) {
+		t.Fatal("TCP 对交互流没有比对批量流更受偏好")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 补不上第二条路径时，重拨不能是个节拍器
 // ---------------------------------------------------------------------------
 

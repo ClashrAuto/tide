@@ -242,24 +242,7 @@ func (s *Session) pickPathLocked(st *Stream) *path {
 			}
 		}
 	}
-	var best *path
-	bestScore := 0.0
-	for _, p := range s.paths {
-		if !p.usable() {
-			continue
-		}
-		sc := p.score()
-		if st != nil && st.isBulk() && p.kind == "quic" {
-			// 批量流偏好 QUIC：同分时优先，不是无脑覆盖。
-			sc *= 0.8
-		}
-		if st != nil && !st.isBulk() && p.kind == "tcp" {
-			sc *= 0.8
-		}
-		if best == nil || sc < bestScore {
-			best, bestScore = p, sc
-		}
-	}
+	best, _ := s.bestPathForLocked(st)
 	if best == nil {
 		// 全都不可用时退而求其次：suspect 也比没有强，反正数据能不能到由 ACK 判定。
 		for _, p := range s.paths {
@@ -273,6 +256,54 @@ func (s *Session) pickPathLocked(st *Stream) *path {
 		st.pathID.Store(best.id)
 	}
 	return best
+}
+
+// scoreFor 是路径 p 对**这条流**的有效评分（越小越好）。
+//
+// ★ 偏好只有一个来源。从前它只写在 pickPathLocked 里，而每 2 秒跑一次的 rebalance
+// 用的是**裸** score()，于是三处调度各说各话：
+//
+//	migrateBulkAway  只迁批量流，注释写明"交互流留着——QUIC 的优势在丢包下的批量
+//	                 吞吐，不在小包延迟，把交互流也迁走反而更糟"；
+//	pickPathLocked   建流时给批量流偏 QUIC、交互流偏 TCP；
+//	rebalance        取一个**全局**最优路径，把**所有**流都迁过去，两种偏好都不看。
+//
+// 而 rebalance 是周期性的，所以它赢：前两处的判断活不过 2 秒就被覆盖掉。
+//
+// ★ 影响要说准，别夸大：偏好只有 ±20%，而迁移门槛 migrateAdvantage 是 2 倍，
+// 所以偏好挪的是**触发点**而不是结论——交互流迁往 QUIC 的条件从"TCP 差 2 倍"
+// 变成"TCP 差 2.5 倍"。也就是说交互流并不会被随便赶走，只是比设计意图早了 25%
+// 被赶走；而每迁一条都要 rewind() 重发未确认字节（resumes 计数器量的就是它）。
+//
+// 这里把偏好收成一个函数，三处共用，矛盾从结构上消失。
+func (s *Session) scoreFor(p *path, st *Stream) float64 {
+	sc := p.score()
+	if st == nil {
+		return sc
+	}
+	if st.isBulk() && p.kind == "quic" {
+		// 批量流偏好 QUIC：同分时优先，不是无脑覆盖。
+		sc *= 0.8
+	}
+	if !st.isBulk() && p.kind == "tcp" {
+		sc *= 0.8
+	}
+	return sc
+}
+
+// bestPathForLocked 给出对 st 最好的可用路径及其有效评分。st 为 nil 时就是全局最优。
+func (s *Session) bestPathForLocked(st *Stream) (*path, float64) {
+	var best *path
+	bestScore := 0.0
+	for _, p := range s.paths {
+		if !p.usable() {
+			continue
+		}
+		if sc := s.scoreFor(p, st); best == nil || sc < bestScore {
+			best, bestScore = p, sc
+		}
+	}
+	return best, bestScore
 }
 
 func (s *Session) reassignFrom(deadID uint32) {
@@ -358,35 +389,44 @@ const migrateVotesNeeded = 2
 
 func (s *Session) rebalance() {
 	s.mu.Lock()
-	var best *path
-	bestScore := 0.0
 	usable := 0
 	for _, p := range s.paths {
-		if !p.usable() {
-			continue
-		}
-		usable++
-		if sc := p.score(); best == nil || sc < bestScore {
-			best, bestScore = p, sc
+		if p.usable() {
+			usable++
 		}
 	}
-	if usable < 2 || best == nil {
+	if usable < 2 {
 		s.mu.Unlock()
 		return
 	}
-	scoreOf := make(map[uint32]float64, len(s.paths))
-	for _, p := range s.paths {
-		scoreOf[p.id] = p.score()
+	type move struct {
+		st *Stream
+		to *path
 	}
-	var moved []*Stream
+	var moved []move
 	for _, st := range s.streams {
+		// ★ 为**这条流**挑最好的路径，不是挑一条全局最优再把所有流都塞过去。
+		// 全局最优那种写法会把交互流也迁到 QUIC 上——而 migrateBulkAway 与
+		// pickPathLocked 两处都明确不这么做（见 scoreFor 的说明）。
+		best, bestScore := s.bestPathForLocked(st)
+		if best == nil {
+			st.migrateVotes = 0
+			continue
+		}
 		cur := st.pathID.Load()
 		if cur == best.id {
 			st.migrateVotes = 0
 			continue
 		}
-		curScore, ok := scoreOf[cur]
-		if !ok || bestScore*migrateAdvantage >= curScore {
+		var curScore float64
+		found := false
+		for _, p := range s.paths {
+			if p.id == cur {
+				curScore, found = s.scoreFor(p, st), true
+				break
+			}
+		}
+		if !found || bestScore*migrateAdvantage >= curScore {
 			st.migrateVotes = 0
 			continue
 		}
@@ -400,21 +440,20 @@ func (s *Session) rebalance() {
 		if st.migrateVotes >= need {
 			st.migrateVotes = 0
 			st.pathID.Store(best.id)
-			moved = append(moved, st)
+			moved = append(moved, move{st: st, to: best})
 		}
 	}
 	s.mu.Unlock()
 
-	for _, st := range moved {
+	for _, m := range moved {
 		var buf []byte
-		st.wmu.Lock()
-		buf = AppendVarint(buf, st.ackOff)
-		st.wmu.Unlock()
-		best.writeFrame(FramePathMigrate, FlagPush, st.id, buf)
-		st.rewind()
+		m.st.wmu.Lock()
+		buf = AppendVarint(buf, m.st.ackOff)
+		m.st.wmu.Unlock()
+		m.to.writeFrame(FramePathMigrate, FlagPush, m.st.id, buf)
+		m.st.rewind()
 	}
 }
-
 func (s *Session) rewindAll() {
 	s.mu.Lock()
 	sts := make([]*Stream, 0, len(s.streams))
