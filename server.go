@@ -38,7 +38,14 @@ type Server struct {
 	nextPath atomic.Uint32
 	stopped  chan struct{}
 	stopOnce sync.Once
+
+	// h3entry 是本部署的 h3 入口路径，见 h3PathFor。算一次存着——
+	// 每个请求都重算等于对着 1216 字节的公钥做一次 SHA-256。
+	h3entry string
 }
+
+// h3Path 返回本部署的 h3 入口路径。
+func (s *Server) h3Path() string { return s.h3entry }
 
 type serverSession struct {
 	sess       *Session
@@ -60,6 +67,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		sessions: make(map[[16]byte]*serverSession),
 		stopped:  make(chan struct{}),
 	}
+	s.h3entry = h3PathFor(cfg.PrivateKey.Public())
 	s.nextPath.Store(1 << 20) // 服务端分配的 path_id 与客户端选的不撞
 	go s.sweepLoop()
 	return s, nil

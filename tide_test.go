@@ -2709,6 +2709,91 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// h3 的那条路径不能是全网常量
+// ---------------------------------------------------------------------------
+
+// 承载 TIDE 的那条 h3 路径**曾经写死**成 /api/v1/stream，于是：
+//
+//   - 它在**每一个** TIDE 部署上逐字节相同。探测方猜中一次，就等于拿到了
+//     全网扫描的判据——这和 deploy/cover/index.html 那张占位页、
+//     以及握手帧的固定长度是同一类错误：一个到处一样的常量就是指纹。
+//     而 /api/v1/stream 恰恰是扫描器字典里会有的那种路径。
+//   - 打中它拿到的是 **200 OK 然后无限沉默**：服务端在认证**之前**就把状态码
+//     发出去了，认证失败之后只是 io.Copy(io.Discard) 把连接晾着。
+//     真实站点上一个不存在的路径会 404，一个真的流式接口会**发点什么**；
+//     "200 之后一个字节都没有、而且一直不关"两样都不是。
+//     代码注释当时写的是"没有票据一样过不了认证，只会被反代到掩护站点"——
+//     那句话与实现不符，反代那条路根本走不到。
+//
+// 处置照 Caddy forwardproxy 的 probe_resistance：没有凭据的请求一律**当成普通
+// 网站来伺候**，而代理入口藏在一个只有持密者知道的秘密地址后面。
+// 这里的"密"现成就有——服务端静态公钥，客户端配置里本来就带着它。
+func TestH3EntryPathIsNotAGlobalConstant(t *testing.T) {
+	cover := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nothing here", http.StatusNotFound)
+	}))
+	defer cover.Close()
+
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		sc.CoverAddr = strings.TrimPrefix(cover.URL, "http://")
+	})
+	go func() { _ = h.srv.ServeH3(net.JoinHostPort("127.0.0.1", strconv.Itoa(port))) }()
+	time.Sleep(400 * time.Millisecond)
+
+	tr := &http3.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "tide.test"},
+	}
+	defer tr.Close()
+
+	probe := func(path string) (int, string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		url := "https://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) + path
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("探测 %s 失败：%v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return resp.StatusCode, string(body)
+	}
+
+	// 从前写死的那条路径，现在必须和随便一条别的路径**没有任何区别**：
+	// 两者都该拿到掩护源站的真实响应。
+	for _, p := range []string{"/api/v1/stream", "/definitely-not-tide"} {
+		code, body := probe(p)
+		if code != http.StatusNotFound || !strings.Contains(body, "nothing here") {
+			t.Fatalf("探测 %s 拿到 %d %q，应当是掩护源站的 404 —— "+
+				"能被区分出来的路径就是全网扫描的判据", p, code, body)
+		}
+	}
+
+	// 而真正的入口必须**跟着公钥走**：换一把密钥就换一条路径。
+	other, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := h3PathFor(h.client.cfg.PublicKey)
+	b := h3PathFor(other.Public())
+	if a == b {
+		t.Fatal("两把不同的密钥导出了同一条路径 —— 那还是个全网常量")
+	}
+	if !strings.HasPrefix(a, "/") || strings.ContainsAny(a, " ?#") {
+		t.Fatalf("导出的路径 %q 不像个正常路径", a)
+	}
+	// 同一把密钥必须稳定，否则客户端和服务端会各请求各的。
+	if a != h3PathFor(h.client.cfg.PublicKey) {
+		t.Fatal("同一把公钥导出了两条不同的路径")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // UDP 关联的寿命
 // ---------------------------------------------------------------------------
 

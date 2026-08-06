@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net"
 	"net/http"
@@ -33,15 +35,41 @@ import (
 // 映射关系天然对齐：**一个 h3 请求 = 一条 TIDE 流**，与 §12.5 的每流一条 QUIC 流一致。
 
 const (
-	// h3Path 是 TIDE 请求的路径。选一个不起眼、且真实站点上大概率不存在的路径；
-	// 它落在**加密的** h3 请求头里，被动观察者看不到，主动探测方也猜不出——
-	// 就算猜中了，没有票据/KEM 一样过不了认证，只会被反代到掩护站点。
-	h3Path = "/api/v1/stream"
 	// h3CtlHeader 区分"控制请求"（承载握手，一条路径一个）与"数据请求"（一条流一个）。
 	h3CtlHeader  = "X-Request-Id"
 	h3CtlValue   = "ctl"
 	h3DataPrefix = "s"
 )
+
+// h3PathFor 导出这个部署的 TIDE 入口路径。
+//
+// ★ 它**必须**跟着服务端静态公钥走，不能是个常量。
+//
+// 这条路径曾经写死成 /api/v1/stream。它落在加密的 h3 请求头里，被动观察者确实
+// 看不到——但主动探测方不需要看，猜一次就行，而且它在**每一个** TIDE 部署上
+// 逐字节相同：猜中一次等于拿到全网扫描的判据。/api/v1/stream 恰恰是扫描器字典里
+// 会有的那种路径。这与 deploy/cover/index.html 那张占位页、以及握手帧的固定长度
+// 是同一类错误——**一个到处一样的常量就是指纹**。
+//
+// 更糟的是打中之后的行为：服务端在认证**之前**就把 200 发出去（客户端要等响应头
+// 才敢写，见 serve 里的说明），认证失败之后只是把连接晾着。于是探测方看到的是
+// "200 OK 然后无限沉默"——真实站点上不存在的路径会 404，真的流式接口会发点什么，
+// 两样都不是。NDSS'20 那篇 Detecting Probe-resistant Proxies 量过这件事：
+// 网上超过 94% 的服务器会对某个常见协议回数据，不回数据本身就是异常。
+//
+// 处置照 Caddy forwardproxy 的 probe_resistance：没有凭据的请求一律当成普通网站
+// 伺候（这里就是反代到掩护源站，h3Cover 已经在做），而代理入口藏在一个只有持密者
+// 知道的**秘密地址**后面（Caddy 用 secret-link 域名）。这里的"密"现成就有：
+// 服务端静态公钥，客户端配置里本来就带着它，不需要任何新配置项。
+//
+// 猜不中就没有任何区别性行为可测——探测方无论打哪条路径，拿到的都是掩护源站的
+// 真实响应。而要猜中就得先有公钥，那已经是共享秘密了。
+func h3PathFor(pub *PublicKey) string {
+	// 独立的标签，避免这个导出值与任何密钥派生共用输入。
+	sum := sha256.Sum256(append([]byte("tide/draft-02 h3-path\x00"), pub.Bytes()...))
+	// 形状要像个正常的带 ID 的 API 路径，别像随机串。
+	return "/api/v1/" + hex.EncodeToString(sum[:8])
+}
 
 // ---------------------------------------------------------------------------
 // 服务端
@@ -99,7 +127,7 @@ type h3Binding struct {
 }
 
 func (b *h3Binding) serve(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != h3Path || r.Method != http.MethodPost {
+	if r.URL.Path != b.srv.h3Path() || r.Method != http.MethodPost {
 		b.srv.h3Cover(w, r)
 		return
 	}
@@ -134,8 +162,17 @@ func (b *h3Binding) serveControl(st *http3.Stream) {
 	p, sess, err := b.srv.serverHandshake(t)
 	if err != nil {
 		// 认证失败：不做任何区别性响应，读到对端放弃为止。
-		// 这条请求已经回过 200 了，在探测方看来就是一个开着不说话的长连接——
-		// 与真实的流式接口没有区别。
+		//
+		// ⚠️ 这条路**不**反代到掩护源站，而且做不到——200 在认证之前就发出去了
+		// （客户端要等响应头才敢写，见 serve 里的说明），掩护源站的状态码与响应头
+		// 已经没地方放了。所以这里能提供的只是"一个开着不说话的长连接"。
+		//
+		// 它之所以仍然可以接受，是因为**走到这里必须先猜中入口路径**，
+		// 而那条路径由服务端静态公钥导出（见 h3PathFor）——猜不中就走 h3Cover，
+		// 拿到的是掩护源站的真实响应；能猜中就说明已经持有共享秘密了。
+		// 这就是 Caddy forwardproxy 的 probe_resistance 结构：
+		// 秘密地址之外一律当普通网站伺候。
+		// 别把这条路当成"反正有掩护"——它没有。
 		io.Copy(io.Discard, st)
 		st.Close()
 		return
@@ -366,7 +403,7 @@ func (c *Client) openH3Stream(ctx context.Context, cc *http3.ClientConn, control
 	if err != nil {
 		return nil, err
 	}
-	url := "https://" + c.quicAddr() + h3Path
+	url := "https://" + c.quicAddr() + h3PathFor(c.cfg.PublicKey)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return nil, err
