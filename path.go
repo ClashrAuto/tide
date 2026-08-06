@@ -91,6 +91,13 @@ type path struct {
 
 	dead     chan struct{}
 	deadOnce sync.Once
+	// deadReason 记下这条路径是被谁判死的。
+	//
+	// ★ 没有它就查不动"路径反复建起来又死"这类问题：markDead 有四个调用点
+	// （写循环退出、读循环出错、连丢探测、静默超时），四者的现象一模一样——
+	// 路径消失、重连、再消失。实网上 h3 模式 40 秒内建了 9 次路径，
+	// 而日志里一个字都没有，等于只能靠猜。
+	deadReason atomic.Value // string
 }
 
 func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey []byte, useAES bool, bare bool) (*path, error) {
@@ -198,7 +205,7 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 }
 
 func (p *path) writeLoop() {
-	defer p.markDead()
+	defer p.markDeadReason("write loop exited")
 	var out []byte
 	for {
 		p.wmu.Lock()
@@ -244,17 +251,27 @@ func (p *path) writeLoop() {
 // ---------------------------------------------------------------------------
 
 func (p *path) readLoop() {
-	defer p.markDead()
+	var rerr error
+	defer func() { p.markDeadReason("read loop: " + errText(rerr)) }()
 	for {
 		f, err := p.fr.ReadFrame()
 		if err != nil {
+			rerr = err
 			return
 		}
 		p.noteRecv(len(f.Payload))
 		if err := p.sess.handleFrame(p, f); err != nil {
+			rerr = err
 			return
 		}
 	}
+}
+
+func errText(err error) string {
+	if err == nil {
+		return "EOF"
+	}
+	return err.Error()
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +425,7 @@ func (p *path) reapProbes() {
 
 	switch {
 	case bad >= deadAfterLostProbes:
-		p.markDead()
+		p.markDeadReason("lost " + itoa(bad) + " consecutive probes")
 	case bad >= suspectAfterLostProbes:
 		p.setState(pathSuspect)
 	case loss > migrateLossThreshold && p.State() == pathActive:
@@ -423,8 +440,8 @@ func (p *path) reapProbes() {
 // 而流数据永远不会来。静默计时器不看语义，只看物理层面有没有字节，是更硬的证据。
 func (p *path) checkSilence() {
 	last := time.Unix(0, p.lastRecv.Load())
-	if time.Since(last) > DefaultPathDeadAfter {
-		p.markDead()
+	if d := time.Since(last); d > DefaultPathDeadAfter {
+		p.markDeadReason("silent for " + d.Round(time.Millisecond).String())
 	}
 }
 
@@ -446,8 +463,11 @@ func (p *path) noteRecv(n int) {
 	p.rxBytes.Add(uint64(n))
 }
 
-func (p *path) markDead() {
+func (p *path) markDead() { p.markDeadReason("unspecified") }
+
+func (p *path) markDeadReason(reason string) {
 	p.deadOnce.Do(func() {
+		p.deadReason.Store(reason)
 		p.state.Store(uint32(pathDead))
 		close(p.dead)
 		p.wmu.Lock()

@@ -54,6 +54,9 @@ type Session struct {
 	// pathsAdded 是累计接入过多少条路径。测试靠它确认"恢复机制真的被触发了"——
 	// 环回网络上重连快到看不见，一个只测了 happy path 的稳定性测试比没有更糟。
 	pathsAdded atomic.Uint64
+	// deadLog 留着最近几条路径的死因。路径死了就从 paths 里摘掉，
+	// 死因也跟着消失——而"反复建起来又死"恰恰只能靠死因序列来查。
+	deadLog deathLog
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -137,6 +140,7 @@ func (s *Session) addPath(p *path) {
 }
 
 func (s *Session) onPathDead(p *path) {
+	s.deadLog.add(p.kind + "#" + itoa(int(p.id)) + " " + p.DeadReason())
 	s.mu.Lock()
 	for i, q := range s.paths {
 		if q == p {
@@ -913,4 +917,37 @@ func fastRand() uint32 {
 			return uint32(x >> 33)
 		}
 	}
+}
+
+// deathLog 是一个很小的环形缓冲，记最近 16 条路径的死因。
+//
+// 只留 16 条是因为它的用途很窄：查"路径反复重建"时，前几条就足以看出模式
+// （是全都"lost N consecutive probes"，还是全都"read loop: ..."）。
+// 无上界地留着反而会在长跑会话里悄悄吃内存。
+type deathLog struct {
+	mu   sync.Mutex
+	ring [16]string
+	n    int
+}
+
+func (d *deathLog) add(s string) {
+	d.mu.Lock()
+	d.ring[d.n%len(d.ring)] = s
+	d.n++
+	d.mu.Unlock()
+}
+
+func (d *deathLog) snapshot() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := d.n
+	if n > len(d.ring) {
+		n = len(d.ring)
+	}
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		idx := (d.n - n + i) % len(d.ring)
+		out = append(out, d.ring[idx])
+	}
+	return out
 }

@@ -32,6 +32,8 @@ type PathInfo struct {
 	Pad   string // 当前填充阶段
 	TX    uint64
 	RX    uint64
+	// Dead 非空时说明这条路径已经死了，内容是**谁**判的死。
+	Dead string
 }
 
 // Paths 返回当前路径快照，供日志、UI 与自检展示。
@@ -49,6 +51,7 @@ func (s *Session) Paths() []PathInfo {
 			Pad:   p.pad.Phase().String(),
 			TX:    p.txBytes.Load(),
 			RX:    p.rxBytes.Load(),
+			Dead:  p.DeadReason(),
 		})
 	}
 	return out
@@ -92,3 +95,15 @@ func (c *Client) TicketsTaken() uint64 { return c.wallet.taken.Load() }
 
 // TicketsRemaining 返回钱包里还剩多少张可用票据。
 func (c *Client) TicketsRemaining() int { return c.wallet.remaining(time.Now()) }
+
+// DeadReason 返回这条路径被判死的原因，还活着时为空。
+func (p *path) DeadReason() string {
+	if v, ok := p.deadReason.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// PathDeaths 返回本会话里已经死掉的路径及其死因，供排查"路径反复重建"用。
+// 活着的路径不在其中。
+func (s *Session) PathDeaths() []string { return s.deadLog.snapshot() }
