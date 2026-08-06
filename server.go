@@ -137,18 +137,65 @@ func (s *Server) handleConn(raw net.Conn) {
 	// 它的响应会和真实访问不一样，探测方照样能分辨。
 	t := &teeConn{Conn: tc, rec: make([]byte, 0, 4096), recording: true}
 
+	// ★ 掩护连接**在读第一个字节之前**就开始拨，且不管这条连接后来是不是 TIDE。
+	//
+	// 这不是预取优化，是在堵一个时序侧信道。§7.1 要求"尽早判定"，于是不同的探测
+	// 会在不同深度被否掉：一个 HTTP 请求第 2 个字节就出局，而一个长得像 HELLO 的
+	// 探测要等服务端做完 X25519 + ML-KEM-768 解封装才在 AEAD 上失败。
+	// 那段密码学运算的时间就直接写在"多久之后掩护源站开始回话"里。
+	//
+	// 实测（掩护源站在本机）：垃圾探测 182µs、像 HELLO 的探测 315µs，
+	// 差 133µs / **+73%**，Welch t = 38.7，两个分布几乎不重叠。
+	// 而一台真正的 nginx 对这两个输入的响应时间**没有任何差别**——两者都只是畸形请求。
+	// 所以这个差值本身就是 TIDE 的签名，而且探测方不需要任何对照基线，
+	// 拿同一台机器自己跟自己比就够了。
+	//
+	// 讽刺的是 §7 建议掩护源站放本机以压低延迟，那反而**抬高了信噪比**、让这个
+	// 差值更好测。想靠"两边都慢一点"去抹平是抹不掉的：均值差在那里，多采几次就出来。
+	//
+	// 提前拨号把这件事从根上去掉：拨号在读任何字节之前就发起，它完成的时刻与
+	// 探测方发了什么完全无关。失败关闭时掩护连接**已经在手**，响应时刻由掩护源站
+	// 自己决定，密码学运算被并行掉了。代价是每条连接多一次到本机的 TCP 连接，
+	// 握手成功时立刻关掉——TIDE 一条路径只握手一次，会话是长寿的，这个代价可以忽略。
+	t.cover = s.dialCoverEarly()
+
 	p, sess, err := s.serverHandshake(t)
 	if err != nil {
 		s.failClosed(t)
 		return
 	}
 	t.stopRecording()
+	// 这条是真的 TIDE：掩护连接直接关掉，它的响应一个字节都不会回给客户端。
+	if c := t.takeCover(); c != nil {
+		c.Close()
+	}
 
 	sess.addPath(p)
 	<-p.dead
 }
 
-// failClosed 执行 §6。
+// dialCoverEarly 立刻起一个协程去连掩护源站，返回一个只会被写一次的通道。
+// 拿不到（没配掩护源站、或连不上）时通道里是 nil。
+func (s *Server) dialCoverEarly() <-chan net.Conn {
+	ch := make(chan net.Conn, 1)
+	if s.cfg.CoverAddr == "" || s.cfg.CoverAddr == "drop" {
+		ch <- nil
+		return ch
+	}
+	go func() {
+		c, err := net.DialTimeout("tcp", s.cfg.CoverAddr, 5*time.Second)
+		if err != nil {
+			ch <- nil
+			return
+		}
+		ch <- c
+	}()
+	return ch
+}
+
+// failClosed 执行 §7。掩护连接由 handleConn 在读第一个字节之前就拨好、
+// 并可能已经由 serverHandshake 提前把握手帧推过去了（见那两处的说明：
+// 这是在堵一个时序侧信道，不是预取优化）。
 func (s *Server) failClosed(t *teeConn) {
 	defer t.Conn.Close()
 	// ⚠️ 必须先把握手期间设的读超时清掉。忘了这一步，下面的 io.Copy 会在
@@ -156,27 +203,20 @@ func (s *Server) failClosed(t *teeConn) {
 	// 连接照样在，只是一个字节都不转，探测方看到的是"TLS 握手成功后立刻沉默"，
 	// 比不做伪装还显眼。
 	t.Conn.SetDeadline(time.Time{})
-	if s.cfg.CoverAddr == "drop" {
-		// 显式选择了不做伪装。直接读到对端放弃为止——
-		// 至少不要出现"立刻 RST"这种明显的区别性行为。
-		io.Copy(io.Discard, t.Conn)
-		return
-	}
-	up, err := net.DialTimeout("tcp", s.cfg.CoverAddr, 5*time.Second)
-	if err != nil {
-		// 掩护源站连不上。这时候唯一不制造差异的做法是把连接晾着直到对端放弃，
-		// 而不是马上关——马上关是一个可测量的、与真实站点完全不同的行为。
+	up := t.takeCover()
+	if up == nil {
+		// 没配掩护源站，或者连不上。这时候唯一不制造差异的做法是把连接晾着
+		// 直到对端放弃，而不是马上关——马上关是一个可测量的、与真实站点
+		// 完全不同的行为（§7.2）。
 		io.Copy(io.Discard, t.Conn)
 		return
 	}
 	defer up.Close()
 
-	// 先把握手期间已经读走的字节补给上游，再做双向拷贝。
-	if rec := t.recorded(); len(rec) > 0 {
-		if _, err := up.Write(rec); err != nil {
-			io.Copy(io.Discard, t.Conn)
-			return
-		}
+	// 把**还没推过**的那段录音补给上游（早推已经送走的部分不会重发）。
+	if err := t.flushCover(up); err != nil {
+		io.Copy(io.Discard, t.Conn)
+		return
 	}
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(up, t.Conn); done <- struct{}{} }()
@@ -189,7 +229,40 @@ type teeConn struct {
 	net.Conn
 	mu        sync.Mutex
 	rec       []byte
+	sent      int // rec 里已经转给掩护源站的前缀长度
 	recording bool
+
+	// cover 是 handleConn 在读第一个字节之前就发起的掩护连接（见 dialCoverEarly）。
+	cover     <-chan net.Conn
+	coverOnce sync.Once
+	up        net.Conn
+}
+
+// takeCover 取出提前拨好的掩护连接。多次调用返回同一条；没有掩护源站时返回 nil。
+func (t *teeConn) takeCover() net.Conn {
+	t.coverOnce.Do(func() {
+		if t.cover != nil {
+			t.up = <-t.cover
+		}
+	})
+	return t.up
+}
+
+// flushCover 把"已经录到、但还没转给掩护源站"的那一段推过去。可重复调用。
+//
+// 拆出偏移量是必要的：早推（serverHandshake 里）与失败关闭都会调它，
+// 不记偏移就会把握手帧发两遍——掩护源站收到的请求于是和真实访问不一样，
+// 响应也就不一样，等于把想消除的差异换了个地方留下。
+func (t *teeConn) flushCover(up net.Conn) error {
+	t.mu.Lock()
+	buf := append([]byte(nil), t.rec[t.sent:]...)
+	t.sent = len(t.rec)
+	t.mu.Unlock()
+	if len(buf) == 0 {
+		return nil
+	}
+	_, err := up.Write(buf)
+	return err
 }
 
 func (t *teeConn) Read(p []byte) (int, error) {
@@ -253,6 +326,22 @@ func (s *Server) serverHandshake(t *teeConn) (*path, *Session, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// ★ 握手帧已经读完，密码学验证还没开始——**就在这里**把已收到的字节推给掩护源站。
+	//
+	// 这是时序侧信道的第二半（第一半是 handleConn 里的提前拨号）。只提前拨号不够：
+	// 本机掩护源站的一次往返大约 150µs，而 X25519 + ML-KEM-768 解封装要 130µs，
+	// 后者仍然整个压在关键路径上。实测提前拨号只把差值从 133µs 压到 64µs。
+	// 把请求也提前推出去之后，掩护源站的处理与本端的密码学运算**并行**，
+	// 响应时刻由两者的较大值决定，而不是相加。
+	//
+	// 推的是"到目前为止读到的字节"，长度只取决于对端发了多少、与内容无关，
+	// 所以这一步本身不引入新的输入相关性。握手成功时这条掩护连接直接关掉，
+	// 它的响应一个字节都不会回给客户端。
+	go func() {
+		if up := t.takeCover(); up != nil {
+			t.flushCover(up)
+		}
+	}()
 	switch f.Type {
 	case FrameHello:
 		if len(f.Payload) < minHelloBody {

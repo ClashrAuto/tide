@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -866,6 +867,104 @@ func TestFailClosedForwardsToCover(t *testing.T) {
 	if el := time.Since(start); el > time.Second {
 		t.Fatalf("fail-closed took %v to reach the cover origin — a prober can distinguish "+
 			"that from a real site by response time alone", el)
+	}
+}
+
+// 失败关闭的响应时间**不得**明显取决于探测方发了什么。
+//
+// ★ §7.1 要求"尽早判定"，于是不同探测在不同深度出局：一个 HTTP 请求第 2 个字节
+// 就被否掉，而一个长得像 HELLO 的探测要等服务端做完 X25519 + ML-KEM-768 解封装
+// 才在 AEAD 上失败。那段密码学运算的时间会直接写进"多久之后掩护源站开始回话"。
+//
+// 这是一个**自足**的判据：探测方不需要任何对照基线，拿同一台机器自己跟自己比就行。
+// 而一台真正的 nginx 对这两个输入的响应时间没有任何差别——两者都只是畸形请求。
+// （讽刺的是 §7 建议掩护源站放本机以压低延迟，那反而抬高信噪比、让差值更好测。）
+//
+// 实测（本机掩护源站，长度对齐的两种探测各 400 次）：
+//
+//	修复前：182µs vs 315µs，差 133µs / +73%，Welch t = 38.7
+//	修复后：197µs vs 261µs，差  64µs / +33%，Welch t = 19.1
+//
+// 修法是把掩护连接的拨号提到读第一个字节**之前**，并在密码学验证开始前就把已收到的
+// 字节推给掩护源站，让两者并行而不是串行。
+//
+// ⚠️ 残留的 33% 短期内消不掉：掩护源站的字节**在确认握手失败之前绝不能回给客户端**，
+// 所以任何走到密码学那一步的探测都必然要等它。要彻底抹平只有两条路，都更糟——
+// 对所有输入都做一遍 KEM（4 字节的探测就能换一次 ML-KEM 解封装，
+// 正是 RFC 9000 §21.9 那类放大），或者给失败响应加一个固定下限
+// （那会让所有畸形请求都恰好耗时 T，本身又是个特征）。
+// 这条测试守的是"别退回修复前"，不是"已经解决"。
+func TestFailClosedTimingDoesNotLeakHandshakeDepth(t *testing.T) {
+	// -race 给每次内存访问插桩，密码学运算被拖慢的比例远大于 I/O，
+	// 于是这里量的"相对时间差"在 -race 下反映的是插桩开销而不是产品的性质。
+	if raceDetector {
+		t.Skip("时序测量在 -race 下失真；请用不带 -race 的一轮跑它")
+	}
+	h := newHarness(t, nil)
+	addr := h.ln.Addr().String()
+
+	// B：能过类型/长度检查，逼服务端做完整 KEM 解封装，最后卡在 AEAD。
+	body := make([]byte, minHelloBody)
+	if _, err := rand.Read(body); err != nil {
+		t.Fatal(err)
+	}
+	body[0] = ProtocolVersion
+	sl := authPlainLen + 16
+	body[1+kemShareLen+32] = byte(sl >> 8)
+	body[1+kemShareLen+33] = byte(sl)
+	kemProbe := AppendFrame(nil, FrameHello, FlagPush, 0, body, 0)
+
+	// A：**同样大小**的垃圾，第 2 个字节就出局。长度必须对齐——不然量到的差里
+	// 混着"请求大一点自然回得晚一点"，那在任何服务器上都成立，不是 TIDE 的特征。
+	head := []byte("GET / HTTP/1.1\r\nHost: a\r\nX-Pad: ")
+	tail := []byte("\r\n\r\n")
+	httpProbe := append([]byte{}, head...)
+	httpProbe = append(httpProbe, bytes.Repeat([]byte("a"), len(kemProbe)-len(head)-len(tail))...)
+	httpProbe = append(httpProbe, tail...)
+
+	probe := func(payload []byte) (time.Duration, bool) {
+		c, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+		if err != nil {
+			return 0, false
+		}
+		defer c.Close()
+		start := time.Now()
+		if _, err := c.Write(payload); err != nil {
+			return 0, false
+		}
+		var b [1]byte
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Read(b[:]); err != nil {
+			return 0, false
+		}
+		return time.Since(start), true
+	}
+
+	var a, b []float64
+	for i := 0; i < 150; i++ {
+		// 交替采样，抵消机器负载漂移
+		if d, ok := probe(httpProbe); ok {
+			a = append(a, float64(d.Microseconds()))
+		}
+		if d, ok := probe(kemProbe); ok {
+			b = append(b, float64(d.Microseconds()))
+		}
+	}
+	if len(a) < 50 || len(b) < 50 {
+		t.Skipf("样本不够：%d / %d", len(a), len(b))
+	}
+	sort.Float64s(a)
+	sort.Float64s(b)
+	medA, medB := a[len(a)/2], b[len(b)/2]
+	rel := (medB - medA) / medA
+	t.Logf("失败关闭响应中位数：垃圾探测 %.0fus  像HELLO %.0fus  相对差 %.1f%%", medA, medB, 100*rel)
+
+	// 修复前是 +73%。阈值取 55%：既能抓住"把提前拨号挪回 failClosed"这类回退，
+	// 又给机器负载留了余量。
+	if rel > 0.55 {
+		t.Fatalf("两类探测的失败关闭响应时间相差 %.1f%%（%.0fus vs %.0fus）—— "+
+			"探测方拿同一台机器自己跟自己比就能确认这跑的是 TIDE，不需要任何对照基线",
+			100*rel, medA, medB)
 	}
 }
 
