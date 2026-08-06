@@ -721,6 +721,19 @@ h3 服务器，探测方发的那个请求会挂死——比沉默更可疑。
 h3 模式下 `DATAGRAM` 现在走可靠有序的控制流，与 §9.1「UDP MUST NOT 重传」相悖——
 被代理的 QUIC 跑在可靠通道上会出现两层拥塞控制打架。这是功能缺口，不是洁癖。
 
+**接法已核实（quic-go v0.61 的 API 名字都确认存在）**，剩下的是机械工作：
+
+| 需要 | quic-go 提供 | 备注 |
+|---|---|---|
+| 收发 HTTP Datagram | `http3.Stream.SendDatagram` / `ReceiveDatagram` | **Quarter Stream ID 前缀由它自己加**，不用手写 RFC 9297 的封装 |
+| 客户端拿到 `*http3.Stream` | `http3.ClientConn.OpenRequestStream(ctx)` → `*RequestStream` | 官方注释写明用途就是"在收到响应之前就能用这条流发数据报" |
+| 两端开启 | `http3.Transport.EnableDatagrams` / `http3.Server.EnableDatagrams` | 同时还要在 QUIC 层 `quic.Config.EnableDatagrams`（当前 `h3QUICConfig()` 把它关掉了，要打开） |
+
+唯一有分量的改动是**客户端要从 `Transport.RoundTrip` 换成 `ClientConn.OpenRequestStream`**：
+现在的 `openH3Stream` 靠 `io.Pipe` + `resp.Body` 拼出双向流，换成 `RequestStream` 之后
+才拿得到底层的 `*http3.Stream`。风险点在于控制流同时承载握手，
+改它等于动整条路径的建立流程——建议先只把**数据报**切过去、握手仍走原路，验证通过再统一。
+
 实现过程中撞到并记下的**四个**坑，都属于"不写下来下次还会再踩"：
 
 0. **h3 请求的生命周期必须绑到路径，不能绑到拨号 ctx。** 控制流就是那个 HTTP 请求
