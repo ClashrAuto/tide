@@ -34,9 +34,22 @@ const (
 
 const (
 	x25519PubLen = 32
-	kemShareLen  = x25519PubLen + mlkem.CiphertextSize768 // 32 + 1088 = 1120
-	pubKeyLen    = x25519PubLen + mlkem.EncapsulationKeySize768
-	cbHashLen    = 32
+	// kem_share = X25519 临时公钥 || 发给服务端**静态** ML-KEM 的密文
+	//           || 客户端**临时** ML-KEM 封装密钥
+	//
+	// ★ 最后那一段（1184 字节）是后量子前向保密的前提，理由见 serverEphemeral。
+	// 前两段只做"到静态密钥"的封装：它给的是隐式服务端认证，**不是**前向保密——
+	// 静态密钥一旦事后泄露，配上录音就能把 ikm 重算出来。
+	kemShareLen = x25519PubLen + mlkem.CiphertextSize768 + mlkem.EncapsulationKeySize768
+	// kemStaticLen 是 kem_share 里"到静态密钥"的那一段，decapsulate 只看这一段。
+	kemStaticLen = x25519PubLen + mlkem.CiphertextSize768
+	// srvEphLen 是 ACCEPT 里服务端临时材料的长度：X25519 公钥 || 到客户端临时 ML-KEM 的密文。
+	srvEphLen = x25519PubLen + mlkem.CiphertextSize768
+	// cliEphLen 是 zero_seal 里客户端临时材料的长度：X25519 公钥 || 临时 ML-KEM 封装密钥。
+	// 0-RTT 没有 kem_share，这两样只能自己带。
+	cliEphLen = x25519PubLen + mlkem.EncapsulationKeySize768
+	pubKeyLen = x25519PubLen + mlkem.EncapsulationKeySize768
+	cbHashLen = 32
 )
 
 // preferAES 在有硬件 AES 的机器上为 true。ChaCha20-Poly1305 是默认值，因为无 AES-NI 时
@@ -180,28 +193,57 @@ func decodeB64(s string) ([]byte, error) {
 // 混合 KEM
 // ---------------------------------------------------------------------------
 
+// ephSecrets 是客户端本次连接的一对临时私钥。它们**从不上线**，握手结束即丢——
+// 前向保密全部落在这一点上。
+type ephSecrets struct {
+	x     *ecdh.PrivateKey
+	mlkem *mlkem.DecapsulationKey768
+}
+
 // encapsulate 由客户端调用：生成 kem_share 与共享密钥输入材料。
-func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, eph *ecdh.PrivateKey, err error) {
-	eph, err = ecdh.X25519().GenerateKey(rand.Reader)
+func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, eph *ephSecrets, err error) {
+	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	xShared, err := eph.ECDH(pub.x25519)
+	xShared, err := x.ECDH(pub.x25519)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	mShared, ct := pub.mlkem.Encapsulate()
+	// 客户端**临时** ML-KEM 密钥对：公钥随 kem_share 发出，服务端拿它封装一次，
+	// 得到的共享值进 ee。没有这一对，后量子那一半就只挂在服务端静态密钥上。
+	ek, err := mlkem.GenerateKey768()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	kemShare = make([]byte, 0, kemShareLen)
-	kemShare = append(kemShare, eph.PublicKey().Bytes()...)
+	kemShare = append(kemShare, x.PublicKey().Bytes()...)
 	kemShare = append(kemShare, ct...)
+	kemShare = append(kemShare, ek.EncapsulationKey().Bytes()...)
 
 	ikm = make([]byte, 0, len(xShared)+len(mShared))
 	ikm = append(ikm, xShared...)
 	ikm = append(ikm, mShared...)
-	// ★ 临时私钥要交回给调用方留着：会话密钥还要用它跟服务端的临时公钥做一次
-	// ephemeral-ephemeral（见 serverEphemeral）。这一步是前向保密的**全部**来源。
-	return kemShare, ikm, eph, nil
+	return kemShare, ikm, &ephSecrets{x: x, mlkem: ek}, nil
+}
+
+// newEphSecrets 生成一对客户端临时密钥，并给出线上要发的那份公开材料
+// （X25519 公钥 || ML-KEM 封装密钥）。0-RTT 路径没有 kem_share，用它自己带。
+func newEphSecrets() (pub []byte, eph *ephSecrets, err error) {
+	x, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	ek, err := mlkem.GenerateKey768()
+	if err != nil {
+		return nil, nil, err
+	}
+	pub = make([]byte, 0, cliEphLen)
+	pub = append(pub, x.PublicKey().Bytes()...)
+	pub = append(pub, ek.EncapsulationKey().Bytes()...)
+	return pub, &ephSecrets{x: x, mlkem: ek}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -216,48 +258,91 @@ func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, eph *ecdh.Private
 // `ee` 那一步存在的理由（IK 的第二条消息带上响应方的临时公钥并做 ee，
 // 传输阶段的前向保密全靠它）。
 //
-// 所以服务端每次握手另生成一对 X25519 临时密钥：公钥放进 ACCEPT（它被 k_hs 保护，
+// 所以服务端每次握手另生成一对临时密钥：公钥放进 ACCEPT（它被 k_hs 保护，
 // 事后攻破者能读到，但没关系——**私钥从不上线**，握手一结束就丢），
 // 双方各自算出同一个 ee 并把它混进会话密钥。攻击者缺的就是这个私钥。
 //
-// 代价：ACCEPT 多 32 字节，一次 X25519。不需要多一个往返，1-RTT 性质不变。
+// ★ ee **必须是混合的**，只做 X25519 不够。这一步 2026-08 补过两次，第二次才补对：
+//
+// design.md §10 把"先收割后解密（第 5 条）"和"服务端事后被攻破（第 7 条）"
+// 分别列为已解决，但它们**不组合**。ee 只有 X25519 时：
+//   · 只有量子计算机 → ikm 里的 ML-KEM 那一半还在，k_hs 安全。挡住。
+//   · 只有静态私钥泄露 → ee 还在，会话密钥安全。挡住。
+//   · **两者都有** → 静态私钥重算出 k_hs，量子计算机解掉 X25519 的 ee，
+//     会话密钥全部还原。而这恰恰是同一个敌手：能查抄服务器的国家级对手，
+//     也正是有能力"先收割后解密"的那一个。
+//
+// 所以 ee = X25519(临时,临时) || ML-KEM(客户端临时封装密钥)。后者要求客户端
+// 在第一个飞行里就发出自己的临时 ML-KEM **封装密钥**（1184 字节），
+// 服务端对它封装一次、把密文放进 ACCEPT（1088 字节）——这正是 TLS 1.3 的
+// X25519MLKEM768 的做法，浏览器已经在默认这么付这笔字节了。
+//
+// 注意"到静态密钥的封装"不能省：它给的是**隐式服务端认证**（只有真服务端能解开
+// HELLO.sealed），是 1-RTT 能成立的前提，与前向保密是两件事。
+//
+// 代价：kem_share +1184、ACCEPT +1088、zero_seal +1184，多一次 ML-KEM 封装/解封装。
+// **不需要多一个往返，1-RTT 与 0-RTT 的性质都不变。**
 //
 // ⚠️ 仍然**不**前向保密的部分（与 TLS 1.3 的 0-RTT 同款取舍，RFC 8446 §2.3）：
 // HELLO.sealed 与 ACCEPT 自身、以及 0-RTT 的 early_data。它们必须在拿到对方临时
 // 公钥之前就能读，1-RTT 里躲不掉。会话数据——也就是绝大部分字节——是保护住的。
 
-// serverEphemeral 由服务端调用：生成一对临时密钥，与客户端的临时公钥做 ee。
-// clientEphPub 取自 kem_share 的前 32 字节（1-RTT）或 zero_seal.eph（0-RTT）。
-func serverEphemeral(clientEphPub []byte) (pub []byte, ee []byte, err error) {
-	if len(clientEphPub) < x25519PubLen {
+// serverEphemeral 由服务端调用：生成一对临时密钥，与客户端的临时公开材料做混合 ee。
+// clientEph 是 X25519 公钥 || ML-KEM 封装密钥，取自 kem_share 的尾部（1-RTT）
+// 或 zero_seal.eph（0-RTT）。
+func serverEphemeral(clientEph []byte) (pub []byte, ee []byte, err error) {
+	if len(clientEph) < cliEphLen {
 		return nil, nil, ErrProtocol
 	}
-	peer, err := ecdh.X25519().NewPublicKey(clientEphPub[:x25519PubLen])
+	peer, err := ecdh.X25519().NewPublicKey(clientEph[:x25519PubLen])
 	if err != nil {
 		return nil, nil, err
 	}
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	peerEK, err := mlkem.NewEncapsulationKey768(clientEph[x25519PubLen:cliEphLen])
 	if err != nil {
 		return nil, nil, err
 	}
-	ee, err = eph.ECDH(peer)
+	x, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
-	return eph.PublicKey().Bytes(), ee, nil
+	xShared, err := x.ECDH(peer)
+	if err != nil {
+		return nil, nil, err
+	}
+	mShared, ct := peerEK.Encapsulate()
+
+	pub = make([]byte, 0, srvEphLen)
+	pub = append(pub, x.PublicKey().Bytes()...)
+	pub = append(pub, ct...)
+	ee = make([]byte, 0, len(xShared)+len(mShared))
+	ee = append(ee, xShared...)
+	ee = append(ee, mShared...)
+	return pub, ee, nil
 }
 
-// clientEphemeralShared 是客户端那一半：拿自己的临时私钥与 ACCEPT 里的服务端临时公钥
-// 算出同一个 ee。
-func clientEphemeralShared(eph *ecdh.PrivateKey, srvEphPub []byte) ([]byte, error) {
-	if eph == nil || len(srvEphPub) < x25519PubLen {
+// clientEphemeralShared 是客户端那一半：拿自己的两把临时私钥与 ACCEPT 里的
+// 服务端临时材料算出同一个 ee。
+func clientEphemeralShared(eph *ephSecrets, srvEph []byte) ([]byte, error) {
+	if eph == nil || len(srvEph) < srvEphLen {
 		return nil, ErrProtocol
 	}
-	peer, err := ecdh.X25519().NewPublicKey(srvEphPub[:x25519PubLen])
+	peer, err := ecdh.X25519().NewPublicKey(srvEph[:x25519PubLen])
 	if err != nil {
 		return nil, err
 	}
-	return eph.ECDH(peer)
+	xShared, err := eph.x.ECDH(peer)
+	if err != nil {
+		return nil, err
+	}
+	mShared, err := eph.mlkem.Decapsulate(srvEph[x25519PubLen:srvEphLen])
+	if err != nil {
+		return nil, err
+	}
+	ee := make([]byte, 0, len(xShared)+len(mShared))
+	ee = append(ee, xShared...)
+	ee = append(ee, mShared...)
+	return ee, nil
 }
 
 // decapsulate 由服务端调用。
@@ -276,7 +361,9 @@ func decapsulate(priv *PrivateKey, kemShare []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	mShared, err := priv.mlkem.Decapsulate(kemShare[x25519PubLen:])
+	// 只解"到静态密钥"的那一段；kem_share 尾部的客户端临时 ML-KEM 封装密钥
+	// 由 serverEphemeral 使用，与 ikm 无关。
+	mShared, err := priv.mlkem.Decapsulate(kemShare[x25519PubLen:kemStaticLen])
 	if err != nil {
 		return nil, err
 	}

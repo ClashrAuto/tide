@@ -2,7 +2,6 @@ package tide
 
 import (
 	"context"
-	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -433,9 +432,10 @@ func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
 		return nil, err
 	}
-	// 0-RTT 路径上没有 kem_share，服务端拿不到客户端的临时公钥就做不了 ee，
-	// 这条会话就会没有前向保密。所以这里另生成一对，把公钥带在 zero_seal 里。
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	// 0-RTT 路径上没有 kem_share，服务端拿不到客户端的临时公开材料就做不了 ee，
+	// 这条会话就会没有前向保密。所以这里另生成一对（X25519 + ML-KEM），
+	// 把公开的那一半带在 zero_seal 里。
+	ephPub, eph, err := newEphSecrets()
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +443,7 @@ func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID
 		cbHash: cb, timestamp: time.Now().Unix(), user: c.cfg.UserID,
 		sessionID: sid, flags: flags, pathID: pathID,
 	}
-	copy(zs.eph[:], eph.PublicKey().Bytes())
+	copy(zs.eph[:], ephPub)
 	ad := make([]byte, 0, 1+8+12)
 	ad = append(ad, ProtocolVersion)
 	ad = appendU64(ad, ticketID)
@@ -472,7 +472,7 @@ func zeroRTTHandshakeKey(ticketKey, cb []byte) ([]byte, error) {
 
 // eph 是本次连接的 X25519 临时私钥：ACCEPT 里带回服务端的临时公钥，两者做 ee，
 // 会话密钥因此获得前向保密（见 crypto.go）。
-func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID uint32, kind string, eph *ecdh.PrivateKey) (*path, error) {
+func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID uint32, kind string, eph *ephSecrets) (*path, error) {
 	f, err := readFrameExact(conn)
 	if err != nil {
 		return nil, err

@@ -12,11 +12,11 @@ import (
 
 const (
 	authPlainLen = 16 + 8 + cbHashLen + 1 + 16 + 4 // user||ts||cb||flags||session||path
-	// ACCEPT 末尾多一个 32 字节的服务端临时公钥（前向保密的 ee，见 crypto.go）。
-	acceptFixed = 16 + 1 + 4 + ticketGrantLen + x25519PubLen // session||mode||path_id||ticket||srv_eph
-	// zero_seal 同样多一个 32 字节的客户端临时公钥：0-RTT 路径上没有 kem_share，
-	// 不带它服务端就没有对端临时公钥可做 ee，整条 0-RTT 会话就没有前向保密。
-	zeroSealLen = cbHashLen + 8 + 16 + 16 + 1 + 4 + x25519PubLen // cb||ts||user||session||flags||path||eph
+	// ACCEPT 末尾带服务端临时材料：X25519 公钥 + 到客户端临时 ML-KEM 的密文（ee，见 crypto.go）。
+	acceptFixed = 16 + 1 + 4 + ticketGrantLen + srvEphLen // session||mode||path_id||ticket||srv_eph
+	// zero_seal 带客户端临时材料：X25519 公钥 + 临时 ML-KEM 封装密钥。0-RTT 没有 kem_share，
+	// 不带它服务端就做不了 ee，整条 0-RTT 会话就没有前向保密。
+	zeroSealLen = cbHashLen + 8 + 16 + 16 + 1 + 4 + cliEphLen // cb||ts||user||session||flags||path||eph
 )
 
 type authPlain struct {
@@ -58,7 +58,7 @@ func parseAuthPlain(b []byte) (*authPlain, bool) {
 // helloMsg 是 HELLO 帧的载荷。
 type helloMsg struct {
 	version      uint8
-	kemShare     []byte // 1120
+	kemShare     []byte // kemShareLen：X25519 公钥 + 静态 ML-KEM 密文 + 临时 ML-KEM 封装密钥
 	clientRandom [32]byte
 	sealed       []byte
 	earlyData    []byte
@@ -132,9 +132,9 @@ type zeroSeal struct {
 	sessionID [16]byte
 	flags     uint8
 	pathID    uint32
-	// eph 是客户端本次连接的 X25519 临时公钥，供服务端做 ee（前向保密）。
-	// 1-RTT 的那份在 kem_share 前 32 字节里，0-RTT 没有 kem_share，只能自己带。
-	eph [x25519PubLen]byte
+	// eph 是客户端本次连接的临时公开材料（X25519 公钥 || ML-KEM 封装密钥），供服务端做 ee。
+	// 1-RTT 的那份在 kem_share 里，0-RTT 没有 kem_share，只能自己带。
+	eph [cliEphLen]byte
 }
 
 func (z *zeroSeal) marshal(early []byte) []byte {
@@ -166,8 +166,8 @@ func parseZeroSeal(b []byte) (*zeroSeal, []byte, bool) {
 	o++
 	z.pathID = binary.BigEndian.Uint32(b[o : o+4])
 	o += 4
-	copy(z.eph[:], b[o:o+x25519PubLen])
-	o += x25519PubLen
+	copy(z.eph[:], b[o:o+cliEphLen])
+	o += cliEphLen
 	return z, b[o:], true
 }
 
@@ -187,9 +187,9 @@ type acceptMsg struct {
 	ticketBase  uint64
 	ticketCount uint16
 	ticketSeed  [32]byte
-	// srvEph 是服务端本次握手的 X25519 临时公钥。它被 k_hs 保护，事后攻破者读得到，
+	// srvEph 是服务端本次握手的临时材料。它被 k_hs 保护，事后攻破者读得到，
 	// 但对应的**私钥从不上线**、握手结束即丢——前向保密就落在这个不对称上。
-	srvEph     [x25519PubLen]byte
+	srvEph     [srvEphLen]byte
 	serverData []byte
 }
 
@@ -216,7 +216,7 @@ func parseAccept(b []byte) (*acceptMsg, bool) {
 		return nil, false
 	}
 	a.ticketBase, a.ticketCount, a.ticketSeed = base, count, seed
-	copy(a.srvEph[:], b[21+ticketGrantLen:21+ticketGrantLen+x25519PubLen])
+	copy(a.srvEph[:], b[21+ticketGrantLen:21+ticketGrantLen+srvEphLen])
 	a.serverData = b[acceptFixed:]
 	return a, true
 }

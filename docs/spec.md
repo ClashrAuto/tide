@@ -117,7 +117,9 @@ body = payload || pad_bytes[pad_len] || u16(pad_len)
 ```
 HELLO {
     version       : u8 = 0x01
-    kem_share     : X25519_pub(32) || MLKEM768_ct(1088)      // 1120 字节
+    kem_share     : X25519_pub(32) || MLKEM768_ct(1088) || MLKEM768_ek(1184)   // 2304 字节
+                    // 前两段：到服务端**静态**密钥的封装（隐式服务端认证）
+                    // 第三段：客户端**临时** ML-KEM 封装密钥，供 §3.2 的 ee 用
     client_random : 32 bytes
     sealed_len    : u16
     sealed_auth   : AEAD(k_hs, auth_plain, ad = transcript)  // nonce = 全零
@@ -156,7 +158,7 @@ ACCEPT_plain {
     ticket_base : u64
     ticket_count: u16           // 默认 1024
     ticket_seed : 32 bytes
-    srv_eph     : 32 bytes       // 服务端本次握手的 X25519 临时公钥
+    srv_eph     : 1120 bytes     // X25519_pub(32) || MLKEM768_ct(1088) 到客户端临时封装密钥
     server_data : opt bytes
 }
 
@@ -164,16 +166,19 @@ ACCEPT.payload = AEAD(k_hs, ACCEPT_plain, ad = transcript)   // nonce = 0…01
 
 ticket_key[i] = HKDF-Expand(ticket_seed, "tide/draft-01 ticket" || u64(id), 32)
 
-ee             = X25519(srv_eph_priv, client_eph_pub)        // client_eph_pub 见下
+ee             = X25519(srv_eph_x_priv, client_eph_x_pub)
+                 || MLKEM.Decap(client_eph_dk, srv_eph_ct)   // **必须是混合的**，见下
 session_secret = HKDF( ikm = k_hs || ee, salt = session_id, info = "tide/draft-01 session" )
 ```
 
 只下发一个 32 字节种子而非 1024 把密钥，是为了让 `ACCEPT` 保持小帧——
 整批密钥两端各自派生即可。
 
-**`srv_eph` 与 `ee` 是前向保密的唯一来源，MUST 存在。**
-`client_eph_pub` 取自 `HELLO.kem_share` 的前 32 字节（1-RTT）或 `zero_seal.eph`（0-RTT）。
-服务端 MUST 为每次握手新生成这对临时密钥，并在握手结束后 MUST 丢弃私钥。
+**`srv_eph` 与 `ee` 是前向保密的唯一来源，MUST 存在，且 `ee` MUST 是混合的
+（经典 + 后量子两项都要）。**
+客户端的临时公开材料取自 `HELLO.kem_share`（1-RTT：X25519 公钥在最前、临时 ML-KEM
+封装密钥在最后）或 `zero_seal.eph`（0-RTT）。
+服务端 MUST 为每次握手新生成这两对临时密钥，并在握手结束后 MUST 丢弃私钥。
 
 > 没有它，握手里就**一个服务端临时密钥都没有**：
 > `ikm = X25519(客户端临时, 服务端静态) || MLKEM.Decapsulate(服务端静态, ct)`，
@@ -188,7 +193,28 @@ session_secret = HKDF( ikm = k_hs || ee, salt = session_id, info = "tide/draft-0
 > 这与 TLS 1.3（RFC 8446 §2.3：0-RTT 数据不具前向保密）和 Noise IK
 > （`ee` 之前的消息只有弱前向保密）的取舍一致。
 >
-> 代价：`ACCEPT` +32 字节，每次握手多一次 X25519。**不增加往返。**
+⚠️ **`ee` 只做 X25519 是不够的**，哪怕 `ikm` 那边已经有 ML-KEM。
+
+> 这一条 draft-01 里写错过一次。`ikm` 的后量子那一半挂在服务端**静态**密钥上，
+> `ee` 的经典那一半挂在临时密钥上，两者各自挡住一种敌手，但**交集挡不住**：
+>
+> | 敌手能力 | `ee` 只有 X25519 | `ee` 是混合的 |
+> |---|---|---|
+> | 只有量子计算机 | 挡住（`k_hs` 里的 ML-KEM 还在） | 挡住 |
+> | 只有静态私钥 | 挡住（`ee` 还在） | 挡住 |
+> | **两者都有** | **全部失守** | 挡住 |
+>
+> 而这是**同一个敌手**：能查抄服务器的国家级对手，正是有能力"先收割后解密"的那一个。
+> 把两条威胁分开写，很容易看不见它们的交集。
+>
+> 因此客户端 MUST 在第一个飞行里发出自己的**临时** ML-KEM 封装密钥，
+> 服务端 MUST 对它封装并把密文放进 `srv_eph`。这与 TLS 1.3 的 X25519MLKEM768 同形。
+>
+> "到**静态**密钥的封装"仍然 MUST 保留：它给的是隐式服务端认证（只有真服务端能解开
+> `HELLO.sealed`），是 1-RTT 成立的前提，与前向保密是两件事。两处封装各司其职，缺一不可。
+
+> 代价：`kem_share` +1184、`ACCEPT` +1088、`zero_seal` +1184，
+> 多一次 ML-KEM 封装/解封装。**不增加往返，1-RTT 与 0-RTT 的性质都不变。**
 
 `ACCEPT` 的 nonce MUST 与 `HELLO` 的全零 nonce 区分（本规范取 `0…01`）：
 同一把 `k_hs` 下重复使用同一个 nonce 会直接泄露明文异或并允许伪造 tag。
@@ -207,14 +233,14 @@ ZERO_RTT {
                       ad = version || ticket_id || nonce)
 }
 
-zero_seal {                        // 109 字节
+zero_seal {                        // 1293 字节
     cb_hash    : 32 bytes
     timestamp  : u64
     user_id    : 16 bytes
     session_id : 16 bytes
     flags      : u8
     path_id    : u32
-    eph        : 32 bytes          // 客户端本次连接的 X25519 临时公钥
+    eph        : 1216 bytes        // X25519_pub(32) || MLKEM768_ek(1184)
 }
 
 k_hs = HKDF( ikm = ticket_key, salt = cb_hash, info = "tide/draft-01 0rtt" )

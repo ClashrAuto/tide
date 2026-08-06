@@ -408,9 +408,13 @@ func (s *Server) handleHello(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, *S
 		return nil, nil, ErrProtocol
 	}
 	useAES := ap.flags&flagHasAESNI != 0 && preferAES
-	// 1-RTT 的客户端临时公钥就在 kem_share 的前 32 字节里。
-	return s.finishHandshake(t, kHS, transcript, ap.user, ap.sessionID, ap.pathID, ap.flags, useAES, cb,
-		h.kemShare[:x25519PubLen])
+	// 1-RTT 的客户端临时公开材料分散在 kem_share 的两头：X25519 公钥在最前面，
+	// 临时 ML-KEM 封装密钥在最后（中间那段是发给**静态**密钥的密文，与 ee 无关）。
+	// serverEphemeral 要的是"X25519 公钥 || 封装密钥"这个拼接，和 0-RTT 的 zero_seal.eph 同形。
+	cliEph := make([]byte, 0, cliEphLen)
+	cliEph = append(cliEph, h.kemShare[:x25519PubLen]...)
+	cliEph = append(cliEph, h.kemShare[kemStaticLen:kemShareLen]...)
+	return s.finishHandshake(t, kHS, transcript, ap.user, ap.sessionID, ap.pathID, ap.flags, useAES, cb, cliEph)
 }
 
 func (s *Server) handleZeroRTT(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, *Session, error) {

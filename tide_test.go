@@ -166,9 +166,11 @@ func TestForwardSecrecyAgainstStaticKeyCompromise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 服务端这一侧：临时密钥对 + ee。srvEph 是**只出现在服务端内存里**的东西，
+	// 服务端这一侧：临时密钥对 + 混合 ee。服务端的临时私钥**只出现在它自己的内存里**，
 	// 握手一结束就没了，录音里没有，事后攻破也拿不到。
-	srvEphPub, ee, err := serverEphemeral(kemShare)
+	// 客户端的临时公开材料分散在 kem_share 两头（中间那段是发给静态密钥的密文）。
+	cliEphPub := append(append([]byte{}, kemShare[:x25519PubLen]...), kemShare[kemStaticLen:kemShareLen]...)
+	srvEphPub, ee, err := serverEphemeral(cliEphPub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +224,28 @@ func TestForwardSecrecyAgainstStaticKeyCompromise(t *testing.T) {
 	if bytes.Equal(real, forged) {
 		t.Fatal("拿静态私钥 + 一份录音就还原出了会话密钥 —— 没有前向保密。" +
 			"design.md §10 把这条列为已解决的威胁，实际上握手里没有任何服务端临时密钥")
+	}
+
+	// ★ 最要紧的一条：**静态私钥泄露 + 量子计算机**同时成立时也必须挡住。
+	//
+	// design.md §10 把"先收割后解密（第 5 条）"与"服务端事后被攻破（第 7 条）"
+	// 分别列为已解决，但它们**不组合**：ee 若只有 X25519，量子对手解掉它、
+	// 静态私钥重算出 k_hs，会话密钥就全还原了。而这恰恰是同一个敌手——
+	// 能查抄服务器的国家级对手，也正是有能力"先收割后解密"的那一个。
+	//
+	// 这里用"把 ee 的 X25519 那一半直接送给攻击者"来模拟量子能力：
+	// X25519 部分视作已破，ML-KEM 部分仍然安全。
+	if len(ee) <= x25519PubLen {
+		t.Fatal("ee 里没有后量子部分 —— 静态私钥泄露 + 量子对手就能还原整条会话")
+	}
+	quantumEE := append([]byte{}, ee[:x25519PubLen]...) // 只有被量子解掉的经典那一半
+	quantumForged, err := sessionSecret(kHS2, quantumEE, sid[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(real, quantumForged) {
+		t.Fatal("静态私钥 + 量子能力（X25519 视作已破）就还原出了会话密钥 —— " +
+			"ee 缺后量子那一半。§10 的第 5 条与第 7 条各自成立，合起来不成立")
 	}
 }
 
