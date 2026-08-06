@@ -14,6 +14,11 @@
 # 这三件事的共同点：库的测试全绿，`-mode local` 也全绿，因为它们都在同一个进程里
 # 用同一份内存中的 Server/Client 对象，从不经过命令行、配置解析、两个进程的握手。
 # 这个脚本补的就是那一层。
+#
+# ⚠️ 速率故意压得很低（32 KiB/s、单流）。这是**冒烟**，要证明的是"这条路通"，
+# 不是量吞吐——CI 的 runner 是两核共享机，把吞吐指标塞进门禁只会换来偶发的红，
+# 而一个偶发红的门禁比没有门禁更糟：它会训练所有人无视它。
+# 真要量吞吐用 `tide-selftest -mode client` 单独跑。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -30,10 +35,6 @@ go build -o "$tmp/tide-server" ./cmd/tide-server
 go build -o "$tmp/tide-selftest" ./cmd/tide-selftest
 
 # 回声上游：既当被代理的目标，也当掩护源站（失败关闭只是把字节对拷过去，回声足够）。
-echo "== 起回声上游 =="
-"$tmp/tide-selftest" -mode raw-server -listen 127.0.0.1:19000 >"$tmp/echo.log" 2>&1 &
-pids+=($!)
-
 wait_port() {
   for _ in $(seq 1 50); do
     if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then exec 3<&- 3>&-; return 0; fi
@@ -41,7 +42,28 @@ wait_port() {
   done
   echo "端口 $1 一直没起来"; return 1
 }
-wait_port 19000
+
+# ★ 端口随机挑，不要写死。
+# 写死的话，任何一次残留进程（上一次跑挂了、或者同机上并发跑一次）都会让后续每次
+# 都以 "bind: address already in use" 失败，而那条错误躲在服务端日志里，
+# 脚本表面上只是"取不到 public-key"——排查方向完全被带偏。
+pick_port() {
+  for _ in $(seq 1 100); do
+    local p=$((20000 + RANDOM % 20000))
+    # 连得上 = 有人在listen = 不能用。连不上才是空闲。
+    # 参数 $1 是"已经挑走的端口"，必须排除：两个服务撞同一个端口时，
+    # 后起的那个才报 bind 失败，而它的失败同样只会表现成"取不到 public-key"。
+    [ "$p" = "${1:-}" ] && continue
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then echo "$p"; return 0; fi
+  done
+  echo "找不到空闲端口" >&2; return 1
+}
+ECHO_PORT=$(pick_port)
+TIDE_PORT=$(pick_port "$ECHO_PORT")
+
+"$tmp/tide-selftest" -mode raw-server -listen "127.0.0.1:$ECHO_PORT" >"$tmp/echo.log" 2>&1 &
+pids+=($!)
+wait_port "$ECHO_PORT"
 
 run_case() {
   local label="$1" srv_extra="$2" cli_extra="$3" want_paths="$4"
@@ -49,23 +71,36 @@ run_case() {
   rm -rf "$tmp/data"; mkdir -p "$tmp/data"
   # shellcheck disable=SC2086
   "$tmp/tide-server" $srv_extra \
-    -listen 127.0.0.1:18443 -quic-listen 127.0.0.1:18443 \
-    -cover 127.0.0.1:19000 -users alice:smoke-pw \
+    -listen 127.0.0.1:$TIDE_PORT -quic-listen 127.0.0.1:$TIDE_PORT \
+    -cover 127.0.0.1:$ECHO_PORT -users alice:smoke-pw \
     -key-file "$tmp/data/k" -cert "$tmp/data/c" -cert-key "$tmp/data/ck" \
     >"$tmp/srv.log" 2>&1 &
   local srv=$!
   pids+=("$srv")
-  wait_port 18443
 
-  # 公钥只能从服务端自己打印的横幅里拿——这一步顺带验证了那段横幅还是对的。
-  local pub
-  pub=$(grep -m1 'public-key:' "$tmp/srv.log" | sed 's/.*public-key: //')
-  if [ -z "$pub" ]; then echo "没能从服务端横幅里取到 public-key"; cat "$tmp/srv.log"; return 1; fi
+  # ★ 等的是**横幅**，不是端口。
+  # 端口在 net.Listen 那一刻就可连了，而公钥要等 printBanner 才写出来——
+  # 按端口判就绪是个竞态，机器一忙就抓到空的 public-key，
+  # 表现是脚本毫无征兆地退出（`pub=` 之后直接 return 1）。
+  # 这个脚本要的就绪信号本来就是"横幅出来了"，那就直接等它。
+  local pub=""
+  for _ in $(seq 1 100); do
+    # ⚠️ 末尾的 `|| true` 不能省：横幅还没写出来时 grep 返回 1，
+    # 而 set -o pipefail 让整条管道也返回 1，赋值语句于是"失败"，set -e 当场退出——
+    # 表现是脚本在这里毫无输出地结束，看起来像卡住而不是出错。
+    # 同理别写成 `[ -n "$pub" ] && break`：pub 为空时它返回 1，
+    # 作为循环体最后一条命令同样会被 set -e 干掉。
+    pub=$(grep -m1 'public-key:' "$tmp/srv.log" 2>/dev/null | sed 's/.*public-key: //' || true)
+    if [ -n "$pub" ]; then break; fi
+    sleep 0.2
+  done
+  if [ -z "$pub" ]; then echo "服务端横幅里一直没出现 public-key："; cat "$tmp/srv.log"; return 1; fi
+  wait_port "$TIDE_PORT"
 
   # shellcheck disable=SC2086
   if ! "$tmp/tide-selftest" -mode client \
-      -server 127.0.0.1:18443 -key "$pub" -password smoke-pw \
-      -target 127.0.0.1:19000 -duration 4s -streams 2 -rate 262144 $cli_extra \
+      -server 127.0.0.1:$TIDE_PORT -key "$pub" -password smoke-pw \
+      -target 127.0.0.1:$ECHO_PORT -duration 4s -streams 1 -rate 32768 $cli_extra \
       >"$tmp/cli.log" 2>&1; then
     echo "客户端失败："; tail -20 "$tmp/cli.log"; return 1
   fi

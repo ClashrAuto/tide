@@ -488,106 +488,130 @@ func TestWalletAndStoreAgreeOnEvictionOrder(t *testing.T) {
 	}
 }
 
-// 重放一个捕获到的 HELLO **不得**在受害者会话上留下一条活着的路径。
+// 重放一个捕获到的握手帧，**不得**在受害者会话上留下一条路径。
 //
-// ★ 单次票据只管 0-RTT；1-RTT 的 HELLO 没有票据也没有 nonce 缓存，
-// 在 ±120 秒的时间戳窗口内是**字节级可重放**的。这一点 design.md 第 6 条没有覆盖。
+// ★ 两个方向各有一条，因为挡住它们的是**两个不同的机制**——这一点第一版没查清就
+// 写了"归因未明"，而问题出在测试本身：受害者客户端手里有票据，它的 join 走的是
+// 0-RTT，于是录到的根本不是 HELLO 而是 ZERO_RTT。把 cb 比对摘掉当然不影响结果，
+// 因为 cb 从头到尾就没参与。**测试的名字和它实际测的东西不是一回事。**
 //
-// 后果不止"多一次握手"：被重放的 HELLO 里带着 session_id（请求**加入**已有会话）。
-// 一旦成功，攻击者就把一条自己控制的路径挂进了受害者的会话，
-// 调度器随时可能把受害者的流量派到那条路上黑洞掉。内容它读不了（会话密钥推不出来），
-// 但足以让会话卡死。
-//
-// ⚠️ 本用例只断言**结果**，不断言是哪个机制挡住的。试过把服务端的 cb_hash 比对
-// 摘掉，它照样通过——也就是说保护不（只）来自那处比较。没查清之前不写归因：
-// 一条把功劳记错地方的注释，会让后来人放心地去动那个其实不承重的地方。
-func TestReplayedHelloCannotJoinVictimSession(t *testing.T) {
-	h := newHarness(t, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+// 被重放的帧里带着 session_id（请求**加入**已有会话），一旦成功，攻击者就把一条
+// 自己控制的路径挂进了受害者的会话，调度器随时可能把受害者的流量派到那条路上黑洞掉。
+// 内容它读不了（会话密钥推不出来），但足以让会话卡死。
+func TestReplayedHandshakeCannotJoinVictimSession(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		drainWallet bool
+		wantFrame   FrameType
+		wantErr     error
+		why         string
+	}{
+		// 1-RTT：没有票据、也没有 nonce 缓存，在 ±120 秒的时间戳窗口内**字节级可重放**。
+		// 唯一挡住它的是信道绑定——重放方只能在自己的 TLS 连接上重放，而 cb 绑的是受害者那条。
+		{"1-RTT HELLO", true, FrameHello, ErrChannelBinding, "信道绑定"},
+		// 0-RTT：票据是一次性的，重放时位图里那一位已经置上了。
+		{"0-RTT ZERO_RTT", false, FrameZeroRTT, ErrBadTicket, "单次票据"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
 
-	// 受害者建会话，并让它多挂一条路径——第二条走的正是 join 流程。
-	sess, err := h.client.Session(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p2, err := h.client.dialPath(ctx, sess, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sess.addPath(p2) {
-		t.Fatal("第二条路径没挂上")
-	}
-	// ★ 要看的是**服务端**那一侧的会话：攻击者一旦 join 成功，多出来的路径挂在
-	// 服务端的会话对象上，客户端自己的 sess 里根本看不见。
-	// 第一版这条用例就断言错了对象，负对照（摘掉 cb 比对）照样绿——
-	// 一条永远通过的安全测试比没有更糟。
-	srvPaths := func() int {
-		h.srv.mu.Lock()
-		ss := h.srv.sessions[sess.ID()]
-		h.srv.mu.Unlock()
-		if ss == nil {
-			return -1
-		}
-		return len(ss.sess.pathsSnapshot())
-	}
-	if n := srvPaths(); n < 1 {
-		t.Fatalf("服务端上找不到这条会话（%d）", n)
-	}
+			sess, err := h.client.Session(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.drainWallet {
+				// ★ 不清空钱包就逼不出 1-RTT：客户端有票就会走 0-RTT。
+				// handshake 读的是 Client 上那个钱包，两处都要换。
+				h.client.wallet = newTicketWallet()
+				sess.wallet = newTicketWallet()
+			}
 
-	// 攻击者：捕获受害者那条 join HELLO 的**明文字节**（最强假设——
-	// 相当于外层 TLS 已经被看穿），在自己的 TLS 连接上原样重放。
-	var captured []byte
-	victim := &captureConn{}
-	{
-		// 用同一个客户端再拨一次 join，把写出去的字节录下来。
-		raw, err := net.Dial("tcp", h.ln.Addr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer raw.Close()
-		tc := tls.Client(raw, h.client.tlsCfg)
-		if err := tc.HandshakeContext(ctx); err != nil {
-			t.Fatal(err)
-		}
-		victim.Conn = tc
-		if _, err := h.client.handshake(ctx, sess, victim, true, "tcp"); err != nil {
-			t.Fatalf("受害者自己的 join 就失败了，测不下去：%v", err)
-		}
-		captured = victim.written()
-	}
-	if len(captured) == 0 {
-		t.Fatal("没录到 HELLO 字节")
-	}
-	// ★ 基线必须在**受害者自己那次 join 之后**才取：那次握手服务端侧也会加一条路径
-	// （客户端没 addPath，但服务端 handleConn 会）。在它之前取基线，
-	// 受害者自己加的那条会被算到攻击者头上。
-	time.Sleep(300 * time.Millisecond)
-	before := srvPaths()
+			// 受害者做一次 join 握手，把它写出去的字节录下来。
+			raw, err := net.Dial("tcp", h.ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			vic := tls.Client(raw, h.client.tlsCfg)
+			if err := vic.HandshakeContext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			rec := &captureConn{Conn: vic}
+			if _, err := h.client.handshake(ctx, sess, rec, true, "tcp"); err != nil {
+				t.Fatal(err)
+			}
+			f, err := readFrameExact(bytes.NewReader(rec.written()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f.Type != tc.wantFrame {
+				t.Fatalf("录到的是 %v，不是 %v —— 用例没在测它声称要测的东西", f.Type, tc.wantFrame)
+			}
 
-	// 攻击者的连接：另一条 TLS，原样重放那串字节。
-	atk, err := tls.Dial("tcp", h.ln.Addr().String(), &tls.Config{
-		InsecureSkipVerify: true, ServerName: "tide.test", MinVersion: tls.VersionTLS13,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer atk.Close()
-	if _, err := atk.Write(captured); err != nil {
-		t.Fatal(err)
-	}
-	// 服务端应当失败关闭并转给掩护源站（回声），而**不是**回一个 ACCEPT。
-	atk.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, len(captured))
-	n, _ := io.ReadFull(atk, buf)
-	if n > 0 && bytes.Equal(buf[:n], captured[:n]) {
-		t.Logf("重放被失败关闭，字节原样转给了掩护源站（%d 字节回声）", n)
-	}
+			srvPaths := func() int {
+				h.srv.mu.Lock()
+				ss := h.srv.sessions[sess.ID()]
+				h.srv.mu.Unlock()
+				if ss == nil {
+					return -1
+				}
+				return len(ss.sess.pathsSnapshot())
+			}
+			// ★ 基线必须等服务端把**受害者自己那次 join** 记上之后再取。
+			// 客户端的 handshake() 返回时，服务端那边的 addPath 可能还没跑完
+			// （它在另一个协程里），过早取样会把受害者自己加的那条算到攻击者头上。
+			// 这条用例第一版就栽在这里：10 次里偶发一次 1 → 2 的假阳性。
+			settle := func() int {
+				last := srvPaths()
+				for i := 0; i < 20; i++ {
+					time.Sleep(50 * time.Millisecond)
+					now := srvPaths()
+					if now == last {
+						return now
+					}
+					last = now
+				}
+				return last
+			}
+			before := settle()
 
-	time.Sleep(500 * time.Millisecond)
-	if after := srvPaths(); after > before {
-		t.Fatalf("重放的 HELLO 把攻击者的连接挂进了受害者的会话（服务端路径 %d → %d）—— "+
-			"攻击者可以就此把受害者的流量吸到自己控制的路径上黑洞掉", before, after)
+			// 攻击者：另一条 TLS 连接，因此 cb 与受害者那条不同。
+			atk, err := tls.Dial("tcp", h.ln.Addr().String(), &tls.Config{
+				InsecureSkipVerify: true, ServerName: "tide.test", MinVersion: tls.VersionTLS13,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer atk.Close()
+			exp, err := exporterFor(atk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			atkCB, err := channelBinding(exp)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var herr error
+			switch tc.wantFrame {
+			case FrameHello:
+				_, _, herr = h.srv.handleHello(&teeConn{Conn: atk}, f, atkCB)
+			default:
+				_, _, herr = h.srv.handleZeroRTT(&teeConn{Conn: atk}, f, atkCB)
+			}
+			// ★ 断言的是**具体哪个机制**挡住的，不只是"被挡住了"。
+			// 只断言结果的话，哪天真正承重的那道防线被拆了，用例还会因为另一个
+			// 无关的原因继续绿——第一版就是这么把归因记错的。
+			if !errors.Is(herr, tc.wantErr) {
+				t.Fatalf("期望被%s挡住（%v），实际返回 %v", tc.why, tc.wantErr, herr)
+			}
+			time.Sleep(300 * time.Millisecond)
+			if after := srvPaths(); after > before {
+				t.Fatalf("重放在受害者会话上留下了路径（%d → %d）", before, after)
+			}
+		})
 	}
 }
 
