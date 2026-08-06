@@ -2,8 +2,8 @@ package tide
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -78,7 +78,12 @@ func (s *Server) serveH3Conn(conn *quic.Conn) {
 	// 每条 QUIC 连接一个 h3 服务器实例，好让 handler 闭包拿到这条 *quic.Conn——
 	// 信道绑定（spec §5）要从它导出 TLS Exporter，而 http3 的 handler 上下文里没有。
 	bind := &h3Binding{srv: s, conn: conn}
-	h3 := &http3.Server{Handler: http.HandlerFunc(bind.serve)}
+	h3 := &http3.Server{
+		Handler: http.HandlerFunc(bind.serve),
+		// RFC 9297：UDP 关联要走 HTTP Datagram，不能塞进可靠有序的流里
+		// （§9.1：UDP MUST NOT 重传）。
+		EnableDatagrams: true,
+	}
 	_ = h3.ServeQUICConn(conn)
 	bind.close()
 }
@@ -138,6 +143,9 @@ func (b *h3Binding) serveControl(st *http3.Stream) {
 	// ★ 服务端侧也要装 h3 分流器，否则 serveData 拿不到 qmux，
 	// 会把每条数据流原地丢掉——路径活着、控制流通着，数据却一个字节都不过。
 	p.qmux = newQUICMuxH3Server(b.conn, p)
+	// 控制流同时是数据报流：两端必须用同一条，客户端那边也是控制流。
+	p.h3srv = st
+	go recvH3Datagrams(p, st)
 
 	b.mu.Lock()
 	b.path, b.sess = p, sess
@@ -176,6 +184,24 @@ func (b *h3Binding) close() {
 	b.mu.Unlock()
 	if p != nil {
 		p.markDead()
+	}
+}
+
+// recvH3Datagrams 收 RFC 9297 数据报并按普通帧分发（服务端侧）。
+func recvH3Datagrams(p *path, st *http3.Stream) {
+	for {
+		b, err := st.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+		f, err := readFrameExact(bytes.NewReader(b))
+		if err != nil {
+			continue
+		}
+		p.noteRecv(len(f.Payload))
+		if err := p.sess.handleFrame(p, f); err != nil {
+			return
+		}
 	}
 }
 
@@ -265,21 +291,21 @@ func (s *h3Stream) Close() error                { return s.st.Close() }
 
 // dialH3Path 用 HTTP/3 拨一条 TIDE 路径。
 func (c *Client) dialH3Path(ctx context.Context, s *Session, join bool) (*path, error) {
-	var captured *quic.Conn
-	var once sync.Once
-	tr := &http3.Transport{
-		TLSClientConfig: quicClientTLS(c.tlsCfg),
-		QUICConfig:      h3QUICConfig(),
-		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-			// ★ 自己拨、自己留一份连接引用：信道绑定要从这条连接导出 TLS Exporter，
-			// 而 http3.Transport 不把连接暴露给调用方。没有这个钩子就没法做 §5。
-			conn, err := quic.DialAddr(ctx, addr, tlsCfg, cfg)
-			if err == nil {
-				once.Do(func() { captured = conn })
-			}
-			return conn, err
-		},
+	// ★ 自己拨 QUIC，再用 NewClientConn 把 h3 架上去。
+	//
+	// 不用 Transport.RoundTrip 的原因有两个，缺一不可：
+	//  1. 信道绑定（§5）要从这条 *quic.Conn 导出 TLS Exporter，而 RoundTrip 不暴露连接。
+	//  2. RFC 9297 的数据报绑在**具体某条请求流**上，只有 OpenRequestStream 拿得到
+	//     那个 *RequestStream；RoundTrip 只给 resp.Body，够不着 SendDatagram。
+	//
+	// ⚠️ 两者不能混用：NewClientConn 会自己开一条 h3 控制流并发 SETTINGS，
+	// 同一条 QUIC 连接上再让 RoundTrip 开第二条，就是两条控制流 = h3 协议错误。
+	captured, err := quic.DialAddr(ctx, c.quicAddr(), quicClientTLS(c.tlsCfg), h3QUICConfig())
+	if err != nil {
+		return nil, err
 	}
+	tr := &http3.Transport{EnableDatagrams: true}
+	cc := tr.NewClientConn(captured)
 
 	// ★ 请求的生命周期必须绑到**路径**，不能绑到拨号 ctx。
 	//
@@ -308,15 +334,10 @@ func (c *Client) dialH3Path(ctx context.Context, s *Session, join bool) (*path, 
 		return nil, err
 	}
 
-	ctlStream, err := c.openH3Stream(pctx, tr, true, 0)
+	ctlStream, err := c.openH3Stream(pctx, cc, true)
 	if err != nil {
 		return fail(err)
 	}
-	if captured == nil {
-		ctlStream.Close()
-		return fail(errNoExporter)
-	}
-
 	hc := &h3ClientConn{rw: ctlStream, conn: captured}
 	p, err := c.handshake(ctx, s, hc, join, "quic")
 	if err != nil {
@@ -325,20 +346,28 @@ func (c *Client) dialH3Path(ctx context.Context, s *Session, join bool) (*path, 
 	}
 	close(hsDone) // 握手完成：拨号 ctx 到期起不再影响这条路径
 
-	p.h3 = &h3Client{tr: tr, client: c, cancel: pcancel}
+	// 控制流同时承载 RFC 9297 的数据报：数据报绑在流上，两端必须用**同一条**流，
+	// 而控制流是唯一双方都确定存在、且生命周期与路径一致的那条。
+	p.h3 = &h3Client{tr: tr, client: c, cancel: pcancel, ctl: ctlStream.rs}
 	// 数据流同样用路径级 ctx，路径一死它们跟着回收。
 	p.qmux = newQUICMuxH3(captured, p, func() (muxStream, error) {
-		return c.openH3Stream(pctx, tr, false, 0)
+		return c.openH3Stream(pctx, cc, false)
 	})
+	go p.h3.recvDatagrams(pctx, p)
 	return p, nil
 }
 
-// openH3Stream 发一个 POST 并把它变成一条双向字节流：
-// 请求体是上行、响应体是下行。
-func (c *Client) openH3Stream(ctx context.Context, tr *http3.Transport, control bool, sid uint64) (*h3ClientStream, error) {
-	pr, pw := io.Pipe()
+// openH3Stream 开一条请求流，并把它当成双向字节流用。
+//
+// 比先前的 io.Pipe + resp.Body 干净：RequestStream 本身就是双向的，
+// 而且它才拿得到 SendDatagram（RFC 9297 的数据报绑在具体请求流上）。
+func (c *Client) openH3Stream(ctx context.Context, cc *http3.ClientConn, control bool) (*h3ClientStream, error) {
+	rs, err := cc.OpenRequestStream(ctx)
+	if err != nil {
+		return nil, err
+	}
 	url := "https://" + c.quicAddr() + h3Path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -347,30 +376,28 @@ func (c *Client) openH3Stream(ctx context.Context, tr *http3.Transport, control 
 	} else {
 		req.Header.Set(h3CtlHeader, h3DataPrefix)
 	}
-	resp, err := tr.RoundTrip(req)
+	if err := rs.SendRequestHeader(req); err != nil {
+		return nil, err
+	}
+	// 服务端在劫持前就回了 200 并冲刷，所以这里不会久等。
+	resp, err := rs.ReadResponse()
 	if err != nil {
-		pw.Close()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		pw.Close()
+		rs.Close()
 		return nil, ErrProtocol
 	}
-	return &h3ClientStream{w: pw, r: resp.Body}, nil
+	return &h3ClientStream{rs: rs}, nil
 }
 
 type h3ClientStream struct {
-	w *io.PipeWriter
-	r io.ReadCloser
+	rs *http3.RequestStream
 }
 
-func (s *h3ClientStream) Read(p []byte) (int, error)  { return s.r.Read(p) }
-func (s *h3ClientStream) Write(p []byte) (int, error) { return s.w.Write(p) }
-func (s *h3ClientStream) Close() error {
-	s.w.Close()
-	return s.r.Close()
-}
+func (s *h3ClientStream) Read(p []byte) (int, error)  { return s.rs.Read(p) }
+func (s *h3ClientStream) Write(p []byte) (int, error) { return s.rs.Write(p) }
+func (s *h3ClientStream) Close() error                { return s.rs.Close() }
 
 // h3ClientConn 是客户端侧的握手载体，同样要能导出信道绑定值。
 type h3ClientConn struct {
@@ -405,6 +432,37 @@ type h3Client struct {
 	client *Client
 	// cancel 撤掉路径级 ctx，连带回收这条路径上所有 h3 请求。
 	cancel context.CancelFunc
+	// ctl 是承载 RFC 9297 数据报的那条请求流（= 控制流）。
+	ctl *http3.RequestStream
+}
+
+// sendDatagram 用 RFC 9297 的 HTTP Datagram 发一帧。
+// quic-go 自己加 Quarter Stream ID 前缀，这里不用手写 RFC 9297 的封装。
+func (h *h3Client) sendDatagram(b []byte) error {
+	if h.ctl == nil {
+		return errNoQUICStream
+	}
+	return h.ctl.SendDatagram(b)
+}
+
+func (h *h3Client) recvDatagrams(ctx context.Context, p *path) {
+	if h.ctl == nil {
+		return
+	}
+	for {
+		b, err := h.ctl.ReceiveDatagram(ctx)
+		if err != nil {
+			return
+		}
+		f, err := readFrameExact(bytes.NewReader(b))
+		if err != nil {
+			continue // 坏数据报丢掉即可
+		}
+		p.noteRecv(len(f.Payload))
+		if err := p.sess.handleFrame(p, f); err != nil {
+			return
+		}
+	}
 }
 
 func (h *h3Client) close() {

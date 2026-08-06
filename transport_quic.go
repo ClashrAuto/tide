@@ -77,8 +77,8 @@ func quicClientTLS(base *tls.Config) *tls.Config {
 func h3QUICConfig() *quic.Config {
 	c := quicConfig()
 	c.MaxIncomingUniStreams = 16
-	// h3 模式下不用裸 QUIC 数据报（要用得走 RFC 9297），关掉以免两端通告不一致。
-	c.EnableDatagrams = false
+	// RFC 9297 的 HTTP Datagram 建在 QUIC 数据报之上，两层都要开。
+	c.EnableDatagrams = true
 	return c
 }
 

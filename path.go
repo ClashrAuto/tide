@@ -3,7 +3,9 @@ package tide
 import (
 	"encoding/binary"
 	"encoding/hex"
+
 	"errors"
+	"github.com/quic-go/quic-go/http3"
 	"io"
 	"math"
 	"net"
@@ -87,8 +89,10 @@ type path struct {
 	// qmux 非空 = QUIC 多流模式：每条 TIDE 流一条独立的 QUIC 流（见 quicmux.go）。
 	// 单流模式下为 nil，所有帧走 conn 那一条字节流。
 	qmux *quicMux
-	// h3 非空 = 这条路径跑在 HTTP/3 之上（spec §12.6）。
+	// h3 非空 = 这条路径跑在 HTTP/3 之上的**客户端**侧（spec §12.6）。
 	h3 *h3Client
+	// h3srv 是服务端侧承载 RFC 9297 数据报的那条流。
+	h3srv *http3.Stream
 
 	dead     chan struct{}
 	deadOnce sync.Once
@@ -187,13 +191,22 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 	if p.qmux != nil && streamID != 0 && muxable(t) {
 		return p.qmux.write(t, flags, streamID, payload)
 	}
-	// UDP 走 RFC 9221 的 QUIC 数据报：不重传、不保序，才是 UDP 该有的语义。
-	// 太大装不下时下面会回退到控制流（可靠），见 quicMux.sendDatagram。
-	if p.qmux != nil && !p.qmux.h3 && t == FrameDatagram {
-		if err := p.qmux.sendDatagram(flags, streamID, payload); err == nil {
-			return nil
-		} else if !errors.Is(err, errDatagramTooLarge) {
-			return err
+	// UDP 走数据报：不重传、不保序，才是 UDP 该有的语义（spec §9.1）。
+	// 原生 QUIC 路径用 RFC 9221 的 QUIC 数据报；h3 路径用 RFC 9297 的 HTTP Datagram
+	// （绑在控制流上，Quarter Stream ID 前缀由 quic-go 自己加）。
+	// 两者都装不下时回退到可靠流——真实世界超 MTU 的 UDP 是被分片而不是消失，
+	// 静默丢会让大 DNS 响应无声失败。
+	if t == FrameDatagram {
+		if buf, ok := p.h3DatagramFrame(flags, streamID, payload); ok {
+			if err := p.sendH3Datagram(buf); err == nil {
+				return nil
+			}
+		} else if p.qmux != nil && !p.qmux.h3 {
+			if err := p.qmux.sendDatagram(flags, streamID, payload); err == nil {
+				return nil
+			} else if !errors.Is(err, errDatagramTooLarge) {
+				return err
+			}
 		}
 	}
 	pad := p.pad.padFor(streamID, len(payload))
@@ -529,4 +542,24 @@ func (p *path) score() float64 {
 		sc += p.loss * 2000
 	}
 	return sc
+}
+
+// h3DatagramFrame 在 h3 路径上把一帧序列化成 HTTP Datagram 的载荷。
+// 非 h3 路径返回 ok=false，调用方转而走 RFC 9221 的 QUIC 数据报。
+func (p *path) h3DatagramFrame(flags uint8, streamID uint64, payload []byte) ([]byte, bool) {
+	if p.h3 == nil && p.h3srv == nil {
+		return nil, false
+	}
+	return AppendFrame(nil, FrameDatagram, flags, streamID, payload, 0), true
+}
+
+// sendH3Datagram 走 RFC 9297。客户端侧与服务端侧各持有同一条控制流的一端。
+func (p *path) sendH3Datagram(buf []byte) error {
+	if p.h3 != nil {
+		return p.h3.sendDatagram(buf)
+	}
+	if p.h3srv != nil {
+		return p.h3srv.SendDatagram(buf)
+	}
+	return errNoQUICStream
 }

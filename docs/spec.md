@@ -721,7 +721,27 @@ h3 服务器，探测方发的那个请求会挂死——比沉默更可疑。
 h3 模式下 `DATAGRAM` 现在走可靠有序的控制流，与 §9.1「UDP MUST NOT 重传」相悖——
 被代理的 QUIC 跑在可靠通道上会出现两层拥塞控制打架。这是功能缺口，不是洁癖。
 
-**接法已核实（quic-go v0.61 的 API 名字都确认存在）**，剩下的是机械工作：
+**已接上，但还不稳定（约一半概率数据报收不到）。**
+
+实现要点与一个必须知道的约束：客户端**不能**混用 `Transport.RoundTrip` 与
+`NewClientConn`——后者会自己开一条 h3 控制流并发 SETTINGS，同一条 QUIC 连接上
+两条控制流就是 h3 协议错误。所以客户端整体换到了
+`NewClientConn` + `OpenRequestStream`：这样才拿得到 `*RequestStream`，
+而 RFC 9297 的数据报是**绑在具体请求流上**的，`resp.Body` 够不着。
+副作用是好的——`RequestStream` 本身双向，去掉了原先 `io.Pipe` + `resp.Body` 的拼装，
+h3 路径的回程字节也随之正常了（此前 rx 恒为 0）。
+
+数据报绑在**控制流**上：两端必须用同一条，而控制流是唯一双方都确定存在、
+且生命周期与路径一致的那条。
+
+⚠️ **残留问题**：`TestUDPOverH3Datagrams` 约一半概率报 "no datagram round-tripped"。
+通过的那一半里，"流字节没有增长"的断言也过——说明数据报**确实**走了 HTTP Datagram
+而不是退回流，链路是对的。怀疑是 SETTINGS 里的 datagram 能力协商完成之前发出的
+数据报被静默丢弃：quic-go 的 `SendDatagram` 里留着
+`TODO: reject if datagrams are not negotiated (yet)`，即此刻它既不拒绝也不排队。
+复现：`TIDE_H3_DGRAM=1 go test -count=6 -run TestUDPOverH3Datagrams`。
+
+下面是当初核实 API 时的记录，保留备查：
 
 | 需要 | quic-go 提供 | 备注 |
 |---|---|---|
