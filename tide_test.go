@@ -1010,6 +1010,9 @@ func newHarness(t *testing.T, tune func(*ClientConfig, *ServerConfig)) *harness 
 		PrivateKey: priv,
 		TLSConfig:  testTLSServer(t),
 		CoverAddr:  cover.Addr().String(),
+		// 夹具确实接受任意 user_id——但现在必须**说出来**，
+		// 因为空用户表默认放行已经被改成失败关闭（见 ServerConfig.AllowAnyUser）。
+		AllowAnyUser: true,
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2705,6 +2708,59 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 	}
 	if got := s.activeStreams(); got != maxStreams {
 		t.Fatalf("被拒的 OpenPacket 改了流计数：%d，应为 %d", got, maxStreams)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 空用户表不能默认放行
+// ---------------------------------------------------------------------------
+
+// 空 Users 的真实含义是"任何拿到公钥的人都能用这台代理，口令随便填"——
+// 客户端在握手里从不证明自己知道私钥，它只需要公钥（做 KEM 封装），
+// 而公钥印在服务端横幅上、也贴在每一份客户端配置里，根本不是秘密。
+//
+// ★ 这属于 CWE-1188（Insecure Default Initialization），MITRE 把利用可能性评为 High。
+// 而本仓库对同一类问题已经正确处置过两次：CoverAddr 为空直接拒绝启动，
+// cmd/tide-server 也拒绝空用户表启动。漏的恰恰是**库**本身——于是 clash 那个
+// listener（Coast 真正在用的入口）从 YAML 读到一份没有 users: 的配置时，
+// 会安安静静地起一台开放代理，日志里一个字都没有。
+func TestEmptyUsersMustBeExplicit(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := func() *ServerConfig {
+		return &ServerConfig{
+			PrivateKey: priv,
+			TLSConfig:  testTLSServer(t),
+			CoverAddr:  "127.0.0.1:1",
+		}
+	}
+
+	// 什么都不说 = 拒绝启动。
+	if _, err := NewServer(base()); err == nil {
+		t.Fatal("空用户表被接受了 —— 那是一台谁都能用的开放代理，且没有任何提示")
+	}
+
+	// 显式声明 = 允许。
+	cfg := base()
+	cfg.AllowAnyUser = true
+	if _, err := NewServer(cfg); err != nil {
+		t.Fatalf("显式 AllowAnyUser 仍被拒：%v", err)
+	}
+
+	// 给了用户表 = 允许，且此时 AllowAnyUser 无关紧要。
+	cfg = base()
+	cfg.Users = map[[16]byte]string{UserIDFromPassword("pw"): "alice"}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("给了用户表反而被拒：%v", err)
+	}
+	if !srv.userAllowed(UserIDFromPassword("pw")) {
+		t.Fatal("配了的用户被拒了")
+	}
+	if srv.userAllowed(UserIDFromPassword("wrong")) {
+		t.Fatal("没配的用户被放行了 —— 用户表形同虚设")
 	}
 }
 

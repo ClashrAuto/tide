@@ -186,9 +186,30 @@ func (c *ClientConfig) streamWindow() uint64 {
 type ServerConfig struct {
 	// PrivateKey 服务端静态私钥。
 	PrivateKey *PrivateKey
-	// Users 允许的用户集合。空表示接受任何通过认证的 user_id
-	// （只有在 PrivateKey 本身即凭据的部署里才合理，不推荐）。
+	// Users 允许的用户集合。
+	//
+	// ⚠️ **空表 = 接受任何 user_id = 开放代理**，必须配合 AllowAnyUser 显式声明。
+	//
+	// 这里原先的注释写的是"只有在 PrivateKey 本身即凭据的部署里才合理"，
+	// 那句话是错的：客户端在握手里**从不证明**自己知道私钥——它只需要**公钥**
+	// （用来做 KEM 封装），而公钥印在服务端启动横幅上、也贴在每一份客户端配置里。
+	// 客户端唯一提供的凭据就是口令派生出来的 user_id。所以空表的真实含义是
+	// "任何拿到公钥的人都能用这台代理，口令随便填"。
+	// 唯一说得通的部署是把公钥当共享秘密来发，那也该是显式选择，而不是默认。
 	Users map[[16]byte]string
+
+	// AllowAnyUser 显式接受"任何 user_id 都放行"。仅在把公钥当共享秘密分发的
+	// 部署里才有意义。不设而又不给 Users 时，NewServer 直接报错。
+	//
+	// ★ 这是**故意做成失败关闭**的。空集合默认放行属于 CWE-1188
+	// （Insecure Default Initialization），MITRE 把它的利用可能性评为 High，
+	// 现实里"空 token / 空用户表即绕过认证"的 CVE 一抓一把。
+	// 而本仓库对同一类问题已经有过两次正确处置：CoverAddr 为空直接拒绝启动
+	// （注释写着"静默降级掉的安全属性没人会发现它已经没了"），
+	// cmd/tide-server 也拒绝空用户表启动。漏的恰恰是库本身——
+	// 于是 clash 那个 listener（Coast 真正在用的入口）从 YAML 里读到一个没有
+	// users: 的配置时，会安安静静地起一台开放代理。
+	AllowAnyUser bool
 
 	// TLSConfig 外层 TLS。必须提供（bare 模式与信道绑定都依赖它）。
 	TLSConfig *tls.Config
@@ -240,6 +261,11 @@ func (c *ServerConfig) validate() error {
 	}
 	if c.TLSConfig == nil {
 		return errors.New("tide: ServerConfig.TLSConfig is nil")
+	}
+	if len(c.Users) == 0 && !c.AllowAnyUser {
+		return errors.New("tide: ServerConfig.Users is empty, which would accept ANY user_id " +
+			"(the client only needs the public key, which is not a secret); " +
+			"set Users, or set AllowAnyUser=true to knowingly run an open relay")
 	}
 	if c.CoverAddr == "" {
 		// 不给掩护站点就等于放弃 §6 的抗主动探测。允许，但必须是显式选择，

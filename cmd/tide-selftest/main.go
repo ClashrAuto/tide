@@ -132,8 +132,13 @@ func doLocal() error {
 	}
 	defer ln.Close()
 
+	// ★ 自检**配一个真用户**，而不是走 AllowAnyUser。
+	// 这条链路本来就该覆盖认证，从前它靠"空用户表默认放行"跑通，
+	// 等于把 user_id 这一段整个绕过去了——空用户表刚改成失败关闭，一下就暴露出来。
+	const selftestPassword = "tide-selftest"
 	srv, err := tide.NewServer(&tide.ServerConfig{
 		PrivateKey: priv, TLSConfig: tlsCfg, CoverAddr: coverLn.Addr().String(),
+		Users: map[[16]byte]string{tide.UserIDFromPassword(selftestPassword): "selftest"},
 	})
 	if err != nil {
 		return err
@@ -148,6 +153,7 @@ func doLocal() error {
 	cl, err := tide.NewClient(&tide.ClientConfig{
 		Server:        ln.Addr().String(),
 		PublicKey:     pub,
+		UserID:        tide.UserIDFromPassword(selftestPassword),
 		TLSConfig:     &tls.Config{InsecureSkipVerify: true, ServerName: "tide.local"},
 		ProbeInterval: 200 * time.Millisecond,
 	})
@@ -359,6 +365,10 @@ func doServer(listen, quicListen, privKey, cover, congestion string, grace time.
 	srv, err := tide.NewServer(&tide.ServerConfig{
 		PrivateKey: priv, TLSConfig: tlsCfg, CoverAddr: cover, SessionGrace: grace,
 		Congestion: congestion,
+		// 压测夹具：客户端的 user_id 由它自己的 -password 派生，夹具事先并不知道，
+		// 所以这里确实要放行任意 user_id。**显式**写出来，而不是靠空表默认放行。
+		// ⚠️ 这是夹具，不是可部署的服务端——要部署请用 tide-server。
+		AllowAnyUser: true,
 	})
 	if err != nil {
 		return err
