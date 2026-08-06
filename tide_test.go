@@ -441,6 +441,188 @@ func TestConcurrentGenuineZeroRTTConsumesExactlyOnce(t *testing.T) {
 	}
 }
 
+// 客户端取票的顺序，必须和服务端淘汰批次的顺序对得上。
+//
+// ★ 这两件事是分两轮加进来的，各自都对，**配在一起就坏**：
+//
+//	· 服务端给单用户的活跃批次设了上界（防止对端刷 TICKET_REQUEST 撑爆票据库），
+//	  超了淘汰**最老**的一批。
+//	· 客户端的 take() 从头扫，也就是**先用最老**的一批。
+//
+// 于是客户端总是优先去用服务端最可能已经淘汰掉的那些票据：每张都换来一次
+// 完整的失败连接（服务端 ErrBadTicket → 失败关闭 → 客户端读到掩护站点的回声
+// → ErrProtocol → 整条路径拨号失败），然后才退回 1-RTT。
+//
+// 触发条件一点都不苛刻：**每次握手（含加入路径与重连）都会签发一批**，
+// 长会话攒过上界是常态。
+func TestWalletAndStoreAgreeOnEvictionOrder(t *testing.T) {
+	st := NewMemTicketStore()
+	w := newTicketWallet()
+	var user [16]byte
+	now := time.Now()
+
+	// 模拟一条长会话：反复握手，每次服务端签一批、客户端收进钱包。
+	rounds := maxLiveBatchesPerUser + 4
+	for i := 0; i < rounds; i++ {
+		base, seed, err := st.Issue(user, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.add(base, 64, seed, now)
+	}
+
+	// 客户端接连取票去做 0-RTT。每一张都必须是服务端**还认**的。
+	for i := 0; i < 200; i++ {
+		id, _, ok := w.take(now)
+		if !ok {
+			break // 钱包用光了，正常退回 1-RTT
+		}
+		if _, _, ok := st.peekAny(id); !ok {
+			st.mu.Lock()
+			live := len(st.users[user])
+			st.mu.Unlock()
+			t.Fatalf("第 %d 张票 id=%d 服务端已经不认了（活跃批次 %d 个，上界 %d）—— "+
+				"客户端与服务端对批次的取用/淘汰顺序相反。每张这样的票都换来一次"+
+				"完整的失败连接，然后才退回 1-RTT", i+1, id, live, maxLiveBatchesPerUser)
+		}
+	}
+}
+
+// 重放一个捕获到的 HELLO **不得**在受害者会话上留下一条活着的路径。
+//
+// ★ 单次票据只管 0-RTT；1-RTT 的 HELLO 没有票据也没有 nonce 缓存，
+// 在 ±120 秒的时间戳窗口内是**字节级可重放**的。这一点 design.md 第 6 条没有覆盖。
+//
+// 后果不止"多一次握手"：被重放的 HELLO 里带着 session_id（请求**加入**已有会话）。
+// 一旦成功，攻击者就把一条自己控制的路径挂进了受害者的会话，
+// 调度器随时可能把受害者的流量派到那条路上黑洞掉。内容它读不了（会话密钥推不出来），
+// 但足以让会话卡死。
+//
+// ⚠️ 本用例只断言**结果**，不断言是哪个机制挡住的。试过把服务端的 cb_hash 比对
+// 摘掉，它照样通过——也就是说保护不（只）来自那处比较。没查清之前不写归因：
+// 一条把功劳记错地方的注释，会让后来人放心地去动那个其实不承重的地方。
+func TestReplayedHelloCannotJoinVictimSession(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 受害者建会话，并让它多挂一条路径——第二条走的正是 join 流程。
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := h.client.dialPath(ctx, sess, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sess.addPath(p2) {
+		t.Fatal("第二条路径没挂上")
+	}
+	// ★ 要看的是**服务端**那一侧的会话：攻击者一旦 join 成功，多出来的路径挂在
+	// 服务端的会话对象上，客户端自己的 sess 里根本看不见。
+	// 第一版这条用例就断言错了对象，负对照（摘掉 cb 比对）照样绿——
+	// 一条永远通过的安全测试比没有更糟。
+	srvPaths := func() int {
+		h.srv.mu.Lock()
+		ss := h.srv.sessions[sess.ID()]
+		h.srv.mu.Unlock()
+		if ss == nil {
+			return -1
+		}
+		return len(ss.sess.pathsSnapshot())
+	}
+	if n := srvPaths(); n < 1 {
+		t.Fatalf("服务端上找不到这条会话（%d）", n)
+	}
+
+	// 攻击者：捕获受害者那条 join HELLO 的**明文字节**（最强假设——
+	// 相当于外层 TLS 已经被看穿），在自己的 TLS 连接上原样重放。
+	var captured []byte
+	victim := &captureConn{}
+	{
+		// 用同一个客户端再拨一次 join，把写出去的字节录下来。
+		raw, err := net.Dial("tcp", h.ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		tc := tls.Client(raw, h.client.tlsCfg)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			t.Fatal(err)
+		}
+		victim.Conn = tc
+		if _, err := h.client.handshake(ctx, sess, victim, true, "tcp"); err != nil {
+			t.Fatalf("受害者自己的 join 就失败了，测不下去：%v", err)
+		}
+		captured = victim.written()
+	}
+	if len(captured) == 0 {
+		t.Fatal("没录到 HELLO 字节")
+	}
+	// ★ 基线必须在**受害者自己那次 join 之后**才取：那次握手服务端侧也会加一条路径
+	// （客户端没 addPath，但服务端 handleConn 会）。在它之前取基线，
+	// 受害者自己加的那条会被算到攻击者头上。
+	time.Sleep(300 * time.Millisecond)
+	before := srvPaths()
+
+	// 攻击者的连接：另一条 TLS，原样重放那串字节。
+	atk, err := tls.Dial("tcp", h.ln.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true, ServerName: "tide.test", MinVersion: tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer atk.Close()
+	if _, err := atk.Write(captured); err != nil {
+		t.Fatal(err)
+	}
+	// 服务端应当失败关闭并转给掩护源站（回声），而**不是**回一个 ACCEPT。
+	atk.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, len(captured))
+	n, _ := io.ReadFull(atk, buf)
+	if n > 0 && bytes.Equal(buf[:n], captured[:n]) {
+		t.Logf("重放被失败关闭，字节原样转给了掩护源站（%d 字节回声）", n)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	if after := srvPaths(); after > before {
+		t.Fatalf("重放的 HELLO 把攻击者的连接挂进了受害者的会话（服务端路径 %d → %d）—— "+
+			"攻击者可以就此把受害者的流量吸到自己控制的路径上黑洞掉", before, after)
+	}
+}
+
+// captureConn 记录写出去的字节，用来"捕获"一条握手。
+type captureConn struct {
+	net.Conn
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (c *captureConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.buf = append(c.buf, p...)
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *captureConn) written() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf...)
+}
+
+// 包装之后 exporterFor 认不出底下的 *tls.Conn 了，得自己把导出器透出来——
+// 否则握手会以"transport does not support channel binding"失败，
+// 那样这条用例测的就不是重放，而是包装写错了。
+func (c *captureConn) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte, error) {
+	tc, ok := c.Conn.(*tls.Conn)
+	if !ok {
+		return nil, errNoExporter
+	}
+	cs := tc.ConnectionState()
+	return cs.ExportKeyingMaterial(label, ctx, n)
+}
+
 func TestTicketWalletFallsBackTo1RTT(t *testing.T) {
 	w := newTicketWallet()
 	now := time.Now()

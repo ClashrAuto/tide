@@ -594,10 +594,26 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		pathID = s.nextPath.Add(1)
 	}
 
-	count := s.cfg.ticketCount()
-	base, seed, err := s.store.Issue(user, count)
-	if err != nil {
-		return nil, nil, err
+	// ★ 只有**新建会话**才签发票据。加入路径（含断线重连）不签。
+	//
+	// 原先每次握手都签一批 1024 张。配上单用户活跃批次的上界
+	// （maxLiveBatchesPerUser，防的是对端刷 TICKET_REQUEST 撑爆票据库），
+	// 结果是一条长会话不停地把**自己手里还没用完**的批次挤掉——
+	// 而客户端又恰好从最老的批次开始用，两个方向正好相反。
+	// 每张这样的票都换来一次完整的失败连接，然后才退回 1-RTT。
+	//
+	// 加入路径时客户端本来就有票；真不够时它会自己发 TICKET_REQUEST 来要
+	// （ticketLoop 每 5 秒检查一次，低于 25% 就请求）。所以这里不签什么也不缺。
+	var base uint64
+	var seed [32]byte
+	var count uint16
+	if !joining {
+		count = s.cfg.ticketCount()
+		var err error
+		base, seed, err = s.store.Issue(user, count)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// 每次握手一对全新的临时密钥。公钥随 ACCEPT 发出去，私钥用完就丢——

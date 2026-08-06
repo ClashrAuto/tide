@@ -341,10 +341,19 @@ func (w *ticketWallet) add(base uint64, count uint16, seed [32]byte, now time.Ti
 }
 
 // take 取出一张票据。没有可用票据时返回 ok=false，调用方据此走 1-RTT。
+//
+// ★ 从**最新**的批次往回扫，不是从最老的。这一条必须和服务端的淘汰顺序对齐：
+// 服务端给单用户的活跃批次有上界，超了淘汰**最老**的一批（见 maxLiveBatchesPerUser）。
+// 如果客户端还按"先用最老"的顺序取，它就总是优先去用服务端最可能已经淘汰掉的那些——
+// 每张都换来一次完整的失败连接（ErrBadTicket → 失败关闭 → 客户端读到掩护站点的回声
+// → 整条路径拨号失败），然后才退回 1-RTT。两个方向各自都合理，配在一起正好相反。
+//
+// 顺带一个好处：最新的批次离过期最远，闲置久了再用也不容易正好赶上过期。
 func (w *ticketWallet) take(now time.Time) (id uint64, key []byte, ok bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for _, b := range w.batches {
+	for i := len(w.batches) - 1; i >= 0; i-- {
+		b := w.batches[i]
 		if now.After(b.expires) || b.next >= b.base+uint64(b.count) {
 			continue
 		}
