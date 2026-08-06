@@ -162,8 +162,10 @@ func (s *Server) ServeQUIC(addr string) error {
 		return err
 	}
 	defer ln.Close()
+	ctx, cancel := s.acceptContext()
+	defer cancel()
 	for {
-		conn, err := ln.Accept(context.Background())
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			select {
 			case <-s.stopped:
@@ -174,6 +176,34 @@ func (s *Server) ServeQUIC(addr string) error {
 		}
 		go s.handleQUICConn(conn)
 	}
+}
+
+// acceptContext 返回一个在 Server.Close() 时被取消的 context，供 Accept 使用。
+//
+// ★ 只在 Accept **返回之后**去看 s.stopped 是不够的——那个检查根本轮不到执行，
+// 因为 Accept 传的是 context.Background()，Close() 不会让它醒。于是：
+//
+//	Server.Close() 之后 QUIC/h3 的 Accept 循环仍然挂着，UDP 端口一直被占；
+//	`defer ln.Close()` 也跑不到——它要等循环退出，而循环在等 Accept，死结。
+//
+// 这在**配置热重载**下会连成一条完整的故障：旧入站关掉（TCP 端口释放了，
+// UDP 没有）→ 新入站绑同一个 UDP 端口失败 → 而调用方往往把这个错误丢掉 →
+// 客户端按 §8 静默回落 TCP。净效果是"第一次热重载之后 QUIC 加速就再也不工作了，
+// 直到进程重启"，全程零日志。Coast 每次订阅/设置变更都会热重载。
+//
+// quic-go 官方给的停机做法正是**取消传给 Accept 的那个 context**
+// （它的 Listener.Close() 还会一并关掉所有活动连接，语义比 TCP 的更重，
+// 所以不适合用来单纯地"停止接受新连接"）。
+func (s *Server) acceptContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.stopped:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func (s *Server) handleQUICConn(conn *quic.Conn) {

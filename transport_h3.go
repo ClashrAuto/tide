@@ -88,8 +88,10 @@ func (s *Server) ServeH3(addr string) error {
 		return err
 	}
 	defer ln.Close()
+	ctx, cancel := s.acceptContext()
+	defer cancel()
 	for {
-		conn, err := ln.Accept(context.Background())
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			select {
 			case <-s.stopped:

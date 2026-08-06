@@ -3100,6 +3100,73 @@ func TestBoundedSessionsNeverEvictALiveOne(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 关掉服务端必须真的把 QUIC 端口还回去
+// ---------------------------------------------------------------------------
+
+// ServeQUIC / ServeH3 的 Accept 循环从前传的是 context.Background()，
+// 而"停机"只在 **Accept 返回之后**才被检查——那个检查根本轮不到执行：
+//
+//	Server.Close() 之后 Accept 仍然挂着，UDP 端口一直被占；
+//	`defer ln.Close()` 也跑不到，它要等循环退出，而循环在等 Accept。死结。
+//
+// ★ 这在**配置热重载**下会连成一条完整的故障，而 Coast 每次订阅/设置变更都会热重载：
+//
+//	旧入站关掉（TCP 端口释放了，UDP 没有）
+//	→ 新入站绑同一个 UDP 端口失败
+//	→ 而调用方（clash 那个 listener）把这个错误丢进了 `_ =`
+//	→ 客户端按 §8 静默回落 TCP
+//
+// 净效果是"第一次热重载之后 QUIC 加速就再也不工作了，直到进程重启"，全程零日志。
+//
+// quic-go 官方给的停机做法正是取消传给 Accept 的那个 context
+// （它的 Listener.Close() 还会一并关掉所有活动连接，语义比 TCP 的重，
+// 不适合用来单纯"停止接受新连接"）。
+func TestCloseReleasesTheQUICPort(t *testing.T) {
+	port := freeUDPPort(t)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	h := newHarness(t, nil)
+
+	done := make(chan error, 1)
+	go func() { done <- h.srv.ServeQUIC(addr) }()
+	// ⚠️ 不要用"反复去 bind 看占没占上"来判就绪——那会和服务端抢这个 UDP 端口，
+	// 抢赢了服务端就绑不上、用例于是什么都没测到却是绿的（第一版正是这样，
+	// -count=3 里第一次绿、后两次红，才暴露出来）。等一小会儿就好。
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("ServeQUIC 提前退出了：%v —— 后面的断言无从谈起", err)
+	default:
+	}
+
+	h.srv.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeQUIC 退出时报错：%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() 之后 ServeQUIC 没有退出 —— Accept 醒不过来，" +
+			"UDP 端口于是一直被占着")
+	}
+
+	// 真正要断言的是这一条：端口必须能被重新绑定。热重载时新入站要的就是这个。
+	var lastErr error
+	start := time.Now()
+	for time.Since(start) < 5*time.Second {
+		pc, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			pc.Close()
+			return
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Close() 之后 UDP 端口 5 秒内仍未释放：%v —— "+
+		"热重载后新入站绑不上，而那个错误往往被调用方丢掉，"+
+		"于是 QUIC 加速静默消失直到进程重启", lastErr)
+}
+
+// ---------------------------------------------------------------------------
 // h3 的那条路径不能是全网常量
 // ---------------------------------------------------------------------------
 
