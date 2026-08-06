@@ -5,6 +5,19 @@ on:
     branches: ["**"]
   pull_request:
 
+# ★ 同一分支上只跑最新那次推送，旧的直接取消。
+#
+# 没有这一段的代价是实打实的：本仓库的 CI 从建库起就是红的，而队列里积压了十几个
+# 待跑的 run，每次去看都是"queued"，于是**十八轮都没人看到过一次真实结果**——
+# 而那期间藏着一个"cmd/ 从未被提交"的致命问题。
+# 迟到十九个提交的反馈不叫反馈。
+#
+# 官方文档提醒过：会发布/部署的工作流不该在默认分支上取消，因为每个提交都得跑完。
+# 这里不适用——本工作流只做验证，不推镜像也不发版，取消掉被取代的 run 没有任何副作用。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -25,6 +38,11 @@ jobs:
       - run: go test -count=1 -timeout 10m ./...
       # 进程内跑完整链路（握手 → 0-RTT → 失败关闭 → 路径迁移 → UDP）。
       - run: go run ./cmd/tide-selftest -mode local
+      # ★ 再跑一遍**跨进程**的端到端：真的 tide-server + 真的 tide-selftest 客户端，
+      # 走命令行、走横幅里打印的公钥、走两个进程之间的真握手。
+      # 上面那些步骤全部在**一个进程里**用内存中的对象，覆盖不到"两个二进制怎么配合"
+      # 这一层——第 17–19 轮连着三个问题都藏在那里，而当时整套测试是绿的。
+      - run: bash deploy/e2e-smoke.sh
 
   docker:
     runs-on: ubuntu-latest
