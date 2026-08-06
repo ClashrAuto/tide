@@ -457,6 +457,9 @@ func (p *path) markDead() {
 		if p.qmux != nil {
 			p.qmux.close()
 		}
+		if p.h3 != nil {
+			p.h3.close()
+		}
 		p.conn.Close()
 		p.sess.onPathDead(p)
 	})

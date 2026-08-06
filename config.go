@@ -79,10 +79,10 @@ type ClientConfig struct {
 	//
 	// 需要服务端用 ServeH3 而不是 ServeQUIC 监听。
 	//
-	// ⚠️ **当前仅掩护那一半可用。** 服务端的 h3 反代已实现并通过测试（探测方拿到
-	// 掩护源站的真实响应）；但 TIDE 自己的数据面在 h3 之上还没跑通，
-	// 路径建起来后会立刻死掉。所以默认关闭，默认仍走原生 QUIC 那条实测过的路径。
-	// 见 spec §12.6 与 TestTIDEOverH3（已 Skip，故意保留）。
+	// 掩护与数据面都已跑通并有测试覆盖。**仍默认关闭**，原因只剩一条：
+	// h3 模式下 UDP 走的是可靠有序的控制流，而不是 §12.8 的 QUIC 数据报——
+	// 要接 RFC 9297 的 HTTP Datagram 才能补上。在那之前，默认路径仍是
+	// 原生 QUIC（p90 8.6ms → 1.67ms 那条实测过的）。
 	H3 bool
 	// QUICPort 为 0 时复用 Server 的端口。
 	QUICPort int

@@ -1035,19 +1035,6 @@ func TestH3ProbeGetsCoverSite(t *testing.T) {
 
 // TIDE 自己在 h3 模式下也必须能跑——掩护做得再好，代理不通就没意义。
 func TestTIDEOverH3(t *testing.T) {
-	// ⚠️ 已知未通过，且**故意留着不删**。
-	//
-	// 现状：h3 掩护（TestH3ProbeGetsCoverSite）已通过——探测方拿到的是掩护源站的
-	// 真实响应，§12.6 的安全目标达成。直接调 dialH3Path 也能建起路径
-	// （TestH3DialDiag 通过）。但经 maintainQUIC 驱动时这条路径起来后立刻死掉，
-	// 数据面没跑通，原因尚未定位。
-	//
-	// 所以 ClientConfig.H3 默认关闭，默认走原生 QUIC 那条**已经实测过**的路径。
-	// 删掉这条测试会让"h3 数据面没通"这件事从代码里消失，下一个人只会看到
-	// 一个看起来完整的 h3 实现。
-	t.Skip("TIDE-over-h3 data path not working yet; masquerade half is done and tested. " +
-		"ClientConfig.H3 stays opt-in and defaults to off — see spec §12.6.")
-
 	port := freeUDPPort(t)
 	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
 		cc.EnableQUIC = true
@@ -1081,24 +1068,76 @@ func TestTIDEOverH3(t *testing.T) {
 		t.Fatal("the HTTP/3 path never came up")
 	}
 
+	// ★ 光有路径不算数：调度器要过几轮才会把流迁过去。不等它就发数据，
+	// 字节全走 TCP，测试照样绿——而 h3 数据面一个字节都没被跑到。
+	// 这正是本仓库反复踩的"假绿"，所以下面**断言 h3 路径真的扛了量**。
+	h3Before := uint64(0)
+	for _, p := range sess.Paths() {
+		if p.Kind == "quic" {
+			h3Before = p.TX
+		}
+	}
+
 	c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+
+	// 先小发一轮把流建起来，再等调度器迁移，然后才发大块。
+	c.Write([]byte("warmup"))
+	buf := make([]byte, 6)
+	c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("warmup echo over h3 session failed: %v", err)
+	}
+	// ★ 不能靠调度器自然迁移：环回上两条路径评分几乎相同，rebalance 要求目标好 2 倍
+	// 才动手，所以它**正确地**不迁。这里直接把流钉到 h3 路径上，
+	// 才能确定性地跑到 h3 的数据面——否则字节全走 TCP，测试绿得毫无意义。
+	st, ok := c.(*Stream)
+	if !ok {
+		t.Fatal("expected a *Stream")
+	}
+	var h3ID uint32
+	for _, p := range sess.pathsSnapshot() {
+		if p.kind == "quic" {
+			h3ID = p.id
+		}
+	}
+	if h3ID == 0 {
+		t.Fatal("no HTTP/3 path to pin the stream to")
+	}
+	st.pathID.Store(h3ID)
+	_ = h3Before
+
 	msg := bytes.Repeat([]byte("h3-"), 20000) // 60 KB，跨过多个帧
 	go func() { c.Write(msg) }()
 	got := make([]byte, len(msg))
-	c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	c.SetReadDeadline(time.Now().Add(30 * time.Second))
 	if _, err := io.ReadFull(c, got); err != nil {
 		t.Fatalf("echo over the HTTP/3 path failed: %v", err)
 	}
 	if !bytes.Equal(got, msg) {
 		t.Fatal("payload corrupted over the HTTP/3 path")
 	}
+
+	var h3TX, h3RX uint64
 	for _, p := range sess.Paths() {
 		t.Logf("path %d %s tx=%dB rx=%dB", p.ID, p.Kind, p.TX, p.RX)
+		if p.Kind == "quic" {
+			h3TX, h3RX = p.TX, p.RX
+		}
 	}
+	// 只断言**发送**方向：上面钉的是本端这条流的亲和，对端的回程仍按它自己的
+	// 路径亲和走（这里是 TCP），所以 h3 的 rx 本来就该接近 0。
+	// 净荷完整回来了 = 服务端确实在 h3 上把这 60 KB 全收到了，
+	// 也就证明了 h3 数据面通。
+	if h3TX < 32*1024 {
+		t.Fatalf("the HTTP/3 path only sent %dB — the payload went over TCP, so this test "+
+			"proved nothing about the h3 data path", h3TX)
+	}
+	t.Logf("h3 data path verified: %d KB sent over HTTP/3, payload returned byte-exact "+
+		"(rx=%dB is expected — the peer echoes on its own path affinity)", h3TX/1024, h3RX)
 }
 
 // 诊断用：直接拨一条 h3 路径，把真实错误打出来。

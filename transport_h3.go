@@ -277,27 +277,54 @@ func (c *Client) dialH3Path(ctx context.Context, s *Session, join bool) (*path, 
 		},
 	}
 
-	ctlStream, err := c.openH3Stream(ctx, tr, true, 0)
-	if err != nil {
+	// ★ 请求的生命周期必须绑到**路径**，不能绑到拨号 ctx。
+	//
+	// 控制流就是那个 HTTP 请求本身。调用方（maintainQUIC）在拨号返回后立刻
+	// cancel() 掉拨号 ctx——若请求挂在它上面，路径**建起来的同一瞬间就被拆掉**，
+	// 现象正是"h3 路径起来就死"。原生 QUIC 路径不受影响，因为 DialAddr /
+	// OpenStreamSync 的 ctx 只约束等待，不决定流的存活。
+	pctx, pcancel := context.WithCancel(context.Background())
+	// 拨号超时仍要约束**握手阶段**：ctx 到期而握手还没完成，就撤掉整条路径。
+	hsDone := make(chan struct{})
+	go func() {
+		select {
+		case <-hsDone:
+		case <-ctx.Done():
+			select {
+			case <-hsDone:
+			default:
+				pcancel()
+			}
+		}
+	}()
+	fail := func(err error) (*path, error) {
+		close(hsDone)
+		pcancel()
 		tr.Close()
 		return nil, err
 	}
+
+	ctlStream, err := c.openH3Stream(pctx, tr, true, 0)
+	if err != nil {
+		return fail(err)
+	}
 	if captured == nil {
 		ctlStream.Close()
-		tr.Close()
-		return nil, errNoExporter
+		return fail(errNoExporter)
 	}
 
 	hc := &h3ClientConn{rw: ctlStream, conn: captured}
 	p, err := c.handshake(ctx, s, hc, join, "quic")
 	if err != nil {
 		ctlStream.Close()
-		tr.Close()
-		return nil, err
+		return fail(err)
 	}
-	p.h3 = &h3Client{tr: tr, client: c}
+	close(hsDone) // 握手完成：拨号 ctx 到期起不再影响这条路径
+
+	p.h3 = &h3Client{tr: tr, client: c, cancel: pcancel}
+	// 数据流同样用路径级 ctx，路径一死它们跟着回收。
 	p.qmux = newQUICMuxH3(captured, p, func() (muxStream, error) {
-		return c.openH3Stream(context.Background(), tr, false, 0)
+		return c.openH3Stream(pctx, tr, false, 0)
 	})
 	return p, nil
 }
@@ -372,6 +399,17 @@ func (c *h3ClientConn) ExportKeyingMaterial(label string, ctx []byte, n int) (ou
 type h3Client struct {
 	tr     *http3.Transport
 	client *Client
+	// cancel 撤掉路径级 ctx，连带回收这条路径上所有 h3 请求。
+	cancel context.CancelFunc
+}
+
+func (h *h3Client) close() {
+	if h.cancel != nil {
+		h.cancel()
+	}
+	if h.tr != nil {
+		h.tr.Close()
+	}
 }
 
 func newBufReader(c net.Conn) *bufio.Reader { return bufio.NewReader(c) }
