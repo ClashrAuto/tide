@@ -488,6 +488,7 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		sess.user = user
 		sess.localAddr = t.Conn.LocalAddr()
 		sess.onTicketReq = func() { s.replenish(sess, user) }
+		go sess.ticketServeLoop()
 
 		s.mu.Lock()
 		if s.closed {

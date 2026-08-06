@@ -151,7 +151,41 @@ func (s *MemTicketStore) Issue(user [16]byte, count uint16) (uint64, [32]byte, e
 	s.users[user] = append(s.users[user], b)
 	// base 单调递增，所以直接追加就保持有序，不需要排序。
 	s.index = append(s.index, batchRef{base: base, count: count, user: user, b: b})
+	s.capUserLocked(user)
 	return base, seed, nil
+}
+
+// maxLiveBatchesPerUser 是单个用户同时活着的批次上界。
+//
+// ★ Sweep 只清"已过期或已用完"的批次，而刚签出的批次两样都不是——也就是说
+// 签发这条路径上**没有任何上界**，只有 24 小时的 TicketLifetime 在兜底。
+// 对端刷 TICKET_REQUEST 时 minReplenishInterval 已经把速率压到 1 批/秒，
+// 但一条挂一天的会话仍能攒下 86400 批（约 28 MB），并且让 Consume 的线性扫描
+// 变成 86400 长——正常握手会跟着一起变慢。
+//
+// 正常用量是同时 1–3 批（低于 25% 才补，一批 1024 张），8 是宽裕的余量。
+// 超了就丢最老的：代价是客户端手里那批票据变成废票，0-RTT 失败退回 1-RTT
+// （spec §12.4 定稿的降级路径），不影响正确性。
+const maxLiveBatchesPerUser = 8
+
+// capUserLocked 把某个用户的活跃批次裁到上界内。必须在持锁时调用。
+func (s *MemTicketStore) capUserLocked(user [16]byte) {
+	bs := s.users[user]
+	for len(bs) > maxLiveBatchesPerUser {
+		old := bs[0]
+		bs = bs[1:]
+		s.dropIndexLocked(old.base)
+	}
+	s.users[user] = bs
+}
+
+// dropIndexLocked 按 base 从索引里摘掉一项。index 按 base 升序且 base 唯一，
+// 所以二分能精确定位。
+func (s *MemTicketStore) dropIndexLocked(base uint64) {
+	i := sort.Search(len(s.index), func(i int) bool { return s.index[i].base >= base })
+	if i < len(s.index) && s.index[i].base == base {
+		s.index = append(s.index[:i], s.index[i+1:]...)
+	}
 }
 
 func (s *MemTicketStore) Consume(user [16]byte, id uint64) ([32]byte, bool) {
@@ -238,9 +272,24 @@ type walletBatch struct {
 
 func newTicketWallet() *ticketWallet { return &ticketWallet{} }
 
+// maxWalletBatches 是钱包里最多留几批。
+//
+// 正常情况下同时活着的批次是 1–3 个（低于 25% 才补一批，一批 1024 张），
+// 64 是极宽的余量。它存在的理由只有一个：add 的输入是**对端发来的帧**，
+// 而任何由对端驱动增长的结构都必须有上界。没有它，一个恶意服务端只要刷
+// TICKET_REPLENISH，客户端的 batches 就会一直涨到 TicketLifetime（24 小时）为止——
+// sweep 只清理"已过期或已用完"的批次，刚收到的新批次两样都不是，一个也清不掉。
+const maxWalletBatches = 64
+
 func (w *ticketWallet) add(base uint64, count uint16, seed [32]byte, now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.pruneLocked(now)
+	if len(w.batches) >= maxWalletBatches {
+		// 还是满的：丢最老的那批。take 是从头扫的，最老的一批最接近用完，
+		// 丢它的代价最小（最坏情况是那几张票没用上，退回 1-RTT，不影响正确性）。
+		w.batches = append(w.batches[:0], w.batches[1:]...)
+	}
 	w.batches = append(w.batches, &walletBatch{
 		base: base, count: count, seed: seed, next: base,
 		expires: now.Add(TicketLifetime),
@@ -283,11 +332,20 @@ func (w *ticketWallet) remaining(now time.Time) int {
 func (w *ticketWallet) sweep(now time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.pruneLocked(now)
+}
+
+// pruneLocked 清掉已过期或已用完的批次。必须在持锁时调用。
+func (w *ticketWallet) pruneLocked(now time.Time) {
 	keep := w.batches[:0]
 	for _, b := range w.batches {
 		if !now.After(b.expires) && b.next < b.base+uint64(b.count) {
 			keep = append(keep, b)
 		}
+	}
+	// 把尾巴上的指针清掉，别让已丢弃的批次被底层数组继续引用。
+	for i := len(keep); i < len(w.batches); i++ {
+		w.batches[i] = nil
 	}
 	w.batches = keep
 }

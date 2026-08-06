@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,6 +243,92 @@ func TestTicketWalletFallsBackTo1RTT(t *testing.T) {
 	// 耗尽后 MUST 立刻返回 false（退回 1-RTT），MUST NOT 阻塞等待补充。
 	if _, _, ok := w.take(now); ok {
 		t.Fatal("exhausted wallet must report empty, not hand out a reused ticket")
+	}
+}
+
+// TICKET_REQUEST 是全协议最便宜的帧（4 字节），却让服务端起协程、读 crypto/rand、
+// 在票据库里新建一批留存 24 小时的位图，再回 42 字节。
+// 逐帧响应就是 RFC 9000 §21.9 说的那种"处理开销相对带宽不成比例"，
+// 一个已认证的对端在循环里发它就能把服务端撑死。必须合并 + 限速。
+func TestTicketRequestFloodIsCoalesced(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+
+	var issued atomic.Int64
+	s.onTicketReq = func() { issued.Add(1) }
+	go s.ticketServeLoop()
+
+	// 一万个请求。逐帧响应的话这里会签出一万批票据、起一万个协程。
+	before := runtime.NumGoroutine()
+	for i := 0; i < 10000; i++ {
+		if err := s.handleFrame(nil, Frame{Type: FrameTicketReq}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 给补票协程一点时间跑完第一次（第一次不受冷却约束）。
+	time.Sleep(200 * time.Millisecond)
+
+	if n := issued.Load(); n > 2 {
+		t.Fatalf("一万个 TICKET_REQUEST 签出了 %d 批票据 —— 没有合并，"+
+			"对端可以用 4 字节的帧换服务端 330 字节留存 24 小时（RFC 9000 §21.9）", n)
+	}
+	if grew := runtime.NumGoroutine() - before; grew > 8 {
+		t.Fatalf("一万个 TICKET_REQUEST 多起了 %d 个协程 —— 每帧一个协程是无上界并发", grew)
+	}
+}
+
+// 签发侧同样必须有上界。Sweep 只清"已过期或已用完"的批次，刚签出的两样都不是，
+// 于是在 24 小时的 TicketLifetime 之内，签发路径上一个上界都没有。
+func TestTicketStoreBoundsBatchesPerUser(t *testing.T) {
+	st := NewMemTicketStore()
+	var user [16]byte
+	user[0] = 7
+	for i := 0; i < 5000; i++ {
+		if _, _, err := st.Issue(user, 1024); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.mu.Lock()
+	batches, index := len(st.users[user]), len(st.index)
+	st.mu.Unlock()
+	if batches > maxLiveBatchesPerUser {
+		t.Fatalf("单个用户攒了 %d 批，上界是 %d —— 对端刷 TICKET_REQUEST 就能把票据库撑爆，"+
+			"顺带让 Consume 的线性扫描变成同样长", batches, maxLiveBatchesPerUser)
+	}
+	// 索引必须跟着一起收，否则它自己变成第二个泄漏点。
+	if index > maxLiveBatchesPerUser {
+		t.Fatalf("索引留了 %d 项而活跃批次只有 %d —— 索引没跟着裁", index, batches)
+	}
+	// 上界不能把功能一起干掉：最新签出的那批必须还能消费。
+	base, _, err := st.Issue(user, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := st.consumeAny(base + 3); !ok {
+		t.Fatal("加了上界之后最新签出的票据也消费不了了")
+	}
+}
+
+// 钱包由**对端发来的帧**驱动增长，所以必须有上界。
+// sweep 只清"已过期或已用完"的批次，而刚收到的新批次两样都不是——
+// 一个恶意服务端刷 TICKET_REPLENISH，能让客户端一直涨到 24 小时后。
+func TestWalletBatchesBounded(t *testing.T) {
+	w := newTicketWallet()
+	now := time.Now()
+	var seed [32]byte
+	for i := 0; i < 100000; i++ {
+		w.add(uint64(i)*2000, 1024, seed, now)
+	}
+	w.mu.Lock()
+	n := len(w.batches)
+	w.mu.Unlock()
+	if n > maxWalletBatches {
+		t.Fatalf("钱包里堆了 %d 批，上界是 %d —— 对端可以刷 TICKET_REPLENISH 把客户端撑爆",
+			n, maxWalletBatches)
+	}
+	// 上界不能把功能一起干掉：最新的那批必须还能用。
+	if _, _, ok := w.take(now); !ok {
+		t.Fatal("加了上界之后钱包一张票也取不出来了")
 	}
 }
 

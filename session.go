@@ -68,10 +68,11 @@ type Session struct {
 
 	// 客户端票据钱包，重连时用来做 0-RTT。
 	wallet *ticketWallet
-	// ticketNeed 由 handleFrame 置位，重连循环消费。
-	ticketLow atomic.Bool
 	// onTicketReq 由服务端注入：客户端票据见底时补发一批。
 	onTicketReq func()
+	// ticketReq 是 TICKET_REQUEST 的**合并**信号，容量 1。
+	// 见 ticketServeLoop：一条会话只有一个补票协程，且有最小间隔。
+	ticketReq chan struct{}
 }
 
 func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.Duration, maxStreams int) *Session {
@@ -84,6 +85,7 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 		maxStream: maxStreams,
 		streams:   make(map[uint64]*Stream),
 		acceptCh:  make(chan *Stream, 64),
+		ticketReq: make(chan struct{}, 1),
 		closed:    make(chan struct{}),
 	}
 	s.pathCond = sync.NewCond(&s.mu)
@@ -706,9 +708,23 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 			}
 		}
 	case FrameTicketReq:
-		s.ticketLow.Store(true)
-		if s.onTicketReq != nil {
-			go s.onTicketReq()
+		// ★ 这里**绝不能**是 `go s.onTicketReq()`。
+		//
+		// TICKET_REQUEST 是全协议里最便宜的一个帧：type+flags+len(0)+sid(0) = 4 字节。
+		// 而它让服务端做的事是：起一个协程、读一次 crypto/rand、在票据库里新建一批
+		// （1024 张的位图 + 索引项，约 330 字节，**留存 24 小时**）、再回一个 42 字节的
+		// TICKET_REPLENISH。4 字节换 330 字节留存 24 小时是 80 倍放大，
+		// 换 42 字节回程是 10 倍反射，换一个协程是无上界并发。
+		// 一个已认证的对端只要在循环里发这个帧，服务端就会在几十秒内被自己的票据库撑死，
+		// 而且全程没有任何错误路径被触发（RFC 9000 §21.9 说的正是这一类：
+		// "处理开销相对带宽与状态变化不成比例"）。
+		//
+		// 改成往一个容量 1 的通道里投**非阻塞**信号：满了就丢，因为"请补票"这件事
+		// 是幂等的，投 1 次和投 1 万次要做的事一模一样。真正的补票在 ticketServeLoop
+		// 里排队执行，一条会话一个协程、且有最小间隔。
+		select {
+		case s.ticketReq <- struct{}{}:
+		default:
 		}
 	case FrameClose:
 		s.closeWith(ErrClosed)
@@ -839,6 +855,42 @@ func (s *Session) currentRTO() time.Duration {
 		rto = 4 * time.Second
 	}
 	return rto
+}
+
+// minReplenishInterval 是服务端两次补票之间的最小间隔。
+//
+// 客户端那边 ticketLoop 每 5 秒才检查一次、且要低于 25% 才发请求，所以对正常客户端
+// 这个下限从来不会碰到；它只对"在循环里刷 TICKET_REQUEST"的对端生效，
+// 把攻击成本从"每帧一批票据"压到"每秒一批"。
+const minReplenishInterval = time.Second
+
+// ticketServeLoop（服务端）串行地响应补票请求。
+//
+// 一条会话**一个**协程，且两次补票之间至少隔 minReplenishInterval。
+// 冷却期内到达的请求全部被合并成一次——补票是幂等的，对端要 1 次和要 1 万次
+// 需要做的事一模一样，所以合并不丢任何语义。
+func (s *Session) ticketServeLoop() {
+	var last time.Time
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-s.ticketReq:
+		}
+		if wait := minReplenishInterval - time.Since(last); wait > 0 && !last.IsZero() {
+			t := time.NewTimer(wait)
+			select {
+			case <-s.closed:
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
+		last = time.Now()
+		if s.onTicketReq != nil {
+			s.onTicketReq()
+		}
+	}
 }
 
 // ticketLoop（客户端）在票据不足时向服务端要一批。
