@@ -70,6 +70,20 @@ type ClientConfig struct {
 
 	// EnableQUIC 允许调度器探测并使用 QUIC 路径。
 	EnableQUIC bool
+	// H3 让 QUIC 路径跑在 HTTP/3 之上（spec §12.6）。
+	//
+	// 收益是服务端对任何非 TIDE 客户端都表现为一个**货真价实的 h3 服务器**
+	// （非 TIDE 请求反代到掩护源站），而不是一个沉默的 QUIC 端点——后者对一台
+	// 在 TCP/443 上服务 HTTPS 的主机来说是说不通的异常。
+	// 代价见 spec §12.6：h3 模式下 UDP 暂时走可靠的控制流（RFC 9297 尚未接入）。
+	//
+	// 需要服务端用 ServeH3 而不是 ServeQUIC 监听。
+	//
+	// ⚠️ **当前仅掩护那一半可用。** 服务端的 h3 反代已实现并通过测试（探测方拿到
+	// 掩护源站的真实响应）；但 TIDE 自己的数据面在 h3 之上还没跑通，
+	// 路径建起来后会立刻死掉。所以默认关闭，默认仍走原生 QUIC 那条实测过的路径。
+	// 见 spec §12.6 与 TestTIDEOverH3（已 Skip，故意保留）。
+	H3 bool
 	// QUICPort 为 0 时复用 Server 的端口。
 	QUICPort int
 

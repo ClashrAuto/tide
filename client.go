@@ -212,7 +212,13 @@ func (c *Client) maintainQUIC(s *Session) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		p, err := c.dialQUICPath(ctx, s, true)
+		var p *path
+		var err error
+		if c.cfg.H3 {
+			p, err = c.dialH3Path(ctx, s, true)
+		} else {
+			p, err = c.dialQUICPath(ctx, s, true)
+		}
 		cancel()
 		if err == nil && p != nil {
 			s.addPath(p)

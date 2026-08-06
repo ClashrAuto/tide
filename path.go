@@ -86,6 +86,8 @@ type path struct {
 	// qmux 非空 = QUIC 多流模式：每条 TIDE 流一条独立的 QUIC 流（见 quicmux.go）。
 	// 单流模式下为 nil，所有帧走 conn 那一条字节流。
 	qmux *quicMux
+	// h3 非空 = 这条路径跑在 HTTP/3 之上（spec §12.6）。
+	h3 *h3Client
 
 	dead     chan struct{}
 	deadOnce sync.Once
@@ -175,7 +177,7 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 	}
 	// UDP 走 RFC 9221 的 QUIC 数据报：不重传、不保序，才是 UDP 该有的语义。
 	// 太大装不下时下面会回退到控制流（可靠），见 quicMux.sendDatagram。
-	if p.qmux != nil && t == FrameDatagram {
+	if p.qmux != nil && !p.qmux.h3 && t == FrameDatagram {
 		if err := p.qmux.sendDatagram(flags, streamID, payload); err == nil {
 			return nil
 		} else if !errors.Is(err, errDatagramTooLarge) {

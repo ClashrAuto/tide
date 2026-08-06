@@ -50,8 +50,7 @@ func (q *quicConn) ExportKeyingMaterial(label string, ctx []byte, n int) (out []
 	// 安全前提，必须是一个显式失败，而不是一个悄悄少掉的安全属性。
 	defer func() {
 		if r := recover(); r != nil {
-			out, err = nil, errors.New("tide: QUIC transport exposes no TLS exporter; "+
-				"channel binding cannot be established")
+			out, err = nil, errNoExporter
 		}
 	}()
 	cs := q.conn.ConnectionState().TLS
@@ -66,6 +65,20 @@ func quicClientTLS(base *tls.Config) *tls.Config {
 	if c.MinVersion < tls.VersionTLS13 {
 		c.MinVersion = tls.VersionTLS13
 	}
+	return c
+}
+
+// h3QUICConfig 是 HTTP/3 模式用的 QUIC 参数。
+//
+// ★ 与原生模式的关键差别：**必须允许单向流**。HTTP/3 靠单向流承载控制流与
+// QPACK 编解码流（RFC 9114 §6.2），而原生模式那份配置把 MaxIncomingUniStreams
+// 设成了 -1（禁用）——客户端开不出控制流，握手直接以 H3_INTERNAL_ERROR 告终，
+// 而且错误是**客户端本地**产生的，看日志会以为是客户端的问题。
+func h3QUICConfig() *quic.Config {
+	c := quicConfig()
+	c.MaxIncomingUniStreams = 16
+	// h3 模式下不用裸 QUIC 数据报（要用得走 RFC 9297），关掉以免两端通告不一致。
+	c.EnableDatagrams = false
 	return c
 }
 
@@ -205,8 +218,22 @@ func (s *Server) handleQUICConn(conn *quic.Conn) {
 	<-p.dead
 }
 
-// isQUICConn 判断一条传输是不是 QUIC。
+// isQUICConn 判断一条传输是不是 QUIC —— **包括跑在 HTTP/3 之上的**。
+//
+// ★ 漏掉 h3 那一支会产生一个极难查的 bug：服务端据此决定 bare 与否，
+// 漏判就会协商成 sealed，而客户端的 h3 分流器写的是 bare 裸帧。
+// 握手本身照常成功（它不走记录层），路径建起来之后第一帧数据就解密失败、
+// 路径静默判死、重连、再死——现象是"h3 路径永远起不来"，
+// 而错误信息指向的是密钥/记录层，跟 bare 协商八竿子打不着。
 func isQUICConn(c interface{}) bool {
-	_, ok := c.(*quicConn)
-	return ok
+	switch c.(type) {
+	case *quicConn, *h3Conn:
+		return true
+	}
+	return false
 }
+
+// errNoExporter：传输层拿不出 TLS 导出器。没有它就没有信道绑定，
+// 也就没有 MITM 检测和 bare 模式的安全前提——必须是显式失败。
+var errNoExporter = errors.New("tide: transport exposes no TLS exporter; " +
+	"channel binding cannot be established")

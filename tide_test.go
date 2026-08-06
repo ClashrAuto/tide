@@ -14,10 +14,15 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go/http3"
 )
 
 // ---------------------------------------------------------------------------
@@ -974,4 +979,148 @@ func TestQUICCannotCreateSession(t *testing.T) {
 		t.Fatal("a QUIC connection created a brand-new session — the UDP port is an " +
 			"unprotected entry point, since QUIC does no cover forwarding")
 	}
+}
+
+// ★ §12.6 的全部意义：一个只会说 HTTP/3 的探测方，打到 TIDE 的 UDP 端口上，
+// 必须拿到**掩护源站的真实响应**，而不是沉默、也不是模拟的内容。
+//
+// 这条测试守的是伪装，不是功能——去掉 h3Cover 之后所有功能测试照常绿，
+// 只是那个 UDP 端口重新变成一个"会握手但不说话"的异常端点。
+func TestH3ProbeGetsCoverSite(t *testing.T) {
+	// 掩护源站必须是**真的 HTTP 服务器**：h3Cover 会把请求转成 HTTP/1.1 发过去
+	// 再把响应搬回来。harness 默认的那个是字节回声，不是 HTTP。
+	cover := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "nginx/1.27.1")
+		io.WriteString(w, "<!doctype html><title>It works</title>")
+	}))
+	t.Cleanup(cover.Close)
+	coverAddr := strings.TrimPrefix(cover.URL, "http://")
+
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.H3 = true
+		cc.QUICPort = port
+		sc.CoverAddr = coverAddr
+	})
+	go func() { _ = h.srv.ServeH3(net.JoinHostPort("127.0.0.1", strconv.Itoa(port))) }()
+	time.Sleep(400 * time.Millisecond)
+
+	// 一个普通的 HTTP/3 客户端，对 TIDE 一无所知。
+	tr := &http3.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "tide.test", NextProtos: []string{"h3"}},
+	}
+	defer tr.Close()
+	cli := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	resp, err := cli.Get("https://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) + "/")
+	if err != nil {
+		t.Fatalf("h3 prober got no response at all — the UDP port is a silent QUIC "+
+			"endpoint, which is exactly the anomaly §12.6 exists to remove: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// harness 的掩护源站是个回声服务：它会把我们发过去的 HTTP/1.1 请求原样回来。
+	// 只要拿到了**非空的、来自掩护源站的**字节，就说明反代真的发生了。
+	if !bytes.Contains(body, []byte("It works")) {
+		t.Fatalf("h3 prober did not get the cover origin's content (status=%d, body=%q)",
+			resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Server"); got != "nginx/1.27.1" {
+		t.Fatalf("cover origin's Server header did not survive the proxy: %q", got)
+	}
+	t.Logf("h3 prober saw a genuine cover response: status=%d Server=%q %d bytes",
+		resp.StatusCode, resp.Header.Get("Server"), len(body))
+}
+
+// TIDE 自己在 h3 模式下也必须能跑——掩护做得再好，代理不通就没意义。
+func TestTIDEOverH3(t *testing.T) {
+	// ⚠️ 已知未通过，且**故意留着不删**。
+	//
+	// 现状：h3 掩护（TestH3ProbeGetsCoverSite）已通过——探测方拿到的是掩护源站的
+	// 真实响应，§12.6 的安全目标达成。直接调 dialH3Path 也能建起路径
+	// （TestH3DialDiag 通过）。但经 maintainQUIC 驱动时这条路径起来后立刻死掉，
+	// 数据面没跑通，原因尚未定位。
+	//
+	// 所以 ClientConfig.H3 默认关闭，默认走原生 QUIC 那条**已经实测过**的路径。
+	// 删掉这条测试会让"h3 数据面没通"这件事从代码里消失，下一个人只会看到
+	// 一个看起来完整的 h3 实现。
+	t.Skip("TIDE-over-h3 data path not working yet; masquerade half is done and tested. " +
+		"ClientConfig.H3 stays opt-in and defaults to off — see spec §12.6.")
+
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.H3 = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	go func() { _ = h.srv.ServeH3(net.JoinHostPort("127.0.0.1", strconv.Itoa(port))) }()
+	time.Sleep(400 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 等 h3 路径接上
+	deadline := time.Now().Add(20 * time.Second)
+	var haveH3 bool
+	for time.Now().Before(deadline) && !haveH3 {
+		for _, p := range sess.Paths() {
+			if p.Kind == "quic" {
+				haveH3 = true
+			}
+		}
+		if !haveH3 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if !haveH3 {
+		t.Fatal("the HTTP/3 path never came up")
+	}
+
+	c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msg := bytes.Repeat([]byte("h3-"), 20000) // 60 KB，跨过多个帧
+	go func() { c.Write(msg) }()
+	got := make([]byte, len(msg))
+	c.SetReadDeadline(time.Now().Add(20 * time.Second))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("echo over the HTTP/3 path failed: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatal("payload corrupted over the HTTP/3 path")
+	}
+	for _, p := range sess.Paths() {
+		t.Logf("path %d %s tx=%dB rx=%dB", p.ID, p.Kind, p.TX, p.RX)
+	}
+}
+
+// 诊断用：直接拨一条 h3 路径，把真实错误打出来。
+func TestH3DialDiag(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.H3 = true
+		cc.QUICPort = port
+	})
+	go func() { _ = h.srv.ServeH3(net.JoinHostPort("127.0.0.1", strconv.Itoa(port))) }()
+	time.Sleep(400 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := h.client.dialH3Path(ctx, sess, true)
+	if err != nil {
+		t.Fatalf("dialH3Path: %v", err)
+	}
+	t.Logf("h3 path up: id=%d kind=%s", p.id, p.kind)
+	p.markDead()
 }

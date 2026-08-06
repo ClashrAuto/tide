@@ -37,9 +37,24 @@ var errNoQUICStream = errors.New("tide: no QUIC stream bound for this TIDE strea
 
 // qstream 是一条 QUIC 流加它自己的写锁。
 // 每条流一把锁，而不是整个 mux 一把——否则分了流却在写入口重新串行化，白分。
+// muxStream 是"一条双向字节流"。QUIC 原生流与 h3 流都满足它——
+// 抽这一层是为了让 §12.6 的 h3 模式复用整套分流逻辑，而不是复制一份。
+type muxStream interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Close() error
+}
+
 type qstream struct {
-	s  *quic.Stream
+	s  muxStream
 	mu sync.Mutex
+}
+
+// cancelRead 只对 QUIC 原生流有意义（h3 流由 http3 自己管）。
+func (q *qstream) cancelRead() {
+	if s, ok := q.s.(*quic.Stream); ok {
+		s.CancelRead(0)
+	}
 }
 
 type quicMux struct {
@@ -47,13 +62,26 @@ type quicMux struct {
 	isClient bool
 	path     *path
 
+	// h3 为真时流由 HTTP/3 handler 交进来，不走 AcceptStream。
+	h3 bool
+	// open 开一条新的底层流。QUIC 原生模式下是 conn.OpenStream；
+	// h3 模式下是"发一个 POST 并把请求体/响应体当成双向流"。
+	open func() (muxStream, error)
+
 	mu      sync.Mutex
 	streams map[uint64]*qstream
 	closed  bool
 }
 
+// adoptStream 收养一条对端开来的流（h3 模式下由 handler 交进来）。
+// 绑定关系等第一帧里的 stream_id 揭晓，与 acceptLoop 的处理一致。
+func (m *quicMux) adoptStream(s muxStream) {
+	m.readLoop(&qstream{s: s}, 0)
+}
+
 func newQUICMux(conn *quic.Conn, isClient bool, p *path) *quicMux {
 	m := &quicMux{conn: conn, isClient: isClient, path: p, streams: map[uint64]*qstream{}}
+	m.open = func() (muxStream, error) { return conn.OpenStream() }
 	go m.acceptLoop()
 	go m.datagramLoop()
 	return m
@@ -85,7 +113,7 @@ func (m *quicMux) streamFor(sid uint64, create bool) (*qstream, error) {
 	}
 	m.mu.Unlock()
 
-	s, err := m.conn.OpenStream()
+	s, err := m.open()
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +121,6 @@ func (m *quicMux) streamFor(sid uint64, create bool) (*qstream, error) {
 	if q, ok := m.streams[sid]; ok {
 		// 竞态：另一个 goroutine 抢先开了。用它的，把自己这条关掉。
 		m.mu.Unlock()
-		s.CancelRead(0)
 		s.Close()
 		return q, nil
 	}
@@ -126,6 +153,9 @@ func (m *quicMux) write(t FrameType, flags uint8, sid uint64, payload []byte) er
 
 // acceptLoop 收对端开的 QUIC 流。
 func (m *quicMux) acceptLoop() {
+	if m.h3 {
+		return // h3 模式下流由 handler 交进来，见 adoptStream
+	}
 	for {
 		s, err := m.conn.AcceptStream(context.Background())
 		if err != nil {
@@ -173,7 +203,7 @@ func (m *quicMux) dropStream(q *qstream) {
 		}
 	}
 	m.mu.Unlock()
-	q.s.CancelRead(0)
+	q.cancelRead()
 	q.s.Close()
 }
 
@@ -204,7 +234,7 @@ func (m *quicMux) close() {
 	m.streams = map[uint64]*qstream{}
 	m.mu.Unlock()
 	for _, q := range all {
-		q.s.CancelRead(0)
+		q.cancelRead()
 		q.s.Close()
 	}
 }
@@ -279,4 +309,20 @@ func (m *quicMux) datagramLoop() {
 			return
 		}
 	}
+}
+
+// newQUICMuxH3 建一个跑在 HTTP/3 之上的分流器（spec §12.6）。
+//
+// 与原生 QUIC 模式的两点不同：
+//   - 新流不是 conn.OpenStream()，而是"发一个 POST，把请求体/响应体当双向流"。
+//   - 对端开的流由 h3 handler 交进来（adoptStream），不走 AcceptStream。
+//
+// ⚠️ h3 模式下**不用 QUIC 数据报**。RFC 9297 的 HTTP Datagram 要求带 Quarter Stream ID
+// 前缀，直接发裸 QUIC 数据报会违反 h3 的帧结构，被规范的 h3 实现视为协议错误。
+// 所以这里 DATAGRAM 回落到控制流——UDP 因此暂时是可靠有序的，与 §9.1 的意图相悖，
+// 这是 h3 模式当前的已知代价，记在 spec §12.6。
+func newQUICMuxH3(conn *quic.Conn, p *path, open func() (muxStream, error)) *quicMux {
+	m := &quicMux{conn: conn, isClient: true, path: p, streams: map[uint64]*qstream{}, h3: true}
+	m.open = open
+	return m
 }
