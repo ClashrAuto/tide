@@ -326,3 +326,15 @@ func newQUICMuxH3(conn *quic.Conn, p *path, open func() (muxStream, error)) *qui
 	m.open = open
 	return m
 }
+
+// newQUICMuxH3Server 是服务端侧的 h3 分流器。
+//
+// 服务端**从不主动开**数据流：TIDE 的流号奇偶分家，客户端开奇数，而服务端在本设计里
+// 不开流。它只负责收养 h3 handler 交进来的流（adoptStream）。
+// 没有这个分流器，serveData 会因为 p.qmux == nil 把每条数据流直接丢掉——
+// 现象是控制流好好的、路径活着，但数据一个字节都过不去。
+func newQUICMuxH3Server(conn *quic.Conn, p *path) *quicMux {
+	m := &quicMux{conn: conn, isClient: false, path: p, streams: map[uint64]*qstream{}, h3: true}
+	m.open = func() (muxStream, error) { return nil, errNoQUICStream }
+	return m
+}

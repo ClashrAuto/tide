@@ -519,8 +519,19 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 	if err != nil {
 		return nil, nil, err
 	}
+	// ★ 这里必须用 isQUICConn（含 h3），不能再写一次窄的 *quicConn 断言。
+	//
+	// 曾经就是两处各自回答"这是不是 QUIC"：上面 ACCEPT 的 mode 位用了 isQUICConn
+	// （于是**告诉客户端用 bare**），这里用窄断言（于是**服务端建了 sealed 记录层**）。
+	// 同一个函数里隔着 70 行的两个答案不一致，结果是服务端发密文、客户端当明文读，
+	// 现象是"h3 路径建起来就死"，报错还是 frame exceeds max size ——
+	// 指向解帧，跟 bare 协商差着十万八千里。查了整整两轮。
+	//
+	// nativeQUIC 单独留着，是因为下面装原生多流复用器需要那个**具体类型**；
+	// 但凡涉及"要不要 bare"，一律走 isQUICConn。
+	qc, nativeQUIC := t.Conn.(*quicConn)
+	isQUIC := isQUICConn(t.Conn)
 	kind := "tcp"
-	qc, isQUIC := t.Conn.(*quicConn)
 	if isQUIC {
 		kind = "quic"
 	}
@@ -533,7 +544,7 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 	if err != nil {
 		return nil, nil, err
 	}
-	if isQUIC {
+	if nativeQUIC {
 		p.qmux = newQUICMux(qc.conn, false, p)
 	}
 	return p, sess, nil

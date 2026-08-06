@@ -2,6 +2,7 @@ package tide
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"math"
@@ -91,6 +92,7 @@ type path struct {
 
 	dead     chan struct{}
 	deadOnce sync.Once
+	peek     *peekReader
 	// deadReason 记下这条路径是被谁判死的。
 	//
 	// ★ 没有它就查不动"路径反复建起来又死"这类问题：markDead 有四个调用点
@@ -131,7 +133,10 @@ func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey
 		// 填充也随之关闭——要插填充就得在用户态碰载荷，那 splice 就没了。
 		p.pad.disable()
 	}
-	p.fr = newFrameReader(src)
+	// 留一份开头字节，解帧失败时能看清到底收到了什么（见 peekReader）。
+	pk := newPeekReader(src, 48)
+	p.peek = pk
+	p.fr = newFrameReader(pk)
 	return p, nil
 }
 
@@ -252,7 +257,14 @@ func (p *path) writeLoop() {
 
 func (p *path) readLoop() {
 	var rerr error
-	defer func() { p.markDeadReason("read loop: " + errText(rerr)) }()
+	defer func() {
+		reason := "read loop: " + errText(rerr)
+		// 解帧类错误一定要带上原始字节，否则只知道"对不齐"，不知道对不齐成什么样。
+		if rerr == ErrFrameTooLarge || rerr == ErrProtocol {
+			reason += " head=" + hex.EncodeToString(p.peek.Head())
+		}
+		p.markDeadReason(reason)
+	}()
 	for {
 		f, err := p.fr.ReadFrame()
 		if err != nil {

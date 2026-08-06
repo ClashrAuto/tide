@@ -135,6 +135,10 @@ func (b *h3Binding) serveControl(st *http3.Stream) {
 		st.Close()
 		return
 	}
+	// ★ 服务端侧也要装 h3 分流器，否则 serveData 拿不到 qmux，
+	// 会把每条数据流原地丢掉——路径活着、控制流通着，数据却一个字节都不过。
+	p.qmux = newQUICMuxH3Server(b.conn, p)
+
 	b.mu.Lock()
 	b.path, b.sess = p, sess
 	b.mu.Unlock()

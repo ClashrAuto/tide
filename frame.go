@@ -312,3 +312,32 @@ func appendPadding(b []byte, pad int) []byte {
 	}
 	return binary.BigEndian.AppendUint16(b, uint16(pad))
 }
+
+// peekReader 留一份**最开头**若干字节的副本。
+//
+// 排查"帧解析失败"时，光有错误类型（长度超限 / 协议违规）没用——那只说明
+// 字节流对不齐，说不出对不齐成什么样。把开头几十字节原样拿出来，
+// 一眼就能认出它是别的协议的帧头、是半个帧、还是纯粹的垃圾。
+type peekReader struct {
+	r    io.Reader
+	head []byte
+	max  int
+}
+
+func newPeekReader(r io.Reader, max int) *peekReader {
+	return &peekReader{r: r, max: max}
+}
+
+func (p *peekReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 && len(p.head) < p.max {
+		room := p.max - len(p.head)
+		if room > n {
+			room = n
+		}
+		p.head = append(p.head, b[:room]...)
+	}
+	return n, err
+}
+
+func (p *peekReader) Head() []byte { return p.head }
