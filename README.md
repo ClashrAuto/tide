@@ -53,7 +53,7 @@ tide/
 
 ```bash
 git clone https://github.com/ClashrAuto/tide.git && cd tide
-cp .env.example .env      # 至少把 TIDE_PASSWORD 改掉
+cp .env.example .env      # 至少把 TIDE_USERS 里的口令改掉
 docker compose up -d
 docker compose logs tide  # 这里会打印客户端该贴的完整配置（含 public-key）
 ```
@@ -75,6 +75,11 @@ docker compose logs tide  # 这里会打印客户端该贴的完整配置（含 
 
 几件必须知道的事：
 
+- **口令不经过容器的环境变量。** 编排把 `.env` 里的 `TIDE_USERS` 作为 compose
+  secret 写成容器内的 `/run/secrets/tide_users`，服务端用 `TIDE_USERS_FILE` 去读。
+  写进 `environment:` 的值会出现在 `docker inspect` 和 `/proc/<pid>/environ` 里，
+  而这个协议里口令就是凭据。自建部署想手工管用户表时，直接
+  `-users-file` 指向一个每行 `name:password` 的文件即可（`#` 开头是注释）。
 - **`/data` 一定要是持久卷。** 静态密钥在里面，删了就等于换了 `public-key`，
   所有客户端配置一起作废。
 - **默认用自动生成的自签证书。** 能跑，但**削弱伪装**——真实网站都有受信任的证书。

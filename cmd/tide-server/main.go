@@ -42,6 +42,7 @@ func main() {
 		keyPEMFile = flag.String("cert-key", env("TIDE_CERT_KEY", "/data/tls.key"), "outer TLS private key (PEM)")
 		certHost   = flag.String("cert-host", env("TIDE_CERT_HOST", "tide.local"), "CN/SAN for the auto-generated self-signed certificate")
 		users      = flag.String("users", env("TIDE_USERS", ""), "comma-separated name:password pairs")
+		usersFile  = flag.String("users-file", env("TIDE_USERS_FILE", ""), "read name:password pairs from this file instead of -users (keeps credentials out of the environment)")
 		grace      = flag.Duration("grace", envDuration("TIDE_GRACE", tide.DefaultSessionGrace), "session grace period")
 		allowBare  = flag.Bool("allow-bare", env("TIDE_ALLOW_BARE", "") != "", "allow negotiating bare-frame mode")
 		advertise  = flag.String("advertise", env("TIDE_ADVERTISE", ""), "host clients will dial (may include :port); only used to print the sample config")
@@ -76,23 +77,27 @@ func main() {
 		fatal(err)
 	}
 
-	userMap := map[[16]byte]string{}
-	for _, pair := range strings.Split(*users, ",") {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
+	spec := *users
+	if *usersFile != "" {
+		// 文件优先。两个都给时不静默取一个——那正是"改了配置却没生效"的经典来源。
+		if spec != "" {
+			fatal(fmt.Errorf("give -users or -users-file, not both"))
 		}
-		name, password, ok := strings.Cut(pair, ":")
-		if !ok || password == "" {
-			fatal(fmt.Errorf("bad -users entry %q, want name:password", pair))
+		b, err := os.ReadFile(*usersFile)
+		if err != nil {
+			fatal(fmt.Errorf("read -users-file: %w", err))
 		}
-		userMap[tide.UserIDFromPassword(password)] = name
+		spec = string(b)
+	}
+	userMap, err := parseUsers(spec)
+	if err != nil {
+		fatal(err)
 	}
 	if len(userMap) == 0 {
 		// 空用户表在 tide 里表示"接受任何通过认证的 user_id"，而 user_id 是由口令派生的——
 		// 也就是**任何人都能连**。这在只有静态公钥当凭据的部署里勉强说得通，
 		// 但绝不该是默认，所以这里直接拒绝启动而不是打个警告了事。
-		fatal(fmt.Errorf("at least one user is required: -users alice:<password>"))
+		fatal(fmt.Errorf("at least one user is required: -users alice:<password> (or -users-file)"))
 	}
 
 	srv, err := tide.NewServer(&tide.ServerConfig{
@@ -194,7 +199,7 @@ func printBanner(priv *tide.PrivateKey, listen, quicListen string, h3 bool, cove
     type: tide
     server: %s
     port: %s
-    password: <你在 -users 里给这个用户设的口令>
+    password: <这个用户在 -users / -users-file 里的口令>
     public-key: %s
     sni: %s
     udp: true
@@ -213,6 +218,40 @@ func printBanner(priv *tide.PrivateKey, listen, quicListen string, h3 bool, cove
 		fmt.Printf("    skip-cert-verify: true   # 自签证书才需要；换成真证书后请删掉这行\n")
 	}
 	fmt.Println()
+}
+
+// parseUsers 解析用户表。逗号与换行都算分隔符，所以同一个解析器既能吃 -users
+// 的 "alice:pw,bob:pw"，也能吃 -users-file 的每行一条。
+//
+// ★ 支持文件是为了让口令**不必经过环境变量**。编排里原本是
+// `TIDE_USERS: "alice:${TIDE_PASSWORD}"`，那意味着口令出现在
+// `docker inspect`、`/proc/<pid>/environ`，以及容器里任何一个进程眼里——
+// 而在这个协议里口令就是凭据，泄露 = 代理被人白嫖，且在威胁模型里还牵扯归属。
+// Docker 自己的建议就是敏感值走 secrets 挂成文件（/run/secrets/<name>），
+// 别走环境变量。
+//
+// ⚠️ 必须容忍 CRLF。用户很可能在 Windows 上编辑这个文件，而一个尾随的 CR
+// 会被当成口令的一部分——派生出来的 user_id 就不是同一个，
+// 现象是"口令明明填对了却认证失败"，且服务端按 §7 失败关闭，
+// 客户端只会看到掩护站点的回声，一条有用的线索都没有。
+func parseUsers(spec string) (map[[16]byte]string, error) {
+	out := map[[16]byte]string{}
+	for _, line := range strings.FieldsFunc(spec, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}) {
+		entry := strings.TrimSpace(line)
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		name, password, ok := strings.Cut(entry, ":")
+		name = strings.TrimSpace(name)
+		password = strings.TrimSpace(password)
+		if !ok || name == "" || password == "" {
+			return nil, fmt.Errorf("bad user entry %q, want name:password", entry)
+		}
+		out[tide.UserIDFromPassword(password)] = name
+	}
+	return out, nil
 }
 
 // advertiseHostPort 决定横幅里那段客户端配置该写哪个 server / port。

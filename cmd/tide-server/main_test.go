@@ -65,3 +65,60 @@ func TestAdvertiseHostPort(t *testing.T) {
 		})
 	}
 }
+
+// 用户表的解析器同时喂给 -users（逗号分隔）与 -users-file（每行一条），
+// 所以两种形状都得吃得下。
+//
+// ★ CRLF 那条不是凑数：用户很可能在 Windows 上编辑 users 文件，而一个尾随的 \r
+// 会被当成口令的一部分——派生出来的 user_id 就不是同一个。现象是"口令明明填对了
+// 却认证失败"，而服务端按 §7 失败关闭，客户端只看到掩护站点的回声，
+// 一条有用的线索都没有。本仓库在 CRLF 上已经栽过一次（seed 配置那次）。
+func TestParseUsers(t *testing.T) {
+	same := func(a, b map[[16]byte]string) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for k, v := range a {
+			if b[k] != v {
+				return false
+			}
+		}
+		return true
+	}
+	want, err := parseUsers("alice:pw1,bob:pw2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 2 {
+		t.Fatalf("逗号形式解出 %d 条，期望 2", len(want))
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   string
+	}{
+		{"每行一条", "alice:pw1\nbob:pw2\n"},
+		{"CRLF", "alice:pw1\r\nbob:pw2\r\n"},
+		{"注释与空行", "# 用户表\n\nalice:pw1\n\n#bob 停用了\nbob:pw2\n"},
+		{"前后空白", "  alice : pw1 \n\tbob:pw2\t\n"},
+		{"混用逗号与换行", "alice:pw1,\nbob:pw2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseUsers(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !same(got, want) {
+				t.Fatalf("%q 解出来和逗号形式不一致：%v", tc.in, got)
+			}
+		})
+	}
+
+	// 缺口令 / 缺用户名必须报错，而不是悄悄少一个用户——
+	// 空用户表在 tide 里的含义是"任何人都能连"。
+	for _, bad := range []string{"alice", "alice:", ":pw", "alice:pw,bob"} {
+		if _, err := parseUsers(bad); err == nil {
+			t.Fatalf("%q 应当被拒绝", bad)
+		}
+	}
+}

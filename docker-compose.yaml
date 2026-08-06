@@ -1,6 +1,6 @@
 # TIDE 一键部署。
 #
-#   1. cp .env.example .env  并把 TIDE_PASSWORD 改掉
+#   1. cp .env.example .env  并把 TIDE_USERS 里的口令改掉
 #   2. docker compose up -d
 #   3. docker compose logs tide      # 里面会打印客户端该贴的配置（含 public-key）
 #
@@ -44,7 +44,13 @@ services:
       TIDE_LISTEN: ":8443"
       TIDE_QUIC_LISTEN: ":8443"
       TIDE_COVER: "cover:80"
-      TIDE_USERS: "${TIDE_USER:-alice}:${TIDE_PASSWORD:?set TIDE_PASSWORD in .env}"
+      # ★ 口令**不走环境变量**，走 secrets 挂进来的文件（见文件末尾的 secrets:）。
+      #   环境变量里的值会出现在 `docker inspect`、`/proc/<pid>/environ`，
+      #   以及容器里任何一个进程眼里。而在这个协议里口令就是凭据：
+      #   泄露 = 代理被人白嫖，在威胁模型里还牵扯归属。
+      #   Docker 自己的建议就是敏感值挂成 /run/secrets/<name> 的文件。
+      #   实测：改完之后容器环境里搜不到口令，docker inspect 里也搜不到。
+      TIDE_USERS_FILE: /run/secrets/tide_users
       TIDE_KEY_FILE: "/data/tide.key"
       TIDE_CERT: "/data/tls.crt"
       TIDE_CERT_KEY: "/data/tls.key"
@@ -64,6 +70,7 @@ services:
       TIDE_GRACE: "${TIDE_GRACE:-120s}"
       # QUIC 面走 HTTP/3（spec §12.6）。非空即开启，客户端必须同步打开 h3。
       TIDE_H3: "${TIDE_H3:-}"
+    secrets: [tide_users]
     volumes:
       # ★ 持久卷不是可选的：静态密钥在这里面。删了它 = 换了 public-key =
       #   所有客户端配置作废。
@@ -94,6 +101,12 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+
+secrets:
+  # 值取自 .env 的 TIDE_USERS，由 compose 写成容器内的一个只读文件。
+  # 关键在于**容器自己的环境变量里没有它**——这正是与直接写 environment: 的区别。
+  tide_users:
+    environment: TIDE_USERS
 
 volumes:
   tide-data:
