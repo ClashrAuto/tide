@@ -156,16 +156,39 @@ ACCEPT_plain {
     ticket_base : u64
     ticket_count: u16           // 默认 1024
     ticket_seed : 32 bytes
+    srv_eph     : 32 bytes       // 服务端本次握手的 X25519 临时公钥
     server_data : opt bytes
 }
 
 ACCEPT.payload = AEAD(k_hs, ACCEPT_plain, ad = transcript)   // nonce = 0…01
 
 ticket_key[i] = HKDF-Expand(ticket_seed, "tide/draft-01 ticket" || u64(id), 32)
+
+ee             = X25519(srv_eph_priv, client_eph_pub)        // client_eph_pub 见下
+session_secret = HKDF( ikm = k_hs || ee, salt = session_id, info = "tide/draft-01 session" )
 ```
 
 只下发一个 32 字节种子而非 1024 把密钥，是为了让 `ACCEPT` 保持小帧——
 整批密钥两端各自派生即可。
+
+**`srv_eph` 与 `ee` 是前向保密的唯一来源，MUST 存在。**
+`client_eph_pub` 取自 `HELLO.kem_share` 的前 32 字节（1-RTT）或 `zero_seal.eph`（0-RTT）。
+服务端 MUST 为每次握手新生成这对临时密钥，并在握手结束后 MUST 丢弃私钥。
+
+> 没有它，握手里就**一个服务端临时密钥都没有**：
+> `ikm = X25519(客户端临时, 服务端静态) || MLKEM.Decapsulate(服务端静态, ct)`，
+> 两项都只依赖长期私钥与线上可见的字节。于是"一份录音 + 事后取得的静态私钥"
+> 足以重算 `k_hs`、解开 `ACCEPT`、拿到 `session_id` 与 `ticket_seed`，
+> 还原整条会话，连同用那批票据做的所有 0-RTT 会话。
+>
+> 加上 `ee` 之后，攻击者仍然能重算 `k_hs`（1-RTT 躲不掉：`ACCEPT` 必须在拿到对方
+> 临时公钥之前就可读），但缺那把从未上线的临时私钥，`session_secret` 就推不出来。
+>
+> 因此仍然**不**具备前向保密的是：`HELLO.sealed`、`ACCEPT` 自身、0-RTT 的 `early_data`。
+> 这与 TLS 1.3（RFC 8446 §2.3：0-RTT 数据不具前向保密）和 Noise IK
+> （`ee` 之前的消息只有弱前向保密）的取舍一致。
+>
+> 代价：`ACCEPT` +32 字节，每次握手多一次 X25519。**不增加往返。**
 
 `ACCEPT` 的 nonce MUST 与 `HELLO` 的全零 nonce 区分（本规范取 `0…01`）：
 同一把 `k_hs` 下重复使用同一个 nonce 会直接泄露明文异或并允许伪造 tag。
@@ -184,17 +207,22 @@ ZERO_RTT {
                       ad = version || ticket_id || nonce)
 }
 
-zero_seal {                        // 77 字节
+zero_seal {                        // 109 字节
     cb_hash    : 32 bytes
     timestamp  : u64
     user_id    : 16 bytes
     session_id : 16 bytes
     flags      : u8
     path_id    : u32
+    eph        : 32 bytes          // 客户端本次连接的 X25519 临时公钥
 }
 
 k_hs = HKDF( ikm = ticket_key, salt = cb_hash, info = "tide/draft-01 0rtt" )
 ```
+
+`zero_seal.eph` 与 1-RTT 里 `kem_share` 前 32 字节起同样的作用：给服务端一把对端临时
+公钥去做 §3.2 的 `ee`。0-RTT 路径上没有 `kem_share`，不单独带它的话这条会话就完全
+没有前向保密——而 0-RTT 恰恰是长期会话里出现次数最多的那种握手。
 
 服务端处理流程（顺序 MUST 严格保持）：
 

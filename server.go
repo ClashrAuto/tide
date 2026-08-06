@@ -319,7 +319,9 @@ func (s *Server) handleHello(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, *S
 		return nil, nil, ErrProtocol
 	}
 	useAES := ap.flags&flagHasAESNI != 0 && preferAES
-	return s.finishHandshake(t, kHS, transcript, ap.user, ap.sessionID, ap.pathID, ap.flags, useAES, cb)
+	// 1-RTT 的客户端临时公钥就在 kem_share 的前 32 字节里。
+	return s.finishHandshake(t, kHS, transcript, ap.user, ap.sessionID, ap.pathID, ap.flags, useAES, cb,
+		h.kemShare[:x25519PubLen])
 }
 
 func (s *Server) handleZeroRTT(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, *Session, error) {
@@ -387,7 +389,8 @@ func (s *Server) handleZeroRTT(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, 
 		return nil, nil, err
 	}
 	useAES := zs.flags&flagHasAESNI != 0 && preferAES
-	return s.finishHandshake(t, kHS, cb[:], zs.user, zs.sessionID, zs.pathID, zs.flags, useAES, cb)
+	// 0-RTT 没有 kem_share，客户端临时公钥自己带在 zero_seal 里。
+	return s.finishHandshake(t, kHS, cb[:], zs.user, zs.sessionID, zs.pathID, zs.flags, useAES, cb, zs.eph[:])
 }
 
 func (s *Server) consumeTicket(id uint64) ([32]byte, [16]byte, bool) {
@@ -448,8 +451,10 @@ func (s *Server) userAllowed(u [16]byte) bool {
 	return ok
 }
 
+// clientEph 是对端本次连接的 X25519 临时公钥：1-RTT 取自 kem_share 前 32 字节，
+// 0-RTT 取自 zero_seal.eph。服务端拿它做 ee，会话密钥因此获得前向保密（见 crypto.go）。
 func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [16]byte,
-	wantPath uint32, flags uint8, useAES bool, cb [cbHashLen]byte) (*path, *Session, error) {
+	wantPath uint32, flags uint8, useAES bool, cb [cbHashLen]byte, clientEph []byte) (*path, *Session, error) {
 
 	bare := s.cfg.AllowBare && flags&flagRequestBare != 0
 
@@ -502,10 +507,17 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		return nil, nil, err
 	}
 
+	// 每次握手一对全新的临时密钥。公钥随 ACCEPT 发出去，私钥用完就丢——
+	// 前向保密全靠"私钥从不上线"这一点（见 crypto.go 的 serverEphemeral）。
+	srvEphPub, ee, err := serverEphemeral(clientEph)
+	if err != nil {
+		return nil, nil, err
+	}
 	am := &acceptMsg{
 		sessionID: sid, pathID: pathID,
 		ticketBase: base, ticketCount: count, ticketSeed: seed,
 	}
+	copy(am.srvEph[:], srvEphPub)
 	if bare || isQUICConn(t.Conn) {
 		am.mode |= acceptModeBare
 	}
@@ -521,7 +533,7 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 	}
 
 	if !joining {
-		secret, err := sessionSecret(kHS, sid[:])
+		secret, err := sessionSecret(kHS, ee, sid[:])
 		if err != nil {
 			return nil, nil, err
 		}

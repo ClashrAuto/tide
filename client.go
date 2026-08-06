@@ -2,6 +2,7 @@ package tide
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -394,7 +395,7 @@ func (c *Client) handshake(ctx context.Context, s *Session, conn net.Conn, join 
 }
 
 func (c *Client) oneRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, flags uint8, pathID uint32, sid [16]byte, kind string) (*path, error) {
-	kemShare, ikm, err := encapsulate(c.cfg.PublicKey)
+	kemShare, ikm, eph, err := encapsulate(c.cfg.PublicKey)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +425,7 @@ func (c *Client) oneRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, flags uin
 	if err := writeFrameExact(conn, FrameHello, FlagPush, 0, h.marshal(), 0); err != nil {
 		return nil, err
 	}
-	return c.readAccept(s, conn, kHS, transcript, pathID, kind)
+	return c.readAccept(s, conn, kHS, transcript, pathID, kind, eph)
 }
 
 func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID uint64, tkey []byte, flags uint8, pathID uint32, sid [16]byte, kind string) (*path, error) {
@@ -432,16 +433,24 @@ func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID
 	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
 		return nil, err
 	}
+	// 0-RTT 路径上没有 kem_share，服务端拿不到客户端的临时公钥就做不了 ee，
+	// 这条会话就会没有前向保密。所以这里另生成一对，把公钥带在 zero_seal 里。
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
 	zs := &zeroSeal{
 		cbHash: cb, timestamp: time.Now().Unix(), user: c.cfg.UserID,
 		sessionID: sid, flags: flags, pathID: pathID,
 	}
+	copy(zs.eph[:], eph.PublicKey().Bytes())
 	ad := make([]byte, 0, 1+8+12)
 	ad = append(ad, ProtocolVersion)
 	ad = appendU64(ad, ticketID)
 	ad = append(ad, nonce[:]...)
 
-	sealed, err := sealFixed(tkey, nonce[:], zs.marshal(nil), ad, false)
+	sealed, err2 := sealFixed(tkey, nonce[:], zs.marshal(nil), ad, false)
+	err = err2
 	if err != nil {
 		return nil, err
 	}
@@ -454,14 +463,16 @@ func (c *Client) zeroRTT(s *Session, conn net.Conn, cb [cbHashLen]byte, ticketID
 	if err != nil {
 		return nil, err
 	}
-	return c.readAccept(s, conn, kHS, cb[:], pathID, kind)
+	return c.readAccept(s, conn, kHS, cb[:], pathID, kind, eph)
 }
 
 func zeroRTTHandshakeKey(ticketKey, cb []byte) ([]byte, error) {
 	return hkdfKey(ticketKey, cb, labelZeroRTT)
 }
 
-func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID uint32, kind string) (*path, error) {
+// eph 是本次连接的 X25519 临时私钥：ACCEPT 里带回服务端的临时公钥，两者做 ee，
+// 会话密钥因此获得前向保密（见 crypto.go）。
+func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID uint32, kind string, eph *ecdh.PrivateKey) (*path, error) {
 	f, err := readFrameExact(conn)
 	if err != nil {
 		return nil, err
@@ -486,7 +497,11 @@ func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID ui
 		s.mu.Lock()
 		s.id = am.sessionID
 		s.mu.Unlock()
-		secret, err := sessionSecret(kHS, am.sessionID[:])
+		ee, err := clientEphemeralShared(eph, am.srvEph[:])
+		if err != nil {
+			return nil, err
+		}
+		secret, err := sessionSecret(kHS, ee, am.sessionID[:])
 		if err != nil {
 			return nil, err
 		}

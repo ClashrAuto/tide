@@ -181,14 +181,14 @@ func decodeB64(s string) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // encapsulate 由客户端调用：生成 kem_share 与共享密钥输入材料。
-func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, err error) {
-	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, eph *ecdh.PrivateKey, err error) {
+	eph, err = ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	xShared, err := eph.ECDH(pub.x25519)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	mShared, ct := pub.mlkem.Encapsulate()
 
@@ -199,7 +199,65 @@ func encapsulate(pub *PublicKey) (kemShare []byte, ikm []byte, err error) {
 	ikm = make([]byte, 0, len(xShared)+len(mShared))
 	ikm = append(ikm, xShared...)
 	ikm = append(ikm, mShared...)
-	return kemShare, ikm, nil
+	// ★ 临时私钥要交回给调用方留着：会话密钥还要用它跟服务端的临时公钥做一次
+	// ephemeral-ephemeral（见 serverEphemeral）。这一步是前向保密的**全部**来源。
+	return kemShare, ikm, eph, nil
+}
+
+// ---------------------------------------------------------------------------
+// 前向保密：ephemeral-ephemeral
+// ---------------------------------------------------------------------------
+//
+// ★ 上面的 ikm 两项——X25519(客户端临时, 服务端**静态**) 与
+// MLKEM.Decapsulate(服务端**静态**, ct)——都只依赖服务端的长期私钥和线上可见的字节。
+// 也就是说，事后拿到静态私钥的人，配上一份录音就能把 k_hs 重算出来，
+// 进而解开 ACCEPT、拿到 session_id 与 ticket_seed，还原整条会话。
+// 握手里如果没有任何**服务端临时密钥**，前向保密就是零——这正是 Noise IK 里
+// `ee` 那一步存在的理由（IK 的第二条消息带上响应方的临时公钥并做 ee，
+// 传输阶段的前向保密全靠它）。
+//
+// 所以服务端每次握手另生成一对 X25519 临时密钥：公钥放进 ACCEPT（它被 k_hs 保护，
+// 事后攻破者能读到，但没关系——**私钥从不上线**，握手一结束就丢），
+// 双方各自算出同一个 ee 并把它混进会话密钥。攻击者缺的就是这个私钥。
+//
+// 代价：ACCEPT 多 32 字节，一次 X25519。不需要多一个往返，1-RTT 性质不变。
+//
+// ⚠️ 仍然**不**前向保密的部分（与 TLS 1.3 的 0-RTT 同款取舍，RFC 8446 §2.3）：
+// HELLO.sealed 与 ACCEPT 自身、以及 0-RTT 的 early_data。它们必须在拿到对方临时
+// 公钥之前就能读，1-RTT 里躲不掉。会话数据——也就是绝大部分字节——是保护住的。
+
+// serverEphemeral 由服务端调用：生成一对临时密钥，与客户端的临时公钥做 ee。
+// clientEphPub 取自 kem_share 的前 32 字节（1-RTT）或 zero_seal.eph（0-RTT）。
+func serverEphemeral(clientEphPub []byte) (pub []byte, ee []byte, err error) {
+	if len(clientEphPub) < x25519PubLen {
+		return nil, nil, ErrProtocol
+	}
+	peer, err := ecdh.X25519().NewPublicKey(clientEphPub[:x25519PubLen])
+	if err != nil {
+		return nil, nil, err
+	}
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	ee, err = eph.ECDH(peer)
+	if err != nil {
+		return nil, nil, err
+	}
+	return eph.PublicKey().Bytes(), ee, nil
+}
+
+// clientEphemeralShared 是客户端那一半：拿自己的临时私钥与 ACCEPT 里的服务端临时公钥
+// 算出同一个 ee。
+func clientEphemeralShared(eph *ecdh.PrivateKey, srvEphPub []byte) ([]byte, error) {
+	if eph == nil || len(srvEphPub) < x25519PubLen {
+		return nil, ErrProtocol
+	}
+	peer, err := ecdh.X25519().NewPublicKey(srvEphPub[:x25519PubLen])
+	if err != nil {
+		return nil, err
+	}
+	return eph.ECDH(peer)
 }
 
 // decapsulate 由服务端调用。
@@ -248,9 +306,17 @@ func handshakeKey(clientRandom, ikm, transcript []byte) ([]byte, error) {
 	return hkdf.Key(sha256.New, ikm, clientRandom, string(info), 32)
 }
 
-// sessionSecret 由 k_hs（1-RTT）或 ticket_key（0-RTT）+ session_id 派生会话主密钥。
-func sessionSecret(base []byte, sessionID []byte) ([]byte, error) {
-	return hkdf.Key(sha256.New, base, sessionID, labelSession, 32)
+// sessionSecret 由 k_hs（1-RTT）或 ticket_key（0-RTT）、ephemeral-ephemeral 共享值
+// 与 session_id 派生会话主密钥。
+//
+// ★ ee 必须混进来，否则整条会话的密钥都能由"服务端静态私钥 + 一份录音"重算出来
+// （见 serverEphemeral 上面那段）。ee 为空只在解析老对端时出现，
+// 那种情况下前向保密不成立，属于兼容性降级而不是正常路径。
+func sessionSecret(base, ee []byte, sessionID []byte) ([]byte, error) {
+	ikm := make([]byte, 0, len(base)+len(ee))
+	ikm = append(ikm, base...)
+	ikm = append(ikm, ee...)
+	return hkdf.Key(sha256.New, ikm, sessionID, labelSession, 32)
 }
 
 // ticketKey 由种子派生第 id 张票据的密钥（spec §3.2）。

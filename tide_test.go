@@ -129,6 +129,100 @@ func TestReadFrameExactConsumesNothingExtra(t *testing.T) {
 	}
 }
 
+// 事后拿到服务端静态私钥，**不得**能解开之前录下的会话（前向保密）。
+//
+// ★ design.md §10 把"服务端事后被攻破 —— 前向保密限制损失范围"列为已解决的威胁。
+// 这条测试就是那句话的凭据：攻击者手里只有一份录音（kem_share、client_random、
+// ACCEPT 密文都是明文可见的线上字节）和事后取得的静态私钥，
+// 必须**推不出**会话密钥。
+//
+// 修复前推得出来，而且是完整的：ikm = X25519(静态私钥, 客户端临时公钥) ||
+// MLKEM.Decapsulate(静态私钥, ct)，两项都只依赖静态私钥和录音里的字节，
+// 于是 k_hs → ACCEPT → session_id/ticket_seed → 会话密钥全部还原。
+// 握手里从头到尾没有任何服务端临时密钥——Noise IK 里叫 `ee` 的那一步，TIDE 缺了。
+func TestForwardSecrecyAgainstStaticKeyCompromise(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := ParsePublicKey(priv.Public().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// —— 线上录得到的东西 ——
+	kemShare, ikm, cliEph, err := encapsulate(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cr [32]byte
+	if _, err := rand.Read(cr[:]); err != nil {
+		t.Fatal(err)
+	}
+	transcript := transcriptHash(ProtocolVersion, kemShare, cr[:])
+	kHS, err := handshakeKey(cr[:], ikm, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 服务端这一侧：临时密钥对 + ee。srvEph 是**只出现在服务端内存里**的东西，
+	// 握手一结束就没了，录音里没有，事后攻破也拿不到。
+	srvEphPub, ee, err := serverEphemeral(kemShare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := [16]byte{1, 2, 3}
+	real, err := sessionSecret(kHS, ee, sid[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 客户端用录音里的 srvEphPub + 自己的临时私钥算出同一个 ee——功能不能坏。
+	cliEE, err := clientEphemeralShared(cliEph, srvEphPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirrored, err := sessionSecret(kHS, cliEE, sid[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(real, mirrored) {
+		t.Fatal("两端算出的会话密钥不一致 —— ee 接错了，握手直接不通")
+	}
+
+	// —— 攻击者：录音 + 事后取得的静态私钥 ——
+	ikm2, err := decapsulate(priv, kemShare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kHS2, err := handshakeKey(cr[:], ikm2, transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kHS, kHS2) {
+		t.Fatal("测试前提不成立：k_hs 本来就推不出来")
+	}
+	// 先把攻击本身演示清楚：**没有 ee 的话**，攻击者算出的会话密钥与真的一模一样。
+	// 这就是修复前的处境——录音 + 静态私钥 = 整条会话的明文。
+	oldReal, err := sessionSecret(kHS, nil, sid[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldForged, err := sessionSecret(kHS2, nil, sid[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(oldReal, oldForged) {
+		t.Fatal("测试前提不成立：不混 ee 时攻击者本来就算不出来")
+	}
+
+	// k_hs 推得出来是设计使然（ACCEPT 要靠它保护，1-RTT 躲不掉）。
+	// 但**会话密钥**必须推不出来——差的就是那个只在服务端内存里待过的临时私钥。
+	forged := oldForged
+	if bytes.Equal(real, forged) {
+		t.Fatal("拿静态私钥 + 一份录音就还原出了会话密钥 —— 没有前向保密。" +
+			"design.md §10 把这条列为已解决的威胁，实际上握手里没有任何服务端临时密钥")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 记录层
 // ---------------------------------------------------------------------------
