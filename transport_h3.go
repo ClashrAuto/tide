@@ -198,7 +198,7 @@ func recvH3Datagrams(p *path, st *http3.Stream) {
 		if err != nil {
 			continue
 		}
-		p.noteRecv(len(f.Payload))
+		p.noteRecvDatagram(len(f.Payload))
 		if err := p.sess.handleFrame(p, f); err != nil {
 			return
 		}
@@ -458,7 +458,7 @@ func (h *h3Client) recvDatagrams(ctx context.Context, p *path) {
 		if err != nil {
 			continue // 坏数据报丢掉即可
 		}
-		p.noteRecv(len(f.Payload))
+		p.noteRecvDatagram(len(f.Payload))
 		if err := p.sess.handleFrame(p, f); err != nil {
 			return
 		}

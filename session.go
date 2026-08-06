@@ -39,7 +39,11 @@ type Session struct {
 	pathCond *sync.Cond
 
 	acceptCh chan *Stream
-	dgramCh  chan *Datagram
+
+	// early 暂存"比自己的 STREAM_OPEN 先到"的数据报，见 datagram.go 的 holdEarlyDatagram。
+	earlyMu    sync.Mutex
+	early      map[uint64]*earlyDatagrams
+	earlyBytes int
 
 	// redial 由客户端注入：在所有路径都死掉后重新拨一条并加入本会话。
 	// 服务端为 nil——服务端不能主动连客户端，只能在宽限期里等对方回来。
@@ -80,7 +84,6 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 		maxStream: maxStreams,
 		streams:   make(map[uint64]*Stream),
 		acceptCh:  make(chan *Stream, 64),
-		dgramCh:   make(chan *Datagram, 256),
 		closed:    make(chan struct{}),
 	}
 	s.pathCond = sync.NewCond(&s.mu)
@@ -762,6 +765,12 @@ func (s *Session) onStreamOpen(p *path, f Frame) error {
 	// 立刻回一个 ACK 通告本端真实窗口——对端在此之前只敢用 64 KiB 的保守初值。
 	st.forceAck()
 
+	// 关联建好了，把抢跑到前面的数据报按原序补交。必须在流入表之后做，
+	// 否则补交与新到的数据报会乱序。
+	if st.udp {
+		s.releaseEarlyDatagrams(st)
+	}
+
 	select {
 	case s.acceptCh <- st:
 	case <-s.closed:
@@ -886,7 +895,11 @@ func (s *Session) closeWith(err error) {
 		for _, st := range sts {
 			st.fail(err)
 		}
-		close(s.dgramCh)
+		// ★ 这里**不能**关 acceptCh，也不能关任何"别人还在往里发"的通道。
+		// 关闭会话是**接收侧**的动作，而每条路径的收帧协程都是发送侧——
+		// Go 里向已关闭通道发送必定 panic，`select`+`default` 也挡不住。
+		// 曾经这里关过一个 dgramCh，于是"会话关闭的同时对端还在发 DATAGRAM"
+		// 就是一次远端可触发的进程崩溃。发送侧一律以 s.closed 为准，通道交给 GC。
 	})
 }
 

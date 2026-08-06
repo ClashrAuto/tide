@@ -32,6 +32,10 @@ type PathInfo struct {
 	Pad   string // 当前填充阶段
 	TX    uint64
 	RX    uint64
+	// TXDgram/RXDgram 是 TX/RX 里走不可靠数据面（RFC 9221 / RFC 9297）的那部分。
+	// 「TX − TXDgram」才是流字节，也是判断"UDP 有没有被偷偷塞进可靠流"的唯一证据。
+	TXDgram uint64
+	RXDgram uint64
 	// Dead 非空时说明这条路径已经死了，内容是**谁**判的死。
 	Dead string
 }
@@ -51,7 +55,10 @@ func (s *Session) Paths() []PathInfo {
 			Pad:   p.pad.Phase().String(),
 			TX:    p.txBytes.Load(),
 			RX:    p.rxBytes.Load(),
-			Dead:  p.DeadReason(),
+
+			TXDgram: p.txDgram.Load(),
+			RXDgram: p.rxDgram.Load(),
+			Dead:    p.DeadReason(),
 		})
 	}
 	return out

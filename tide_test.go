@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -1171,6 +1170,103 @@ func TestH3DialDiag(t *testing.T) {
 	p.markDead()
 }
 
+// ---------------------------------------------------------------------------
+// 抢跑的数据报
+// ---------------------------------------------------------------------------
+
+// 一条 UDP 关联的第一个数据报**理应**跑在它自己的 STREAM_OPEN 前面：
+// 数据报走不可靠数据面，STREAM_OPEN 走可靠流，两者之间没有任何顺序关系。
+// 丢掉它不会报错，只表现为"每开一个新 UDP 连接就卡一下"——
+// DNS 等自己的重传超时（通常 1 秒），被代理的 QUIC 少一个 Initial 退避一轮。
+// 处置照 RFC 9297 §5.2：在一个 RTT 量级内暂存等待流建立。
+func TestEarlyDatagramHeldUntilAssociationExists(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	const assoc = 5
+	want := []string{"first", "second", "third"}
+	for _, w := range want {
+		if err := s.onDatagram(udpFrame(t, assoc, "10.0.0.1:53", []byte(w))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 此刻关联还不存在，数据报只能在暂存区里。
+	if got := s.earlyHeld(); got != len(want) {
+		t.Fatalf("early datagrams held = %d, want %d", got, len(want))
+	}
+
+	// STREAM_OPEN 追上来了——照 onStreamOpen 的样子把关联建起来。
+	st := newStream(s, assoc, "10.0.0.1:53", DefaultStreamWindow)
+	st.udp = true
+	st.pkt = newPacketStream(s, st)
+	s.mu.Lock()
+	s.streams[assoc] = st
+	s.mu.Unlock()
+	s.releaseEarlyDatagrams(st)
+
+	if got := s.earlyHeld(); got != 0 {
+		t.Fatalf("early buffer not drained: %d left", got)
+	}
+	// ★ 顺序也要对：补交的必须按原序，否则上层看到的是被重排过的 UDP 流。
+	for _, w := range want {
+		st.pkt.SetReadDeadline(time.Now().Add(2 * time.Second))
+		d, err := st.pkt.ReadFrom()
+		if err != nil {
+			t.Fatalf("read %q: %v", w, err)
+		}
+		if string(d.Data) != w {
+			t.Fatalf("got %q, want %q — 补交乱序了", d.Data, w)
+		}
+	}
+}
+
+// 暂存区必须有硬上界。没有上界的话，对端只要对**不存在**的流号狂发 DATAGRAM，
+// 就能让一条会话白占内存——而且完全在协议允许的范围内，不触发任何错误路径。
+func TestEarlyDatagramBounded(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+
+	// 单个关联：超过 earlyDatagramPerAssoc 就丢最老的，条数不再增长。
+	for i := 0; i < earlyDatagramPerAssoc*3; i++ {
+		s.onDatagram(udpFrame(t, 7, "10.0.0.1:53", []byte{byte(i)}))
+	}
+	if got := s.earlyHeld(); got != earlyDatagramPerAssoc {
+		t.Fatalf("per-assoc cap not enforced: held %d, want %d", got, earlyDatagramPerAssoc)
+	}
+
+	// 全会话字节数：拿不同流号灌满，总字节不得越界。
+	big := make([]byte, 8<<10)
+	for id := uint64(100); id < 400; id++ {
+		s.onDatagram(udpFrame(t, id, "10.0.0.1:53", big))
+	}
+	s.earlyMu.Lock()
+	bytesHeld := s.earlyBytes
+	s.earlyMu.Unlock()
+	if bytesHeld > earlyDatagramBytes {
+		t.Fatalf("byte cap breached: %d > %d", bytesHeld, earlyDatagramBytes)
+	}
+}
+
+// 关闭会话的**同时**对端还在发数据报，是一次远端可触发的进程崩溃：
+// closeWith 是接收侧，onDatagram 是发送侧，接收侧关掉发送侧还在用的通道，
+// 在 Go 里必定 panic（`select` + `default` 也挡不住）。
+func TestDatagramAfterSessionCloseDoesNotPanic(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	s.closeWith(ErrClosed)
+	for i := 0; i < 64; i++ {
+		if err := s.onDatagram(udpFrame(t, uint64(i), "10.0.0.1:53", []byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// udpFrame 拼一个 DATAGRAM 帧的载荷：SOCKS 地址 + 数据。
+func udpFrame(t *testing.T, assoc uint64, addr string, data []byte) Frame {
+	t.Helper()
+	payload, err := appendSocksAddr(nil, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Frame{Type: FrameDatagram, StreamID: assoc, Payload: append(payload, data...)}
+}
+
 // UDP 在 h3 路径上必须走 RFC 9297 的 HTTP Datagram（spec §12.6 / §9.1）。
 //
 // ★ 这条守的是**语义**，不是连通性：把 DATAGRAM 塞进可靠有序的流里，UDP 照样能通，
@@ -1178,19 +1274,6 @@ func TestH3DialDiag(t *testing.T) {
 // 两层拥塞控制打架，现象是吞吐周期性崩塌而两层统计都看不出问题。
 // 所以这里除了断言收发正常，还断言**数据报没有落到流上**。
 func TestUDPOverH3Datagrams(t *testing.T) {
-	// ⚠️ 已知不稳定：约一半概率报 "no datagram round-tripped"。
-	// RFC 9297 的链路确实通（另一半是过的，且流字节断言也过，说明数据报**真的**
-	// 走了 HTTP Datagram 而不是流），但存在一个还没定位的竞态——
-	// 怀疑是 SETTINGS 里的 datagram 能力协商完成前发出的数据报被静默丢弃
-	// （quic-go 的 SendDatagram 里就留着 "TODO: reject if datagrams are not
-	// negotiated (yet)" 的注释，也就是说它此刻既不拒绝也不排队）。
-	//
-	// 常关而不删：删了这件事就从代码里消失，而它是 h3 转正的最后一道。
-	//     TIDE_H3_DGRAM=1 go test -count=6 -run TestUDPOverH3Datagrams
-	if os.Getenv("TIDE_H3_DGRAM") == "" {
-		t.Skip("RFC 9297 datagram path is flaky (~50%) — suspected races with " +
-			"datagram capability negotiation. Set TIDE_H3_DGRAM=1 to run.")
-	}
 	port := freeUDPPort(t)
 	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
 		cc.EnableQUIC = true
@@ -1247,20 +1330,30 @@ func TestUDPOverH3Datagrams(t *testing.T) {
 	// 把这条关联钉到 h3 路径上，否则可能走 TCP，测的就不是 RFC 9297 了。
 	ps.st.pathID.Store(h3ID)
 
-	var txBefore uint64
-	for _, p := range sess.pathsSnapshot() {
-		if p.id == h3ID {
-			txBefore = p.txBytes.Load()
+	// 流字节 = 总字节 − 数据报字节。这个差才是"UDP 有没有被塞进可靠流"的证据；
+	// 只看总量的话，"没走流"和"根本没发出去"长得一模一样。
+	streamTx := func() uint64 {
+		for _, p := range sess.pathsSnapshot() {
+			if p.id == h3ID {
+				return p.txBytes.Load() - p.txDgram.Load()
+			}
 		}
+		return 0
 	}
+	txBefore := streamTx()
 
 	payload := []byte("datagram-over-http3")
-	ps.SetReadDeadline(time.Now().Add(10 * time.Second))
 	ok := false
+	// ★ 读超时必须**每轮重设**。它是绝对时刻，不是"每次调用的等待时长"：
+	// 在循环外设一次的话，第一次 ReadFrom 就会把整个 10 秒吃光，
+	// 剩下 9 轮都在已过期的 deadline 上立刻返回——写出去了，但根本没等回来。
+	// 那样这个循环名为"重试 10 次"，实为"试 1 次"，而失败恰好耗时 10 秒，
+	// 看起来像超时，掩盖了真正的原因。
 	for i := 0; i < 10 && !ok; i++ {
 		if _, err := ps.WriteTo(payload, pc.LocalAddr().String()); err != nil {
 			t.Fatal(err)
 		}
+		ps.SetReadDeadline(time.Now().Add(time.Second))
 		if d, err := ps.ReadFrom(); err == nil && bytes.Equal(d.Data, payload) {
 			ok = true
 		}
@@ -1270,14 +1363,7 @@ func TestUDPOverH3Datagrams(t *testing.T) {
 	}
 
 	// ★ 关键断言：数据报走的是 HTTP Datagram，**不该**在流上留下字节。
-	// txBytes 只统计流写入（quicMux.write / writeLoop），HTTP Datagram 不经过它们。
-	var txAfter uint64
-	for _, p := range sess.pathsSnapshot() {
-		if p.id == h3ID {
-			txAfter = p.txBytes.Load()
-		}
-	}
-	if grew := txAfter - txBefore; grew > 512 {
+	if grew := streamTx() - txBefore; grew > 512 {
 		t.Fatalf("the h3 path's stream bytes grew by %d during a UDP-only exchange — "+
 			"the datagrams went over a reliable stream instead of RFC 9297 HTTP Datagrams, "+
 			"which silently gives UDP retransmission it must not have (spec §9.1)", grew)

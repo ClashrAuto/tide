@@ -83,8 +83,16 @@ type path struct {
 	created  time.Time
 	// 收发字节数。调度器的决策（哪条流走哪条路）除了看这个没有别的办法验证——
 	// "QUIC 路径建起来了"和"数据真的走了 QUIC"是两件事。
+	//
+	// tx/rxBytes 是**这条路径上的全部**字节；tx/rxDgram 是其中走不可靠数据面
+	// （RFC 9221 的 QUIC 数据报 / RFC 9297 的 HTTP Datagram）的那部分。
+	// ★ 拆开不是为了好看：判断"UDP 有没有被偷偷塞进可靠流"唯一能用的证据就是
+	// 「总量 − 数据报量 = 流字节」这个差。只有一个总数时，"没走流"和"没发出去"
+	// 长得一模一样，而这两件事一个是对的、一个是彻底坏了。
 	txBytes atomic.Uint64
 	rxBytes atomic.Uint64
+	txDgram atomic.Uint64
+	rxDgram atomic.Uint64
 
 	// qmux 非空 = QUIC 多流模式：每条 TIDE 流一条独立的 QUIC 流（见 quicmux.go）。
 	// 单流模式下为 nil，所有帧走 conn 那一条字节流。
@@ -488,6 +496,18 @@ func (p *path) noteRecv(n int) {
 	p.rxBytes.Add(uint64(n))
 }
 
+// noteRecvDatagram 同 noteRecv，外加记下"这些字节走的是不可靠数据面"。
+func (p *path) noteRecvDatagram(n int) {
+	p.noteRecv(n)
+	p.rxDgram.Add(uint64(n))
+}
+
+// noteSentDatagram 记一次从不可靠数据面发出的字节。
+func (p *path) noteSentDatagram(n int) {
+	p.txBytes.Add(uint64(n))
+	p.txDgram.Add(uint64(n))
+}
+
 func (p *path) markDead() { p.markDeadReason("unspecified") }
 
 func (p *path) markDeadReason(reason string) {
@@ -555,11 +575,17 @@ func (p *path) h3DatagramFrame(flags uint8, streamID uint64, payload []byte) ([]
 
 // sendH3Datagram 走 RFC 9297。客户端侧与服务端侧各持有同一条控制流的一端。
 func (p *path) sendH3Datagram(buf []byte) error {
-	if p.h3 != nil {
-		return p.h3.sendDatagram(buf)
+	var err error
+	switch {
+	case p.h3 != nil:
+		err = p.h3.sendDatagram(buf)
+	case p.h3srv != nil:
+		err = p.h3srv.SendDatagram(buf)
+	default:
+		return errNoQUICStream
 	}
-	if p.h3srv != nil {
-		return p.h3srv.SendDatagram(buf)
+	if err == nil {
+		p.noteSentDatagram(len(buf))
 	}
-	return errNoQUICStream
+	return err
 }

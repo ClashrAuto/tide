@@ -194,11 +194,118 @@ func (s *Session) onDatagram(f Frame) error {
 		st.pkt.deliver(d)
 		return nil
 	}
-	// 服务端侧：关联由 STREAM_OPEN(kind=1) 建立，PacketStream 挂在流上。
-	// 走到这里说明关联还没建好或已经关了，丢弃。
-	select {
-	case s.dgramCh <- d:
-	default:
-	}
+	// 关联还没建好：**短暂**留住，等 STREAM_OPEN 追上来（见 holdEarlyDatagram）。
+	s.holdEarlyDatagram(d)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 抢跑的数据报
+// ---------------------------------------------------------------------------
+//
+// ★ 一条 UDP 关联的第一个数据报**理应**跑在它自己的 STREAM_OPEN 前面。
+//
+// 这不是竞态、也不是实现瑕疵，而是把不可靠数据面（RFC 9221 的 QUIC 数据报 /
+// RFC 9297 的 HTTP Datagram）和可靠控制面（STREAM_OPEN 走流）混在一起的必然结果：
+// 两者之间**没有任何顺序关系**。数据报不排队、不等流控、不等重传，
+// 于是在任何有 RTT 的链路上，"先发的 STREAM_OPEN 后到"是常态而不是例外。
+//
+// 丢掉它的代价是隐形的：DNS 的第一个查询消失，应用要等自己的重传超时（通常 1 秒）；
+// 被代理的 QUIC 第一个 Initial 消失，握手退避一轮。两者都**不报错**，
+// 只表现为"每开一个新连接就卡一下"。
+//
+// RFC 9297 §5.2 对完全同构的问题（收到的 HTTP Datagram 其 Quarter Stream ID
+// 指向一条尚未创建的流）给的处置就是两选一：静默丢弃，**或者**在一个 RTT 量级的
+// 时间内暂存等待流建立。这里选后者，并且给足三重上界，避免它变成新的内存坑：
+// 总字节、每关联条数、存活时长。
+const (
+	// earlyDatagramTTL 是"一个 RTT 量级"的具体取值。宁短勿长：
+	// 留久了不会更正确（应用早就自己重传了），只会让攻击面变大。
+	earlyDatagramTTL = time.Second
+	// earlyDatagramPerAssoc 是单个关联最多暂存几个。一次 DNS 查询是 1 个，
+	// 一个 QUIC Initial 突发也就几个，超过说明对端在乱发。
+	earlyDatagramPerAssoc = 8
+	// earlyDatagramBytes 是整个会话暂存区的硬上界。这是对"对端拿不存在的流号
+	// 狂发 DATAGRAM"的唯一有效防线——限条数不够，单帧可以有 56 KiB。
+	earlyDatagramBytes = 256 << 10
+)
+
+type earlyDatagrams struct {
+	expires time.Time
+	dgrams  []*Datagram
+}
+
+// holdEarlyDatagram 暂存一个还没有归属的数据报。
+func (s *Session) holdEarlyDatagram(d *Datagram) {
+	s.earlyMu.Lock()
+	defer s.earlyMu.Unlock()
+
+	now := time.Now()
+	s.sweepEarlyLocked(now)
+
+	if s.earlyBytes+len(d.Data) > earlyDatagramBytes {
+		return // 暂存区满：按 UDP 的规矩丢掉，不扩容
+	}
+	e := s.early[d.Assoc]
+	if e == nil {
+		if s.early == nil {
+			s.early = make(map[uint64]*earlyDatagrams)
+		}
+		e = &earlyDatagrams{}
+		s.early[d.Assoc] = e
+	}
+	// 每次续期：同一个关联持续抢跑说明它确实还在等 STREAM_OPEN。
+	e.expires = now.Add(earlyDatagramTTL)
+	if len(e.dgrams) >= earlyDatagramPerAssoc {
+		s.earlyBytes -= len(e.dgrams[0].Data)
+		e.dgrams = e.dgrams[1:] // 丢最老的：陈旧的 UDP 比新鲜的更没价值
+	}
+	e.dgrams = append(e.dgrams, d)
+	s.earlyBytes += len(d.Data)
+}
+
+// releaseEarlyDatagrams 在关联建好后把暂存的数据报按原序交付。
+// 由 onStreamOpen 在 st.pkt 装好、流已入表之后调用。
+func (s *Session) releaseEarlyDatagrams(st *Stream) {
+	s.earlyMu.Lock()
+	e := s.early[st.id]
+	if e != nil {
+		delete(s.early, st.id)
+		for _, d := range e.dgrams {
+			s.earlyBytes -= len(d.Data)
+		}
+	}
+	s.sweepEarlyLocked(time.Now())
+	s.earlyMu.Unlock()
+
+	if e == nil || st.pkt == nil {
+		return
+	}
+	for _, d := range e.dgrams {
+		st.pkt.deliver(d)
+	}
+}
+
+// earlyHeld 返回暂存区里的数据报条数，供自检与测试。
+func (s *Session) earlyHeld() int {
+	s.earlyMu.Lock()
+	defer s.earlyMu.Unlock()
+	n := 0
+	for _, e := range s.early {
+		n += len(e.dgrams)
+	}
+	return n
+}
+
+// sweepEarlyLocked 清掉过期条目。惰性清理，不额外起 timer——
+// 暂存区只在有数据报抢跑时才被碰，没人碰就没有需要清的东西。
+func (s *Session) sweepEarlyLocked(now time.Time) {
+	for id, e := range s.early {
+		if now.After(e.expires) {
+			for _, d := range e.dgrams {
+				s.earlyBytes -= len(d.Data)
+			}
+			delete(s.early, id)
+		}
+	}
 }

@@ -281,7 +281,7 @@ func (m *quicMux) sendDatagram(flags uint8, sid uint64, payload []byte) error {
 	buf := AppendFrame(nil, FrameDatagram, flags, sid, payload, 0)
 	err := m.conn.SendDatagram(buf)
 	if err == nil {
-		m.path.txBytes.Add(uint64(len(buf)))
+		m.path.noteSentDatagram(len(buf))
 		return nil
 	}
 	var tooLarge *quic.DatagramTooLargeError
@@ -304,7 +304,7 @@ func (m *quicMux) datagramLoop() {
 		if err != nil {
 			continue // 坏数据报丢掉即可，不值得断路径
 		}
-		m.path.noteRecv(len(f.Payload))
+		m.path.noteRecvDatagram(len(f.Payload))
 		if err := m.path.sess.handleFrame(m.path, f); err != nil {
 			return
 		}
