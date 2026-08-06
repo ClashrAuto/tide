@@ -255,6 +255,13 @@ func (t *teeConn) takeCover() net.Conn {
 // 响应也就不一样，等于把想消除的差异换了个地方留下。
 func (t *teeConn) flushCover(up net.Conn) error {
 	t.mu.Lock()
+	// ⚠️ 必须夹一下：stopRecording 会把 rec 置 nil 而**不动** sent。
+	// 今天 stopRecording（握手成功）与 flushCover（失败关闭）互斥，走不到一起，
+	// 但早推那个协程是并发的，重排一次代码就可能撞上——那时 t.rec[t.sent:]
+	// 就是 nil[2450:]，直接 panic 掉整个进程。夹住比记住这条互斥关系可靠。
+	if t.sent > len(t.rec) {
+		t.sent = len(t.rec)
+	}
 	buf := append([]byte(nil), t.rec[t.sent:]...)
 	t.sent = len(t.rec)
 	t.mu.Unlock()

@@ -1785,6 +1785,68 @@ func TestPathsPerSessionBounded(t *testing.T) {
 	}
 }
 
+// 会话挂满路径之后，后台的 QUIC 维持循环**不得**变成一台握手风暴发生器。
+//
+// ★ 这是第 4 轮的路径上界与既有 maintainQUIC 之间的配合问题，两边各自都对：
+//
+//	· addPath 到上界就把新路径顶回来（防对端不断加路径）；
+//	· maintainQUIC 看"有没有 QUIC 路径"决定要不要拨，而它把 addPath 的返回值**丢掉了**。
+//
+// 于是 hasQUIC 永远为假（新路径根本挂不上），每 5 秒拨一次全新的 QUIC 路径，
+// 每次都做完整的 KEM 握手、服务端也陪着做一遍，然后被拒、判死、重来——会话活多久刷多久。
+//
+// 死因环形缓冲让它可观测：每条被顶回来的路径都会留下一条
+// "too many paths on this session"。
+func TestFullSessionDoesNotSpinDialingQUIC(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用假路径把会话填满（kind 用 tcp，好让 hasQUIC 保持为假）。
+	for len(sess.pathsSnapshot()) < maxPathsPerSession {
+		p := &path{
+			id: 900 + uint32(len(sess.pathsSnapshot())), kind: "tcp", sess: sess, conn: &nopConn{},
+			pad: newPaddingScheduler(), pending: make(map[uint64]time.Time),
+			created: time.Now(), dead: make(chan struct{}),
+		}
+		p.wcond = sync.NewCond(&p.wmu)
+		p.lastRecv.Store(time.Now().UnixNano())
+		p.peek = newPeekReader(p.conn, 48)
+		p.fr = newFrameReader(p.peek)
+		if !sess.addPath(p) {
+			break
+		}
+	}
+	if n := len(sess.pathsSnapshot()); n < maxPathsPerSession {
+		t.Skipf("没能把会话填满（%d/%d）", n, maxPathsPerSession)
+	}
+
+	// 让 maintainQUIC 跑一会儿。修复前它每 5 秒拨一次并被顶回来。
+	time.Sleep(16 * time.Second)
+
+	rejected := 0
+	for _, d := range sess.PathDeaths() {
+		if strings.Contains(d, "too many paths") {
+			rejected++
+		}
+	}
+	if rejected > 1 {
+		t.Fatalf("会话挂满之后仍然反复拨号：死因里有 %d 条“路径太多”—— "+
+			"每一条都是一次完整的 KEM 握手，客户端和服务端各做一遍，然后扔掉", rejected)
+	}
+	t.Logf("会话挂满 16 秒，被顶回来的拨号次数 = %d", rejected)
+}
+
 // UDP 关联在开了 QUIC 路径的会话上也必须能通。
 //
 // ★ 这条专门守 spec §12.8 的回归：DATAGRAM 改走 RFC 9221 的 QUIC 数据报之后，

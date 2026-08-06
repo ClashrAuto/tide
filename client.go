@@ -195,7 +195,19 @@ func (c *Client) maintainQUIC(s *Session) {
 				hasQUIC = true
 			}
 		}
+		full := len(s.paths) >= maxPathsPerSession
 		s.mu.Unlock()
+
+		// ★ 会话已经挂满路径：拨了也会被 addPath 顶回来。
+		//
+		// 没有这一条就是个自伤的握手风暴：hasQUIC 永远为 false（新路径根本挂不上），
+		// 于是每 5 秒拨一次全新的 QUIC 路径，每次都做完整的 KEM 握手、
+		// 服务端也陪着做一遍，然后被拒、判死、重来。会话活多久就刷多久。
+		// 退避拉到最大，等别的路径死掉腾出位置再说。
+		if full {
+			backoff = quicBackoffMax
+			continue
+		}
 
 		if hasQUIC {
 			backoff = 5 * time.Second
@@ -221,7 +233,12 @@ func (c *Client) maintainQUIC(s *Session) {
 		}
 		cancel()
 		if err == nil && p != nil {
-			s.addPath(p)
+			if !s.addPath(p) {
+				// 被路径上界顶回来了。上面的 full 检查通常已经拦住，
+				// 这里是并发下的兜底：拨号期间别的协程刚把位置占满。
+				backoff = quicBackoffMax
+				continue
+			}
 			backoff = 5 * time.Second
 			continue
 		}

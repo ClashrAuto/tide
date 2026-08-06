@@ -486,7 +486,11 @@ func (s *Session) recoverLoop() {
 		p, err := s.redial(ctx, s)
 		cancel()
 		if err == nil && p != nil {
-			s.addPath(p)
+			if !s.addPath(p) {
+				// 会话已经挂满：这条重连的路径被顶回来了，别当成"恢复成功"，
+				// 否则 recoverLoop 就此退出，而会话其实一条可用路径都没有。
+				continue
+			}
 			return
 		}
 
