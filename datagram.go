@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,10 @@ type PacketStream struct {
 	queued int // queue 里的载荷字节数，与 sess.dgramBytes 同步增减
 	closed bool
 	rdl    time.Time
+
+	// lastActive 是这条关联**任一方向**最后一次有流量的时刻（UnixNano）。
+	// 空闲回收看的是它，见 watchUDPIdle。
+	lastActive atomic.Int64
 }
 
 // OpenPacket 开一条 UDP 关联。dst 是"默认目标"，实际每个数据报都自带地址。
@@ -90,6 +95,7 @@ func (s *Session) OpenPacket(ctx context.Context, dst string) (*PacketStream, er
 func newPacketStream(s *Session, st *Stream) *PacketStream {
 	ps := &PacketStream{st: st, sess: s}
 	ps.cond = sync.NewCond(&ps.mu)
+	ps.lastActive.Store(time.Now().UnixNano())
 	return ps
 }
 
@@ -113,6 +119,9 @@ func (ps *PacketStream) WriteTo(b []byte, addr string) (int, error) {
 	if err := ps.sess.sendOnStream(ps.st, FrameDatagram, FlagPush, payload); err != nil {
 		return 0, err
 	}
+	// 出向也算"活着"。只按入向计时的话，一条纯下载的关联（本端一直在发、
+	// 对端偶尔才回）会在传输中途被当成空闲收掉。
+	ps.lastActive.Store(time.Now().UnixNano())
 	return len(b), nil
 }
 
@@ -246,6 +255,7 @@ func (ps *PacketStream) deliver(d *Datagram) {
 
 	ps.queue = append(ps.queue, d)
 	ps.queued += n
+	ps.lastActive.Store(time.Now().UnixNano())
 	ps.cond.Signal()
 }
 

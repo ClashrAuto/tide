@@ -3265,6 +3265,62 @@ func TestClosingUDPAssociationReleasesTheServerSide(t *testing.T) {
 		n, serverStreams(t, h.srv), base)
 }
 
+// 自定义 PacketHandler **不能**把空闲回收一起丢掉。
+//
+// ★ 空闲回收原先只写在 packetRelay（默认 handler）内部。于是任何一个提供了自己的
+// PacketHandler 的接入方——clash 那个 listener 就是——静默地失去了这条保证：
+// 它的 handler 只是阻塞在 ReadFrom 上，没有任何超时，于是"对端开了关联却再也不管"
+// 会一直占着流数配额，直到整条会话过期。而这恰恰是 §9.4 第二条要挡的那一类。
+//
+// Go 官方 net/http 的取法正相反，也正是该学的：WriteTimeout 覆盖**整个 handler 栈**
+// 的生命周期，handler 换成什么都一样——服务端级别的保证不会因为换了 handler 就蒸发。
+func TestUDPIdleReclaimSurvivesACustomHandler(t *testing.T) {
+	const idle = 600 * time.Millisecond
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) { sc.UDPTimeout = idle })
+
+	// 一个**什么超时都没有**的 handler，正是 clash 那个 listener 的形状。
+	handled := make(chan *PacketStream, 4)
+	h.srv.PacketHandler = func(ctx context.Context, ps *PacketStream) {
+		handled <- ps
+		for {
+			if _, err := ps.ReadFrom(); err != nil {
+				return // 只有关联被收掉时才会走到这里
+			}
+		}
+	}
+
+	ctx := context.Background()
+	base := serverStreams(t, h.srv)
+	ps, err := h.client.DialPacket(ctx, "10.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+	// 发一个数据报把服务端那半边建起来。
+	for i := 0; i < 5; i++ {
+		ps.WriteTo([]byte("ping"), "10.0.0.1:53")
+		select {
+		case <-handled:
+			i = 99
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	select {
+	case <-handled:
+	default:
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if serverStreams(t, h.srv) <= base {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("换成自定义 handler 之后，空闲 %v 的关联仍挂着（服务端还有 %d 条流，起始 %d）"+
+		" —— 空闲回收这条保证被 handler 一换就没了", idle, serverStreams(t, h.srv), base)
+}
+
 // 对端一声不吭地消失时，靠的是空闲超时。
 //
 // 光有"流结束 = 关联结束"不够：客户端崩了、路径断了、或者干脆是个恶意实现，

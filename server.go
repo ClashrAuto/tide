@@ -902,6 +902,10 @@ func (s *Server) acceptLoop(sess *Session) {
 		if st.udp {
 			ps := st.pkt
 			idle := s.cfg.udpTimeout()
+			// ★ 空闲回收由**服务端**保证，而不是塞在默认 handler 里。
+			// 见 watchUDPIdle 的说明：接入方换掉 PacketHandler 之后，
+			// 从前会连这条保证一起丢掉，且没有任何迹象。
+			go watchUDPIdle(ps, idle)
 			go func() {
 				if s.PacketHandler != nil {
 					s.PacketHandler(context.Background(), ps)
@@ -937,6 +941,43 @@ func DefaultHandler(ctx context.Context, st *Stream) {
 	go func() { io.Copy(up, st); done <- struct{}{} }()
 	go func() { io.Copy(st, up); done <- struct{}{} }()
 	<-done
+}
+
+// watchUDPIdle 在一条关联**两个方向都**静默超过 idle 之后把它整条收掉。
+//
+// ★ 这条保证必须由服务端给，不能只写在默认 handler 里。
+//
+// 空闲回收原先只存在于 packetRelay（也就是 DefaultPacketHandler）内部。
+// 于是任何一个提供了自己的 PacketHandler 的接入方——clash 那个 listener 就是——
+// **静默地**失去了这条保证：它的 handler 只是阻塞在 ReadFrom 上，没有任何超时，
+// 于是"对端开了关联却再也不管"这种情况会一直占着流数配额，直到整条会话过期。
+// 而这恰恰是 §9.4 第二条要挡的那一类（对端一声不吭地消失）。
+//
+// Go 官方 net/http 的取法正相反，也正是该学的：WriteTimeout 覆盖**整个 handler 栈**
+// 的生命周期，handler 换成什么都一样——服务端级别的保证不会因为换了 handler 就蒸发。
+// 这里照此办理：关联一建起来就挂上看门狗，handler 是谁都不影响。
+//
+// 计时看的是 PacketStream.lastActive，收发两侧都会刷新它（见 datagram.go），
+// 所以纯下载的关联不会在传输中途被误收。
+func watchUDPIdle(ps *PacketStream, idle time.Duration) {
+	tick := idle / 4
+	if tick < time.Second {
+		tick = time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for range t.C {
+		ps.mu.Lock()
+		closed := ps.closed
+		ps.mu.Unlock()
+		if closed {
+			return // 关联已经没了，看门狗跟着退
+		}
+		if time.Since(time.Unix(0, ps.lastActive.Load())) > idle {
+			ps.Close()
+			return
+		}
+	}
 }
 
 // DefaultPacketHandler 为一条 UDP 关联建一个本地 socket 并转发。
