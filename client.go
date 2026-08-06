@@ -250,15 +250,54 @@ func (c *Client) maintainQUIC(s *Session) {
 	}
 }
 
+const (
+	redundancyCheckInterval = 2 * time.Second
+	redundancyBackoffMax    = 30 * time.Second
+)
+
+// nextRedundancyDelay 给出下一次检查/补路之前要等的**基准**间隔（真正睡的时候还要过
+// jitter）。ok = 这一轮不需要补路，或者补上了。
+//
+// ★ 补不上时必须退避，而且必须抖动——这两件事这里原本一件都没有，是**固定 2 秒**。
+//
+// 两条独立的理由，各自都足够：
+//
+//  1. **它违反 spec §8.5**。那一条要求"任何周期性发送的间隔 MUST 加入随机抖动"，
+//     而补不上第二条路径时，这个循环每 2.000 秒发起一次完整的 TCP+TLS 拨号——
+//     比 §8.5 当初治的那个 PATH_PROBE 节拍器更显眼，因为每一拍都是一次新连接，
+//     链路上任何观察者都看得见。识别它连机器学习都不用，对到达间隔做个直方图就够了。
+//
+//  2. **惊群**。波动往往是整片网络的，几十上百个客户端会在同一时刻失去第二条路径，
+//     然后以完全相同的 2 秒节奏一起重拨，把刚要恢复的链路再打垮一次。
+//     这正是 AWS 那篇 Exponential Backoff And Jitter 讲的：退避降的是总量，
+//     抖动断的是同步，两者缺一不可。
+//
+// 讽刺的是这两条道理在本仓库里各写过一遍：recoverLoop 的退避注释写的就是惊群，
+// maintainQUIC 的注释写的就是"一串规律的探测本身就是个特征"。
+// 唯独 Redundancy 这条漏了——而它恰恰是文档里**专门推荐给移动网络**的那个开关，
+// 也就是最容易反复补不上第二条路径的场景。
+func nextRedundancyDelay(cur time.Duration, ok bool) time.Duration {
+	if ok {
+		return redundancyCheckInterval
+	}
+	next := cur * 2
+	if next < redundancyCheckInterval {
+		next = redundancyCheckInterval
+	}
+	if next > redundancyBackoffMax {
+		next = redundancyBackoffMax
+	}
+	return next
+}
+
 // maintainRedundancy 保证会话上始终有两条路径。
 func (c *Client) maintainRedundancy(s *Session) {
-	t := time.NewTicker(2 * time.Second)
-	defer t.Stop()
+	base := redundancyCheckInterval
 	for {
 		select {
 		case <-s.closed:
 			return
-		case <-t.C:
+		case <-time.After(jitter(base)):
 		}
 		s.mu.Lock()
 		n := 0
@@ -269,14 +308,16 @@ func (c *Client) maintainRedundancy(s *Session) {
 		}
 		s.mu.Unlock()
 		if n >= 2 {
+			base = nextRedundancyDelay(base, true)
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		p, err := c.dialPath(ctx, s, true)
 		cancel()
-		if err == nil && p != nil {
-			s.addPath(p)
-		}
+		// addPath 的返回值不能丢：会话的路径数有上界（maxPathsPerSession），
+		// 顶回来的那条已经被 markDead 关掉了，这一轮等于没补上。
+		ok := err == nil && p != nil && s.addPath(p)
+		base = nextRedundancyDelay(base, ok)
 	}
 }
 

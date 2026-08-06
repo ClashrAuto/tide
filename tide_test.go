@@ -2709,6 +2709,60 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 补不上第二条路径时，重拨不能是个节拍器
+// ---------------------------------------------------------------------------
+
+// Redundancy 打开后，maintainRedundancy 会在只剩一条路径时去补第二条。
+// 补不上的时候它原本以**固定 2.000 秒**重拨，既不退避也不抖动。
+//
+// ★ 这违反的是本规范已有的一条 MUST：§8.5 要求"任何周期性发送的间隔 MUST 加入
+// 随机抖动"。而这里每一拍都是一次完整的 TCP+TLS 拨号，比 §8.5 当初治的
+// PATH_PROBE 节拍器更显眼——链路上任何观察者都看得见一串等间隔的新连接。
+//
+// 另一半是惊群：波动往往是整片网络的，几十上百个客户端会在同一时刻失去第二条路径，
+// 然后以完全相同的节奏一起重拨。退避降总量、抖动断同步，两者缺一不可。
+//
+// 讽刺的是这两条道理在本仓库里各写过一遍（recoverLoop 的退避注释讲惊群，
+// maintainQUIC 的注释讲"一串规律的探测本身就是个特征"），唯独这条路漏了——
+// 而 Redundancy 恰恰是文档里**专门推荐给移动网络**的开关，也就是最容易反复补不上的场景。
+func TestRedundancyRetryBacksOffAndJitters(t *testing.T) {
+	// 补不上时必须退避：2 → 4 → 8 …，封顶后不再增长。
+	d := redundancyCheckInterval
+	var seq []time.Duration
+	for i := 0; i < 8; i++ {
+		d = nextRedundancyDelay(d, false)
+		seq = append(seq, d)
+	}
+	for i := 1; i < len(seq); i++ {
+		if seq[i] < seq[i-1] {
+			t.Fatalf("退避序列不单调：%v", seq)
+		}
+	}
+	if seq[0] <= redundancyCheckInterval {
+		t.Fatalf("第一次失败之后仍然是基准间隔 %v —— 没有退避，那就是个 2 秒节拍器", seq[0])
+	}
+	if got := seq[len(seq)-1]; got != redundancyBackoffMax {
+		t.Fatalf("退避封顶是 %v，期望 %v", got, redundancyBackoffMax)
+	}
+
+	// 补上了（或本来就够）之后必须立刻回到基准间隔，否则一次抖动会让冗余路径
+	// 长时间处于"死了也不补"的状态。
+	if got := nextRedundancyDelay(redundancyBackoffMax, true); got != redundancyCheckInterval {
+		t.Fatalf("成功之后没有复位：%v", got)
+	}
+
+	// 真正睡的时候要过 jitter：同一个基准间隔反复取值不能总是同一个数。
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 64; i++ {
+		seen[jitter(redundancyCheckInterval)] = true
+	}
+	if len(seen) < 8 {
+		t.Fatalf("jitter(%v) 在 64 次取样里只出现 %d 个不同值 —— 抖动没生效，"+
+			"链路上就是一串等间隔的新连接", redundancyCheckInterval, len(seen))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 单用户的会话数必须有上界
 // ---------------------------------------------------------------------------
 
