@@ -1,0 +1,5 @@
+/data/
+.env
+tide-server
+tide-selftest
+*.exe

@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt
+      - run: go vet ./...
+      # -race 是这里最重要的一道：会话层有路径读写、探测、重传、重平衡四组
+      # goroutine 并发碰同一批流状态，竞态在功能测试里表现为"偶尔卡一下"，查起来极痛苦。
+      - run: go test -race -count=1 -timeout 10m ./...
+      # 进程内跑完整链路（握手 → 0-RTT → 失败关闭 → 路径迁移 → UDP）。
+      - run: go run ./cmd/tide-selftest -mode local
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 只验证镜像能构建。不推送——推送要 registry 凭据，那是部署方的事。
+      - run: docker build -t tide:ci .
+      - run: docker run --rm tide:ci -keygen | head -2

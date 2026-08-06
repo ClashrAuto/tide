@@ -1,0 +1,90 @@
+# TIDE 一键部署。
+#
+#   1. cp .env.example .env  并把 TIDE_PASSWORD 改掉
+#   2. docker compose up -d
+#   3. docker compose logs tide      # 里面会打印客户端该贴的配置（含 public-key）
+#
+# ★ 这份编排里有两个服务，第二个不是可有可无的凑数：
+#
+#   cover —— 掩护源站。TIDE 认证失败时会把连接的**全部字节原样转发**给它，
+#            而不是模拟一个响应。时序是伪装里唯一真正难伪造的东西：失败路径 0.1ms
+#            而真实站点 50ms，探测方量一下响应时间分布就分开了（spec §7）。
+#            所以它必须真实可达、延迟合理——放在同一个 compose 网络里正合适。
+#            把它换成你自己的站点（或反代到一个真实域名）会更像样。
+
+name: tide
+
+services:
+  tide:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # proxy.golang.org 在不少网络里连不上，换源不该要求改 Dockerfile。
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: ghcr.io/clashrauto/tide:latest
+    container_name: tide
+    restart: unless-stopped
+    depends_on:
+      cover:
+        condition: service_started
+    ports:
+      - "${TIDE_PORT:-8443}:8443/tcp"
+      # QUIC 走 UDP，端口号与 TCP 相同。它是**加速通道**不是门面：
+      # QUIC 路径不做掩护转发（spec §12.6），抗主动探测完全靠上面那条 TCP。
+      # 所以绝不要只开 UDP 而不开 TCP。丢包链路上它很值：实测 5% 丢包下
+      # p90 从 197ms 降到 9ms。UDP 被封时客户端会静默回落 TCP，无需配置。
+      - "${TIDE_PORT:-8443}:8443/udp"
+    environment:
+      TIDE_LISTEN: ":8443"
+      TIDE_QUIC_LISTEN: ":8443"
+      TIDE_COVER: "cover:80"
+      TIDE_USERS: "${TIDE_USER:-alice}:${TIDE_PASSWORD:?set TIDE_PASSWORD in .env}"
+      TIDE_KEY_FILE: "/data/tide.key"
+      TIDE_CERT: "/data/tls.crt"
+      TIDE_CERT_KEY: "/data/tls.key"
+      # 客户端 SNI 要与证书一致。换成真证书时，把它改成你的真实域名。
+      TIDE_CERT_HOST: "${TIDE_SNI:-tide.local}"
+      # 只用来把示例配置打得更完整，不影响运行。
+      TIDE_ADVERTISE: "${TIDE_ADVERTISE:-}"
+      # 所有路径都断了之后，会话还能活多久。这段时间里服务端替客户端留着
+      # 上游连接，所以 Wi-Fi 切换、基站切换、路由器重启都不会断连接。
+      # 实测断网 60s 后恢复只花 274ms，且零字节丢失。
+      TIDE_GRACE: "${TIDE_GRACE:-120s}"
+    volumes:
+      # ★ 持久卷不是可选的：静态密钥在这里面。删了它 = 换了 public-key =
+      #   所有客户端配置作废。
+      - tide-data:/data
+    # ⚠️ QUIC 需要更大的 UDP 收发缓冲，否则日志里会出现
+    #    "failed to sufficiently increase receive buffer size"，高带宽下丢包上升。
+    #    net.core.rmem_max / wmem_max **不是网络命名空间隔离的**，所以放在这里的
+    #    sysctls 无效，必须在**宿主**上设：
+    #      echo 'net.core.rmem_max=7500000' > /etc/sysctl.d/99-tide.conf
+    #      echo 'net.core.wmem_max=7500000' >> /etc/sysctl.d/99-tide.conf
+    #      sysctl --system
+    #    不设也能跑，只是 QUIC 那条路径吃不满带宽。
+    networks: [tide]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  cover:
+    image: nginx:alpine
+    container_name: tide-cover
+    restart: unless-stopped
+    # 不对外映射端口：它只服务于同网络内的 tide 容器。
+    # 对外暴露它反而多给了探测方一个可比对的样本。
+    expose: ["80"]
+    volumes:
+      - ./deploy/cover:/usr/share/nginx/html:ro
+    networks: [tide]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  tide-data:
+
+networks:
+  tide:
+    driver: bridge

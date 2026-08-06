@@ -1,0 +1,15 @@
+# 仓库里一律存 LF，检出也一律 LF。
+#
+# 不是洁癖：本项目的姊妹仓库栽过一次——Windows 检出（core.autocrlf=true）的工作区是
+# CRLF，把 config 文件拷到 Linux 后，按行匹配的正则全部失配，产生了一份重复键的 YAML，
+# 核心直接拒绝加载。看起来完全像生成器的 bug，其实不是。
+# Dockerfile / entrypoint / .sh 若带 CR，容器里会报 "no such file or directory"，
+# 那个错误信息更是完全指错方向。
+* text=auto eol=lf
+
+*.go     text eol=lf
+*.md     text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.sh     text eol=lf
+Dockerfile text eol=lf

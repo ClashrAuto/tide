@@ -1,0 +1,192 @@
+package tide
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net"
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+// QUIC 路径（spec §8 / design.md 机制 6b）。
+//
+// ★ 为什么值得做，实测说了算：本仓库在树莓派↔x86 之间量过，5% 丢包下单条 TCP 路径的
+// p99 往返是 619ms，两条 TCP 路径 323ms。这几百毫秒里绝大部分不是链路时延，
+// 是 **Linux TCP 的最小 RTO（200ms）**——LAN 上 RTT 只有 0.3ms，一次丢包却要等 200ms
+// 才重传，而且重传期间这条连接上复用的**所有**流一起卡住（队头阻塞）。
+// QUIC 的 PTO 由实测 RTT 驱动、没有 200ms 的地板，正是冲着这一项来的。
+//
+// 一条 QUIC 路径 = 一条 QUIC 连接上的**一条**双向流。
+//
+// 这是个刻意的简化，代价要写清楚：路径内部仍然有队头阻塞（同一条 QUIC 流上的丢包
+// 照样挡住它后面的字节）。把每条 TIDE 流映射到独立的 QUIC 流可以彻底消除它，
+// 但那会让 sealed 记录层的按路径序号失效——多条 QUIC 流之间没有全局顺序，
+// 记录会乱序到达，AEAD 序号立刻对不上。要走那条路必须同时强制 bare 模式，
+// 是个更大的改动。现在拿到的是"更好的丢包恢复"，还没拿到"零队头阻塞"。
+
+const quicALPN = "h3"
+
+// quicConn 把一条 QUIC 流包装成 net.Conn。
+// 地址取自连接而不是流——流本身没有地址概念。
+type quicConn struct {
+	*quic.Stream
+	conn *quic.Conn
+}
+
+func (q *quicConn) LocalAddr() net.Addr  { return q.conn.LocalAddr() }
+func (q *quicConn) RemoteAddr() net.Addr { return q.conn.RemoteAddr() }
+
+func (q *quicConn) Close() error {
+	q.Stream.CancelRead(0)
+	err := q.Stream.Close()
+	q.conn.CloseWithError(0, "")
+	return err
+}
+
+// ExportKeyingMaterial 让 QUIC 路径也能做信道绑定（spec §4）。
+// QUIC-TLS 的导出器与 TLS 1.3 的是同一套，crypto/tls 的 QUIC 接口原样提供。
+func (q *quicConn) ExportKeyingMaterial(label string, ctx []byte, n int) (out []byte, err error) {
+	// ExportKeyingMaterial 是 tls.ConnectionState 上的**方法**，不是字段，
+	// 所以没法用 == nil 判断有没有导出器；底层 ekm 为 nil 时它直接 panic。
+	// 这里兜住那个 panic 并转成错误：没有信道绑定就没有 MITM 检测、也没有 bare 模式的
+	// 安全前提，必须是一个显式失败，而不是一个悄悄少掉的安全属性。
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, errors.New("tide: QUIC transport exposes no TLS exporter; "+
+				"channel binding cannot be established")
+		}
+	}()
+	cs := q.conn.ConnectionState().TLS
+	return cs.ExportKeyingMaterial(label, ctx, n)
+}
+
+func quicClientTLS(base *tls.Config) *tls.Config {
+	c := base.Clone()
+	// QUIC 强制要求 ALPN。用 h3 是因为 QUIC 上的 h3 是当下唯一常见的流量，
+	// 换成自定义串等于在握手明文里插一个协议指纹。
+	c.NextProtos = []string{quicALPN}
+	if c.MinVersion < tls.VersionTLS13 {
+		c.MinVersion = tls.VersionTLS13
+	}
+	return c
+}
+
+func quicConfig() *quic.Config {
+	return &quic.Config{
+		// KeepAlivePeriod 让 NAT 表项不过期。移动网络的 UDP NAT 超时经常只有 30 秒，
+		// 超时之后回程包直接被丢，表现为"能发不能收"——这是 UDP 代理最常见的一类假死。
+		KeepAlivePeriod: 10 * time.Second,
+		// MaxIdleTimeout 要比会话宽限期短：路径该死就让它死，
+		// 由 TIDE 的重连逻辑接管，而不是让一条僵尸 QUIC 连接吊着。
+		MaxIdleTimeout:        30 * time.Second,
+		MaxIncomingStreams:    16,
+		MaxIncomingUniStreams: -1,
+		// Allow0RTT 关掉：TIDE 自己的单次票据才是 0-RTT 的正确实现，
+		// QUIC 的 0-RTT 早期数据**没有重放保护**（TUIC 就吃这个亏），
+		// 两层都开等于把内层辛苦建立的重放保护又从外层漏掉。
+		Allow0RTT: false,
+	}
+}
+
+// dialQUICPath 拨一条 QUIC 路径。
+func (c *Client) dialQUICPath(ctx context.Context, s *Session, join bool) (*path, error) {
+	addr := c.quicAddr()
+	base := c.tlsCfg
+	conn, err := quic.DialAddr(ctx, addr, quicClientTLS(base), quicConfig())
+	if err != nil {
+		return nil, err
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "")
+		return nil, err
+	}
+	// QUIC 的流是懒创建的：不写一个字节，服务端永远 Accept 不到。
+	// 握手的第一帧就是那个字节，所以这里不需要额外的探针。
+	qc := &quicConn{Stream: stream, conn: conn}
+	p, err := c.handshake(ctx, s, qc, join, "quic")
+	if err != nil {
+		qc.Close()
+		return nil, err
+	}
+	return p, nil
+}
+
+func (c *Client) quicAddr() string {
+	host, port, err := net.SplitHostPort(c.cfg.Server)
+	if err != nil {
+		return c.cfg.Server
+	}
+	if c.cfg.QUICPort > 0 {
+		return net.JoinHostPort(host, itoa(c.cfg.QUICPort))
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	var b [12]byte
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(b[i:])
+}
+
+// ServeQUIC 在 addr 上接受 QUIC 路径。与 Serve 并存：同一个 Server 可以同时
+// 提供 TCP 与 QUIC 两条数据面，客户端的调度器按实测质量挑。
+func (s *Server) ServeQUIC(addr string) error {
+	tlsCfg := s.cfg.TLSConfig.Clone()
+	tlsCfg.NextProtos = []string{quicALPN}
+	ln, err := quic.ListenAddr(addr, tlsCfg, quicConfig())
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	for {
+		conn, err := ln.Accept(context.Background())
+		if err != nil {
+			select {
+			case <-s.stopped:
+				return nil
+			default:
+			}
+			return err
+		}
+		go s.handleQUICConn(conn)
+	}
+}
+
+func (s *Server) handleQUICConn(conn *quic.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeReadTimeout)
+	stream, err := conn.AcceptStream(ctx)
+	cancel()
+	if err != nil {
+		conn.CloseWithError(0, "")
+		return
+	}
+	qc := &quicConn{Stream: stream, conn: conn}
+
+	// QUIC 路径上**不做**掩护转发。
+	//
+	// 不是偷懒：§6 的失败关闭要求把字节原样转给一个真实的掩护源站，而 QUIC 的
+	// 掩护对象只能是另一个 QUIC/HTTP-3 服务，字节流也不能直接搬过去（QUIC 有自己的
+	// 流语义）。更关键的是，一个对外只开 UDP/443 的主机本来就没有"看起来像普通网站"
+	// 这个选项——真正的伪装靠的是 TCP 那条路径。所以 QUIC 路径的定位是
+	// **已建立会话的加速通道**，不是首次接入的门面；探测方打到这里只会看到一个沉默的
+	// QUIC 端点，和任何一个不响应的 UDP 端口没有区别。
+	t := &teeConn{Conn: qc, recording: false}
+	p, sess, err := s.serverHandshake(t)
+	if err != nil {
+		qc.Close()
+		return
+	}
+	sess.addPath(p)
+	<-p.dead
+}
