@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1170,6 +1171,52 @@ func TestH3DialDiag(t *testing.T) {
 	p.markDead()
 }
 
+// 乱序缓冲的上界必须限住**真实内存**，不是载荷字节。
+//
+// ★ 这条测试是拿实际堆占用去校准 reorderSegOverhead 的，不是走个过场：
+// 修复前 1 字节段能让 reorderN 报 512 KiB 而真实堆占用 42.5 MB（81 倍），
+// 乘上 MaxStreams=1024 就是几十 GB——对端只要把 STREAM_DATA 拆成 1 字节一段、
+// 段间留空洞永远接不上，就能在完全合法的流控之内把接收方撑爆。
+// 上界限错了量这件事编译期看不出来、功能测试也测不出来，只有量内存能看出来。
+func TestReorderBufferFootprint(t *testing.T) {
+	heap := func() uint64 {
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	// 最坏情况：段越小，固定开销占比越高。1 字节是下界。
+	for _, segLen := range []int{1, 8, 64, 1024} {
+		sess := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+		st := newStream(sess, 2, "1.2.3.4:80", DefaultStreamWindow)
+		data := make([]byte, segLen)
+		before := heap()
+		// 段间永远留一个字节的空洞，谁也接不上，全部滞留在 reorder 里。
+		for off := uint64(1); ; off += uint64(segLen) + 1 {
+			st.rmu.Lock()
+			full := uint64(st.reorderN)+uint64(reorderCost(segLen)) > st.window
+			st.rmu.Unlock()
+			if full {
+				break
+			}
+			if err := st.onData(off, data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		used := heap() - before
+		runtime.KeepAlive(st)
+
+		// 留 2 倍余量：Go 版本、GC 时机、map 装载因子都会让这个数浮动，
+		// 但 81 倍那种量级的错误一定会被抓住。
+		if limit := uint64(DefaultStreamWindow) * 2; used > limit {
+			t.Fatalf("segLen=%d: 乱序缓冲实占 %d 字节，窗口只有 %d —— "+
+				"上界限的是载荷字节而不是真实内存，对端可以用小段把它放大到 OOM",
+				segLen, used, DefaultStreamWindow)
+		}
+		t.Logf("segLen=%-5d heap=%-9d window=%d", segLen, used, DefaultStreamWindow)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 抢跑的数据报
 // ---------------------------------------------------------------------------
@@ -1237,10 +1284,28 @@ func TestEarlyDatagramBounded(t *testing.T) {
 		s.onDatagram(udpFrame(t, id, "10.0.0.1:53", big))
 	}
 	s.earlyMu.Lock()
-	bytesHeld := s.earlyBytes
+	bytesHeld, assocs := s.earlyBytes, len(s.early)
 	s.earlyMu.Unlock()
 	if bytesHeld > earlyDatagramBytes {
 		t.Fatalf("byte cap breached: %d > %d", bytesHeld, earlyDatagramBytes)
+	}
+	if assocs > earlyDatagramAssocs {
+		t.Fatalf("assoc cap breached: %d > %d", assocs, earlyDatagramAssocs)
+	}
+
+	// ★ 只限字节挡不住"小数据报 + 不同流号"：每条记录的 map 表项、slice、
+	// Datagram 结构与地址字符串合计一两百字节，且与载荷长度无关。
+	// 用 1 字节的数据报灌 20 万个流号，条数上界是唯一拦得住的东西。
+	s2 := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	for id := uint64(0); id < 200_000; id++ {
+		s2.onDatagram(udpFrame(t, id, "10.0.0.1:53", []byte{1}))
+	}
+	s2.earlyMu.Lock()
+	assocs2 := len(s2.early)
+	s2.earlyMu.Unlock()
+	if assocs2 > earlyDatagramAssocs {
+		t.Fatalf("1 字节数据报绕过了上界：暂存了 %d 个关联，上界是 %d",
+			assocs2, earlyDatagramAssocs)
 	}
 }
 

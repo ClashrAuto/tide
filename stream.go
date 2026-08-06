@@ -391,6 +391,23 @@ func (st *Stream) rewind() {
 // 接收处理
 // ---------------------------------------------------------------------------
 
+// reorderSegOverhead 是一个乱序段除了自身字节之外的固定占用：
+// map 表项 + slice 头 + 一次独立的小块堆分配。**与段长无关**。
+//
+// ★ 这个数不是估的，是量的（TestReorderBufferFootprint 每次跑都在重量）：
+// 1 / 8 / 64 / 1024 字节的段，每段实际占用减去载荷都落在 ~80 字节。
+//
+// 为什么必须把它算进窗口：窗口的意思是"这条流的乱序缓冲最多吃多少内存"。
+// 只累加载荷字节的话，这句话在段很小的时候就是假的——实测 1 字节段能让
+// reorderN 报 512 KiB 而真实堆占用 42.5 MB（**81 倍**），乘上 MaxStreams=1024
+// 就是几十 GB。对端只要把 STREAM_DATA 拆成 1 字节一段、段间留空洞永远接不上，
+// 就能在完全合法的流控之内把接收方撑爆。
+//
+// 代价可以忽略：真实的乱序段是 MTU 量级（~1400 字节），80 字节的记账开销是 5.7%。
+const reorderSegOverhead = 80
+
+func reorderCost(n int) int { return n + reorderSegOverhead }
+
 func (st *Stream) onData(off uint64, data []byte) error {
 	st.rmu.Lock()
 	defer st.rmu.Unlock()
@@ -401,7 +418,7 @@ func (st *Stream) onData(off uint64, data []byte) error {
 	}
 	if off > st.recvOff {
 		// 乱序：只可能发生在跨路径迁移的窗口期，正常路径内 TCP/QUIC 已经保序。
-		if uint64(st.reorderN)+uint64(len(data)) > st.window {
+		if uint64(st.reorderN)+uint64(reorderCost(len(data))) > st.window {
 			// 超出窗口的乱序段直接丢弃，让发送方重传。缓冲无上界是内存炸弹，
 			// 而重传的代价有界。
 			return nil
@@ -410,7 +427,7 @@ func (st *Stream) onData(off uint64, data []byte) error {
 			cp := make([]byte, len(data))
 			copy(cp, data)
 			st.reorder[off] = cp
-			st.reorderN += len(data)
+			st.reorderN += reorderCost(len(data))
 		}
 		return nil
 	}
@@ -439,7 +456,7 @@ func (st *Stream) drainReorderLocked() {
 			return
 		}
 		delete(st.reorder, st.recvOff)
-		st.reorderN -= len(seg)
+		st.reorderN -= reorderCost(len(seg))
 		st.appendLocked(seg)
 	}
 }

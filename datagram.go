@@ -225,8 +225,15 @@ const (
 	// earlyDatagramPerAssoc 是单个关联最多暂存几个。一次 DNS 查询是 1 个，
 	// 一个 QUIC Initial 突发也就几个，超过说明对端在乱发。
 	earlyDatagramPerAssoc = 8
-	// earlyDatagramBytes 是整个会话暂存区的硬上界。这是对"对端拿不存在的流号
-	// 狂发 DATAGRAM"的唯一有效防线——限条数不够，单帧可以有 56 KiB。
+	// earlyDatagramAssocs 是同时能有几个关联处于"数据报已到、STREAM_OPEN 未到"。
+	// ★ 光有字节上界不够：每条暂存记录除了载荷还有 map 表项、slice、
+	//   Datagram 结构与地址字符串，合计一两百字节且**与载荷长度无关**。
+	//   只限字节的话，对端拿 1 字节的数据报配上不同的流号，就能用 256 KiB 的
+	//   记账额度换到几十 MB 的真实占用——和 stream.go 里 reorderSegOverhead
+	//   记的是同一类错误：上界限的量不是真正涨的那个量。
+	earlyDatagramAssocs = 64
+	// earlyDatagramBytes 是整个会话暂存区的字节上界。限条数不够，单帧可以有 56 KiB，
+	// 所以两个上界缺一不可。
 	earlyDatagramBytes = 256 << 10
 )
 
@@ -248,6 +255,9 @@ func (s *Session) holdEarlyDatagram(d *Datagram) {
 	}
 	e := s.early[d.Assoc]
 	if e == nil {
+		if len(s.early) >= earlyDatagramAssocs {
+			return // 待建关联太多：丢，不扩容
+		}
 		if s.early == nil {
 			s.early = make(map[uint64]*earlyDatagrams)
 		}
