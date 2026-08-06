@@ -26,6 +26,7 @@ const (
 	PhaseDecision PaddingPhase = iota // 判决窗口：每帧填到采样目标长度
 	PhaseDecay                        // 衰减：填充概率线性降到 0
 	PhaseBulk                         // 批量：不填充
+	PhaseOff                          // 填充被关闭（bare 模式：用户态不碰载荷）
 )
 
 func (p PaddingPhase) String() string {
@@ -34,6 +35,8 @@ func (p PaddingPhase) String() string {
 		return "decision"
 	case PhaseDecay:
 		return "decay"
+	case PhaseOff:
+		return "off"
 	}
 	return "bulk"
 }
@@ -114,6 +117,9 @@ func (p *paddingScheduler) phase() PaddingPhase {
 func (p *paddingScheduler) Phase() PaddingPhase {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.disabled {
+		return PhaseOff
+	}
 	return p.phase()
 }
 

@@ -81,6 +81,7 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
+		setCongestion(c, s.cfg.congestion())
 		go s.handleConn(c)
 	}
 }
@@ -420,6 +421,18 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		// 比在这里失败关闭要好，因为这不是攻击，是正常的超时。
 	}
 
+	// ★ QUIC 路径**只能加入已有会话，不能新建会话**（spec §12.6）。
+	//
+	// QUIC 面是加速通道，不是门面：它不做 §7 的掩护转发（掩护对象只能是另一个
+	// QUIC/HTTP-3 服务，而字节流也不能直接搬过去——QUIC 有自己的流语义）。
+	// 既然它没有伪装，就不该让它成为一个可以独立进入的入口。
+	//
+	// 强制"必须先有会话"之后，探测方无论怎么打这个 UDP 端口都拿不到任何东西：
+	// 它没有会话 ID，而会话 ID 只能通过 TCP 那条**有掩护**的路径认证后取得。
+	// 这把"QUIC 是加速通道"从一句部署建议变成了协议强制的性质。
+	if isQUICConn(t.Conn) && !joining {
+		return nil, nil, ErrProtocol
+	}
 	sid := wantSession
 	if !joining {
 		var err error
@@ -444,7 +457,7 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		sessionID: sid, pathID: pathID,
 		ticketBase: base, ticketCount: count, ticketSeed: seed,
 	}
-	if bare {
+	if bare || isQUICConn(t.Conn) {
 		am.mode |= acceptModeBare
 	}
 	if useAES {
@@ -507,12 +520,21 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		return nil, nil, err
 	}
 	kind := "tcp"
-	if _, ok := t.Conn.(*quicConn); ok {
+	qc, isQUIC := t.Conn.(*quicConn)
+	if isQUIC {
 		kind = "quic"
 	}
-	p, err := newPath(sess, pathID, kind, t.Conn, sealKey, openKey, sess.useAES, sess.bare)
+	// bare 是**每路径**的属性。QUIC 路径无条件 bare，且不受 AllowBare 开关约束——
+	// 那个开关防的是"外层可能没有 AEAD"的情况（裸 TCP + 混淆），而 QUIC-TLS
+	// **恒定**提供 AEAD，加上信道绑定已经证明外层没被中间人替换，
+	// spec §6.2 允许 bare 的两个前提天然满足。分流本身也要求 bare（见 quicmux.go）。
+	pathBare := bare || isQUIC
+	p, err := newPath(sess, pathID, kind, t.Conn, sealKey, openKey, sess.useAES, pathBare)
 	if err != nil {
 		return nil, nil, err
+	}
+	if isQUIC {
+		p.qmux = newQUICMux(qc.conn, false, p)
 	}
 	return p, sess, nil
 }

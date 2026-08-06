@@ -178,7 +178,9 @@ func (s *Session) pickPathLocked(st *Stream) *path {
 	if st != nil {
 		if id := st.pathID.Load(); id != 0 {
 			for _, p := range s.paths {
-				if p.id == id && p.usable() {
+				// holdable 而不是 usable：一次探测抖动不该把一条正在传输的流
+				// 从好路径上赶到差路径上，见 path.holdable 的说明。
+				if p.id == id && p.holdable() {
 					return p
 				}
 			}
@@ -292,6 +294,9 @@ func (s *Session) rebalanceLoop() {
 // 拥塞窗口都要重新长起来。2 倍的门槛保证只有真正显著的差距才会触发。
 const migrateAdvantage = 2.0
 
+// migrateDecisive：差距大到这个倍数就不必等滞回票数了。
+const migrateDecisive = 5.0
+
 // migrateVotesNeeded：连续几次观测都支持迁移才动手，防止被一次抖动骗到。
 const migrateVotesNeeded = 2
 
@@ -330,7 +335,13 @@ func (s *Session) rebalance() {
 			continue
 		}
 		st.migrateVotes++
-		if st.migrateVotes >= migrateVotesNeeded {
+		// 差距悬殊（5 倍以上）时一票就够。滞回是为了防抖动，
+		// 而 5 倍的差距不可能是抖动——多等一轮只是让瞬态里更多字节走在差路径上。
+		need := migrateVotesNeeded
+		if bestScore*migrateDecisive < curScore {
+			need = 1
+		}
+		if st.migrateVotes >= need {
 			st.migrateVotes = 0
 			st.pathID.Store(best.id)
 			moved = append(moved, st)
@@ -589,9 +600,18 @@ func (s *Session) removeStream(id uint64) {
 	s.mu.Lock()
 	_, ok := s.streams[id]
 	delete(s.streams, id)
+	paths := append([]*path(nil), s.paths...)
 	s.mu.Unlock()
 	if ok {
 		s.streamCount.Add(-1)
+	}
+	// 顺手关掉这条流占的 QUIC 流。不关就是纯泄漏——quic-go 的流上限
+	// （MaxIncomingStreams）用满之后，新流会阻塞在 OpenStream 上，
+	// 表现为"跑一段时间后新连接全部卡住"，而且看不出跟流没回收有关系。
+	for _, p := range paths {
+		if p.qmux != nil {
+			p.qmux.closeStream(id)
+		}
 	}
 }
 

@@ -18,13 +18,9 @@ import (
 // 才重传，而且重传期间这条连接上复用的**所有**流一起卡住（队头阻塞）。
 // QUIC 的 PTO 由实测 RTT 驱动、没有 200ms 的地板，正是冲着这一项来的。
 //
-// 一条 QUIC 路径 = 一条 QUIC 连接上的**一条**双向流。
-//
-// 这是个刻意的简化，代价要写清楚：路径内部仍然有队头阻塞（同一条 QUIC 流上的丢包
-// 照样挡住它后面的字节）。把每条 TIDE 流映射到独立的 QUIC 流可以彻底消除它，
-// 但那会让 sealed 记录层的按路径序号失效——多条 QUIC 流之间没有全局顺序，
-// 记录会乱序到达，AEAD 序号立刻对不上。要走那条路必须同时强制 bare 模式，
-// 是个更大的改动。现在拿到的是"更好的丢包恢复"，还没拿到"零队头阻塞"。
+// 一条 QUIC 路径上，**每条 TIDE 流有自己的 QUIC 流**（见 quicmux.go），
+// 控制帧（握手、探测、票据）留在第一条流上。这样一条流的丢包不会卡住其它流——
+// 早先的单流版本在 5% 丢包下 p99 比裸 TCP 还差，原因就是把 4 条流全塞进了一条。
 
 const quicALPN = "h3"
 
@@ -80,9 +76,13 @@ func quicConfig() *quic.Config {
 		KeepAlivePeriod: 10 * time.Second,
 		// MaxIdleTimeout 要比会话宽限期短：路径该死就让它死，
 		// 由 TIDE 的重连逻辑接管，而不是让一条僵尸 QUIC 连接吊着。
-		MaxIdleTimeout:        30 * time.Second,
-		MaxIncomingStreams:    16,
+		MaxIdleTimeout: 30 * time.Second,
+		// 分流之后每条 TIDE 流吃一条 QUIC 流，上限必须跟得上会话的并发流数，
+		// 否则超出的流会阻塞在 OpenStream 上——现象是"并发一高就有连接卡死"。
+		MaxIncomingStreams:    int64(DefaultMaxStreams) + 16,
 		MaxIncomingUniStreams: -1,
+		// UDP 关联要走 RFC 9221 的数据报（spec §12.8），两端都必须通告支持。
+		EnableDatagrams: true,
 		// Allow0RTT 关掉：TIDE 自己的单次票据才是 0-RTT 的正确实现，
 		// QUIC 的 0-RTT 早期数据**没有重放保护**（TUIC 就吃这个亏），
 		// 两层都开等于把内层辛苦建立的重放保护又从外层漏掉。
@@ -184,9 +184,29 @@ func (s *Server) handleQUICConn(conn *quic.Conn) {
 	t := &teeConn{Conn: qc, recording: false}
 	p, sess, err := s.serverHandshake(t)
 	if err != nil {
-		qc.Close()
+		// 认证失败：**不要立刻关**。立刻关是一个可测量的、与"真实 QUIC 服务在等
+		// 后续请求"截然不同的行为，等于给探测方一个免费的判据。
+		// 这里读到对端自己放弃为止，与 §7.2「掩护源站不可达时」的处理一致。
+		// 注意这仍然弱于 TCP 那条路径的真实转发——QUIC 面没有掩护源站，
+		// 见 spec §12.6 对这个残留差距的说明。
+		go func() {
+			buf := make([]byte, 4096)
+			qc.SetReadDeadline(time.Now().Add(30 * time.Second))
+			for {
+				if _, err := qc.Read(buf); err != nil {
+					break
+				}
+			}
+			qc.Close()
+		}()
 		return
 	}
 	sess.addPath(p)
 	<-p.dead
+}
+
+// isQUICConn 判断一条传输是不是 QUIC。
+func isQUICConn(c interface{}) bool {
+	_, ok := c.(*quicConn)
+	return ok
 }

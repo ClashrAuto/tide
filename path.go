@@ -2,6 +2,7 @@ package tide
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 	"net"
@@ -82,6 +83,10 @@ type path struct {
 	txBytes atomic.Uint64
 	rxBytes atomic.Uint64
 
+	// qmux 非空 = QUIC 多流模式：每条 TIDE 流一条独立的 QUIC 流（见 quicmux.go）。
+	// 单流模式下为 nil，所有帧走 conn 那一条字节流。
+	qmux *quicMux
+
 	dead     chan struct{}
 	deadOnce sync.Once
 }
@@ -123,10 +128,22 @@ func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey
 
 func (p *path) State() pathState { return pathState(p.state.Load()) }
 
+// usable 表示"新流可以选它"。suspect 不在其列（spec §8.2）。
 func (p *path) usable() bool {
 	s := p.State()
 	return s == pathActive || s == pathDegraded
 }
+
+// holdable 表示"已经钉在它上面的流可以继续留着"。
+//
+// ★ 这两个判据必须分开，spec §8.2 写的就是 suspect = "**新流**不再选它"。
+// 早先只有 usable() 一个判据，suspect 会把已有的流也一起赶走——而赶到哪去？
+// 赶到当时唯一还 active 的那条路径上，哪怕它慢 8 倍。
+// 5% 丢包下探测本身也会丢，连丢 2 个就进 suspect，于是这事**反复发生**：
+// 实测 90 秒里有 24.3 MiB（14%）被赶回 RTT 高一个数量级的 TCP 路径，
+// 而且是稳态泄漏、不是启动瞬态——把测试时长从 25s 拉到 90s，这个量成比例增长。
+// 判死（连丢 4 个探测或静默 8 秒）仍然会撤离所有流，所以留在 suspect 上的代价有上界。
+func (p *path) holdable() bool { return p.State() != pathDead }
 
 // RTT 返回平滑后的往返时延（自检/调度用）。
 func (p *path) RTT() time.Duration {
@@ -151,6 +168,19 @@ func (p *path) Loss() float64 {
 func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []byte) error {
 	if len(payload) > MaxFrameBody {
 		return ErrFrameTooLarge
+	}
+	// 属于某条 TIDE 流的帧走它自己的 QUIC 流，避免一条流的丢包卡住其它流。
+	if p.qmux != nil && streamID != 0 && muxable(t) {
+		return p.qmux.write(t, flags, streamID, payload)
+	}
+	// UDP 走 RFC 9221 的 QUIC 数据报：不重传、不保序，才是 UDP 该有的语义。
+	// 太大装不下时下面会回退到控制流（可靠），见 quicMux.sendDatagram。
+	if p.qmux != nil && t == FrameDatagram {
+		if err := p.qmux.sendDatagram(flags, streamID, payload); err == nil {
+			return nil
+		} else if !errors.Is(err, errDatagramTooLarge) {
+			return err
+		}
 	}
 	pad := p.pad.padFor(streamID, len(payload))
 
@@ -218,8 +248,7 @@ func (p *path) readLoop() {
 		if err != nil {
 			return
 		}
-		p.lastRecv.Store(time.Now().UnixNano())
-		p.rxBytes.Add(uint64(len(f.Payload)))
+		p.noteRecv(len(f.Payload))
 		if err := p.sess.handleFrame(p, f); err != nil {
 			return
 		}
@@ -231,6 +260,12 @@ func (p *path) readLoop() {
 // ---------------------------------------------------------------------------
 
 func (p *path) probeLoop(interval, idleInterval time.Duration) {
+	// ★ 立刻探一次，不要先等一个周期。
+	// score() 在没有 RTT 样本时返回中性值 50（毫秒当量），而一条正常的 TCP 路径
+	// 只有 3 左右——于是新建的 QUIC 路径在拿到第一个样本之前**看起来比 TCP 差**，
+	// 调度器不会往它上面迁。实测这段窗口让每次会话开头有几秒钟的流量白白走在
+	// 慢一个数量级的路径上（单流 40 秒的测试里是 8.1MiB / 10%）。
+	p.sendProbe()
 	t := time.NewTimer(interval)
 	defer t.Stop()
 	for {
@@ -398,6 +433,17 @@ func (p *path) setState(s pathState) {
 	}
 }
 
+// noteRecv 记一次收到数据。
+//
+// ★ QUIC 多流模式下这条**必须**被每条数据流调用：静默计时器（checkSilence）
+// 是路径死亡的第二个判据，它只看"多久没收到字节"。分流之后控制流上可能长时间
+// 只有稀疏的探测，真正的数据全在别的 QUIC 流上——不在那里打点，
+// 一条正在满速传输的路径会被静默计时器判死。
+func (p *path) noteRecv(n int) {
+	p.lastRecv.Store(time.Now().UnixNano())
+	p.rxBytes.Add(uint64(n))
+}
+
 func (p *path) markDead() {
 	p.deadOnce.Do(func() {
 		p.state.Store(uint32(pathDead))
@@ -406,6 +452,9 @@ func (p *path) markDead() {
 		p.wclosed = true
 		p.wcond.Broadcast()
 		p.wmu.Unlock()
+		if p.qmux != nil {
+			p.qmux.close()
+		}
 		p.conn.Close()
 		p.sess.onPathDead(p)
 	})

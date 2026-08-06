@@ -168,12 +168,21 @@ func (c *Client) maintainQUIC(s *Session) {
 		quicIdleCheck  = 2 * time.Second
 		quicBackoffMax = 30 * time.Second
 	)
-	backoff := quicIdleCheck
+	// 首次**不等待**：QUIC 越早可用，启动瞬态里被迫走 TCP 的字节越少。
+	backoff := time.Duration(0)
 	for {
-		select {
-		case <-s.closed:
-			return
-		case <-time.After(backoff):
+		if backoff > 0 {
+			select {
+			case <-s.closed:
+				return
+			case <-time.After(backoff):
+			}
+		} else {
+			select {
+			case <-s.closed:
+				return
+			default:
+			}
 		}
 		s.mu.Lock()
 		hasQUIC, hasAny := false, false
@@ -285,9 +294,15 @@ func (c *Client) dialPath(ctx context.Context, s *Session, join bool) (*path, er
 
 func (c *Client) dialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	if c.cfg.Dial != nil {
-		return c.cfg.Dial(ctx, "tcp", addr)
+		// 注入的 dialer（clash 侧）自己管 socket 选项；连上之后再补设一次。
+		conn, err := c.cfg.Dial(ctx, "tcp", addr)
+		if err == nil {
+			setCongestion(conn, c.cfg.congestion())
+		}
+		return conn, err
 	}
-	var d net.Dialer
+	// 在 Control 里设：连接建立**之前**就生效，慢启动的头几个 RTT 也用上新算法。
+	d := net.Dialer{Control: controlCongestion(c.cfg.congestion())}
 	return d.DialContext(ctx, "tcp", addr)
 }
 
@@ -495,7 +510,19 @@ func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID ui
 	if err != nil {
 		return nil, err
 	}
-	return newPath(s, usePath, kind, conn, sealKey, openKey, s.useAES, s.bare)
+	// ★ bare 是**每路径**的属性，不是每会话的。同一个会话可以同时挂着一条 sealed 的
+	// TCP 路径和一条 bare 的 QUIC 路径——QUIC 多流分流强制 bare（见 quicmux.go）。
+	// 早先这里读的是 s.bare（会话级），那会让 QUIC 路径按 TCP 那条的模式建记录层，
+	// 两端立刻对不上，且错误长得像"解密失败"，查起来会指向密钥调度。
+	pathBare := am.mode&acceptModeBare != 0
+	p, err := newPath(s, usePath, kind, conn, sealKey, openKey, s.useAES, pathBare)
+	if err != nil {
+		return nil, err
+	}
+	if qc, ok := conn.(*quicConn); ok && pathBare {
+		p.qmux = newQUICMux(qc.conn, true, p)
+	}
+	return p, nil
 }
 
 // acceptNonce 与握手 seal 的全零 nonce 区分开——同一把 k_hs 下用了两次同一个 nonce

@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -758,3 +759,219 @@ func (nopConn) RemoteAddr() net.Addr               { return streamAddr("nop") }
 func (nopConn) SetDeadline(t time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(t time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ---------------------------------------------------------------------------
+// 拥塞控制与 QUIC 数据报
+// ---------------------------------------------------------------------------
+
+// setCongestion 必须**静默**容忍内核里没有该算法的情况。
+// 它只是优化，绝不能因为设不上就让连接建不起来——而 "bbr" 在很多发行版上
+// 默认没编进去，这是常态而不是异常。
+func TestCongestionSetIsBestEffort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			setCongestion(c, "definitely-not-a-real-algo")
+			c.Close()
+		}
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	setCongestion(c, "definitely-not-a-real-algo")
+	// 连接必须仍然可用。
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("connection broken after a failed congestion setting: %v", err)
+	}
+}
+
+// UDP 关联在开了 QUIC 路径的会话上也必须能通。
+//
+// ★ 这条专门守 spec §12.8 的回归：DATAGRAM 改走 RFC 9221 的 QUIC 数据报之后，
+// 编解码路径与普通帧完全不同（没有流、自带完整帧头、超限要回退到控制流）。
+// 走错任何一步的现象都是"UDP 静默不通"，而 TCP 一切正常——
+// 这种半瘫状态最容易在自检全绿的情况下溜过去。
+func TestUDPOverQUICPath(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		// ★ 不能改 Server：那是 TCP 路径的目标。QUIC 端口单独给，
+		// 否则客户端会拿 TCP 去连一个只监听 UDP 的端口。
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 等 QUIC 路径接上
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		hasQUIC := false
+		for _, p := range sess.Paths() {
+			if p.Kind == "quic" {
+				hasQUIC = true
+			}
+		}
+		if hasQUIC {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	ps, err := h.client.DialPacket(ctx, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+	payload := bytes.Repeat([]byte("q"), 600)
+	ps.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for i := 0; i < 8; i++ {
+		if _, err := ps.WriteTo(payload, pc.LocalAddr().String()); err != nil {
+			t.Fatal(err)
+		}
+		if d, err := ps.ReadFrom(); err == nil && bytes.Equal(d.Data, payload) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("no datagram round-tripped over the QUIC path")
+}
+
+// 超过单个 QUIC 数据报上限的载荷必须**回退到控制流**，而不是静默丢弃。
+// 真实世界里超 MTU 的 UDP 会被 IP 分片而不是消失；静默丢会让大 DNS 响应之类
+// 无声失败，排查时完全看不出跟大小有关。
+func TestOversizeDatagramFallsBack(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ps, err := h.client.DialPacket(ctx, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+
+	// 8 KiB 远超任何 QUIC 数据报能装下的量，必须走回退路径。
+	payload := bytes.Repeat([]byte("L"), 8*1024)
+	ps.SetReadDeadline(time.Now().Add(15 * time.Second))
+	for i := 0; i < 8; i++ {
+		if _, err := ps.WriteTo(payload, pc.LocalAddr().String()); err != nil {
+			t.Fatal(err)
+		}
+		if d, err := ps.ReadFrom(); err == nil && bytes.Equal(d.Data, payload) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("oversize datagram was dropped instead of falling back to the control stream")
+}
+
+// freeUDPPort 抢一个空闲 UDP 端口号（立刻释放，供随后的 QUIC 监听使用）。
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	return pc.LocalAddr().(*net.UDPAddr).Port
+}
+
+func serveQUICOn(t *testing.T, h *harness, port int) {
+	t.Helper()
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	go func() { _ = h.srv.ServeQUIC(addr) }()
+	time.Sleep(300 * time.Millisecond)
+}
+
+// QUIC 路径不能凭空建会话——它没有掩护，不该是一个可独立进入的入口（spec §12.6）。
+//
+// 这条守的是安全属性，不是功能：去掉那个检查，功能测试全部照常通过，
+// 只是 UDP 端口悄悄变成了一个不设防的入口。所以必须有一条测试专门盯着它。
+func TestQUICCannotCreateSession(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	// 一个全新的客户端，从来没有通过 TCP 建立过会话。
+	fresh, err := NewClient(&ClientConfig{
+		Server:     h.client.cfg.Server,
+		PublicKey:  h.client.cfg.PublicKey,
+		TLSConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: "tide.test"},
+		EnableQUIC: true,
+		QUICPort:   port,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+
+	sess := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+	sess.wallet = fresh.wallet
+	// 4 秒足够证明"没成功"。不用更长是因为服务端现在**故意不关**这条连接
+	// （关得太干脆本身就是给探测方的判据），客户端只能等到自己的 deadline——
+	// 也就是说这个 ctx 时限就是本用例的耗时下界。
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	// join=false 且 session_id 为全零：服务端必须拒绝。
+	if p, err := fresh.dialQUICPath(ctx, sess, false); err == nil {
+		p.markDead()
+		t.Fatal("a QUIC connection created a brand-new session — the UDP port is an " +
+			"unprotected entry point, since QUIC does no cover forwarding")
+	}
+}

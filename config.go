@@ -90,6 +90,26 @@ type ClientConfig struct {
 
 	// Dial 允许注入自定义拨号（clash 侧用来走 dialer 的接口绑定/DNS）。
 	Dial DialFunc
+
+	// Congestion 指定 TCP 路径的拥塞控制算法（Linux 专有，如 "bbr"、"cubic"）。
+	// 空 = **不动系统默认**。填 "-" 同义。
+	//
+	// ⚠️ 别想当然地填 "bbr"：实测双向 5% 丢包下它把 p99 从 125ms 抬到 620ms
+	//    （详见 congestion_linux.go）。Linux 的 `bbr` 是 v1，对随机丢包的处理
+	//    正是它的弱点；design.md 里说的 BBRv3 内核里并没有。
+	// ⚠️ 只作用于 TCP 路径：quic-go v0.61 内置只有 cubic 且不暴露选择接口。
+	Congestion string
+}
+
+// congestion 返回该配置最终要用的算法名。
+func (c *ClientConfig) congestion() string {
+	if c.Congestion == "-" {
+		return ""
+	}
+	if c.Congestion != "" {
+		return c.Congestion
+	}
+	return defaultCongestion
 }
 
 // DialFunc 与 net.Dialer.DialContext 同形。
@@ -159,6 +179,19 @@ type ServerConfig struct {
 	StreamWindow uint64
 	// MaxStreams 单会话并发流上限。
 	MaxStreams int
+
+	// Congestion 同 ClientConfig.Congestion。
+	Congestion string
+}
+
+func (c *ServerConfig) congestion() string {
+	if c.Congestion == "-" {
+		return ""
+	}
+	if c.Congestion != "" {
+		return c.Congestion
+	}
+	return defaultCongestion
 }
 
 func (c *ServerConfig) validate() error {
