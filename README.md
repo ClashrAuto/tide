@@ -32,7 +32,11 @@ tide/
 ├── docs/
 │   ├── design.md           # 设计动机与取舍论证（先读这个）
 │   └── spec.md             # 线格式规范（规范性文本，draft-02）
+├── cmd/tide-server/        # 生产服务端（真代理）
 ├── cmd/tide-selftest/      # 自检 + 实网波动压测工具
+├── deploy/verify.sh        # 一条命令跑完整套验证（CI 也只是调它）
+├── deploy/e2e-smoke.sh     # 跨进程端到端冒烟：真的两个二进制
+├── deploy/cover/           # 掩护源站的占位内容（**部署前必须换掉**）
 ├── varint.go frame.go record.go        # 线格式
 ├── crypto.go handshake.go ticket.go    # 混合后量子握手 + 单次票据
 ├── session.go stream.go path.go        # 会话层：复用、可靠性、调度
@@ -84,6 +88,20 @@ docker compose logs tide  # 这里会打印客户端该贴的完整配置（含 
   ```
 
 - `proxy.golang.org` 连不上的网络里，`.env` 里把 `GOPROXY` 换成 `https://goproxy.cn,direct`。
+
+## 验证
+
+```bash
+# 一条命令跑完整套验证。默认验的是**暂存区**（这次提交会包含的内容），
+# 不是工作区——工作区能跑通不代表仓库里的代码能跑通，这个项目在这上面栽过两次。
+bash deploy/verify.sh
+
+bash deploy/verify.sh --head   # 验 HEAD：别人克隆下来会拿到的内容
+bash deploy/verify.sh --here   # 就地验当前目录（CI 用这个）
+```
+
+它跑的就是 CI 跑的那几步（gofmt / vet / `-race` / 不带 `-race` / 进程内自检 /
+跨进程端到端冒烟），CI 也只是调用这个脚本——两边不会各自漂移。
 
 ## 不用 Docker 跑
 
