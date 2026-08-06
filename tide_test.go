@@ -1847,6 +1847,86 @@ func TestFullSessionDoesNotSpinDialingQUIC(t *testing.T) {
 	t.Logf("会话挂满 16 秒，被顶回来的拨号次数 = %d", rejected)
 }
 
+// 一次**成功**的握手，不得往掩护源站发任何字节。
+//
+// ★ 掩护源站只在认证失败时才该被碰到（§7）——Xray/Trojan 的 fallback 也是这条线。
+// 合法会话往那边漏字节有三重代价：掩护源站为每次正常连接记一条畸形请求日志（噪音）；
+// 谁能看到那份日志就能数出 TIDE 的握手次数（相关性信号）；
+// 掩护源站若是第三方站点，等于替用户往别人服务器上发垃圾。
+//
+// 这条测试是为了守住第 8 轮那个"提前把请求推给掩护源站"的改动**不要再回来**：
+// 它当初是想让掩护源站的处理与本端密码学运算并行，实测一无所得
+// （响应在确认握手失败之前本来就不能回给客户端），代价却是上面这三条。
+func TestSuccessfulHandshakeSendsNothingToCover(t *testing.T) {
+	cover, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cover.Close()
+	var got atomic.Int64
+	go func() {
+		for {
+			c, err := cover.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if n > 0 {
+						got.Add(int64(n))
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		sc.CoverAddr = cover.Addr().String()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 几次完整的、成功的握手 + 一点真实流量。
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		p, err := h.client.dialPath(ctx, sess, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess.addPath(p)
+	}
+	c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msg := bytes.Repeat([]byte("z"), 4096)
+	if _, err := c.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(msg))
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	if n := got.Load(); n != 0 {
+		t.Fatalf("合法握手往掩护源站漏了 %d 字节 —— 掩护源站只在认证失败时才该被碰到。"+
+			"漏过去的是加密后的握手帧，对端读不懂，但它给掩护源站的日志留下了"+
+			"一条一一对应的记录：数那份日志就能数出 TIDE 的握手次数", n)
+	}
+}
+
 // UDP 关联在开了 QUIC 路径的会话上也必须能通。
 //
 // ★ 这条专门守 spec §12.8 的回归：DATAGRAM 改走 RFC 9221 的 QUIC 数据报之后，
