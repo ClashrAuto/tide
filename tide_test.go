@@ -885,6 +885,99 @@ func TestCongestionSetIsBestEffort(t *testing.T) {
 	}
 }
 
+// 多路径爬坡（TCP 起来之后再加一条 QUIC）**不得**触发全量重发。
+//
+// ★ addPath 曾经无条件 rewindAll()，把每条流的待发指针退回最后确认点。
+// 数据明明还在一条健康的路径上飞，接收方又按绝对偏移去重，于是重发的字节纯属浪费；
+// 更糟的是加路径这件事由对端驱动——任何一次 join 都能触发一次全量重发，
+// 最坏是 maxStreams × window ≈ 512 MB 的出向流量外加每条流一个 pump 协程。
+// 多路径 QUIC 的原则也是一样的：确认丢失或路径判死之前不重传，就是为了躲开虚假重传。
+func TestAddingHealthyPathDoesNotResendEverything(t *testing.T) {
+	port := freeUDPPort(t)
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.EnableQUIC = true
+		cc.QUICPort = port
+		cc.ProbeInterval = 200 * time.Millisecond
+	})
+	serveQUICOn(t, h, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := h.client.Session(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先在 TCP 路径上把几条流跑起来，确保有已发送的数据。
+	payload := bytes.Repeat([]byte("x"), 8192)
+	var conns []net.Conn
+	for i := 0; i < 4; i++ {
+		c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	// 等这批数据真的走完，免得把"还没发完"误判成"被重发了"。
+	buf := make([]byte, len(payload))
+	for _, c := range conns {
+		c.SetReadDeadline(time.Now().Add(20 * time.Second))
+		if _, err := io.ReadFull(c, buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := sess.StreamResumes()
+	// 等 QUIC 路径加进来。
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(sess.pathsSnapshot()) >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := len(sess.pathsSnapshot()); n < 2 {
+		t.Skipf("QUIC path never came up (%d paths); nothing to assert", n)
+	}
+	time.Sleep(300 * time.Millisecond) // 让 addPath 的后续动作跑完
+
+	if grew := sess.StreamResumes() - before; grew > 0 {
+		t.Fatalf("加一条健康路径触发了 %d 次全量退回重发 —— 数据还在一条好路径上飞，"+
+			"这些字节是白发的；而且加路径由对端驱动，反复 join 就能把出口打满", grew)
+	}
+}
+
+// 一条会话能挂的路径数必须有上界：加路径由对端驱动，每条路径要付 3 个协程
+// 加一个 32 KiB 的解帧缓冲，还会让 pickPath 的每次发送变成 O(路径数)。
+func TestPathsPerSessionBounded(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+	accepted := 0
+	for i := 0; i < maxPathsPerSession*4; i++ {
+		p := &path{
+			id: uint32(i + 1), kind: "tcp", sess: s, conn: &nopConn{},
+			pad: newPaddingScheduler(), pending: make(map[uint64]time.Time),
+			created: time.Now(), dead: make(chan struct{}),
+		}
+		p.wcond = sync.NewCond(&p.wmu)
+		p.lastRecv.Store(time.Now().UnixNano())
+		p.peek = newPeekReader(p.conn, 48)
+		p.fr = newFrameReader(p.peek)
+		if s.addPath(p) {
+			accepted++
+		}
+	}
+	if accepted > maxPathsPerSession {
+		t.Fatalf("接纳了 %d 条路径，上界是 %d", accepted, maxPathsPerSession)
+	}
+	if n := len(s.pathsSnapshot()); n > maxPathsPerSession {
+		t.Fatalf("会话上挂了 %d 条路径，上界是 %d", n, maxPathsPerSession)
+	}
+}
+
 // UDP 关联在开了 QUIC 路径的会话上也必须能通。
 //
 // ★ 这条专门守 spec §12.8 的回归：DATAGRAM 改走 RFC 9221 的 QUIC 数据报之后，

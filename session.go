@@ -58,6 +58,10 @@ type Session struct {
 	// pathsAdded 是累计接入过多少条路径。测试靠它确认"恢复机制真的被触发了"——
 	// 环回网络上重连快到看不见，一个只测了 happy path 的稳定性测试比没有更糟。
 	pathsAdded atomic.Uint64
+	// resumes 是累计有多少次"把一条流退回最后确认点重发"。
+	// 每一次都意味着一段已经发过的字节要再上一次线，所以它是虚假重传的直接度量：
+	// 正常爬坡（TCP 起来后再加 QUIC）**不该**让它涨，涨了就是在白烧带宽。
+	resumes atomic.Uint64
 	// deadLog 留着最近几条路径的死因。路径死了就从 paths 里摘掉，
 	// 死因也跟着消失——而"反复建起来又死"恰恰只能靠死因序列来查。
 	deadLog deathLog
@@ -124,9 +128,24 @@ func (s *Session) Done() <-chan struct{} { return s.closed }
 // 路径集合
 // ---------------------------------------------------------------------------
 
-func (s *Session) addPath(p *path) {
+// maxPathsPerSession 是一条会话最多能挂几条路径。
+//
+// 正常形态是 2 条（TCP + QUIC/h3），多网口部署每个上行各一条，8 是宽裕的余量。
+// 上界必须存在，因为**加路径这件事由对端驱动**：任何拿着有效 session_id 的对端
+// 都可以不断握手加入同一条会话，而每条路径要付 3 个协程（读/写/探测）
+// 加一个 32 KiB 的解帧缓冲，还会让 pickPath 的每次发送变成 O(路径数)。
+const maxPathsPerSession = 8
+
+// addPath 把一条新路径挂进会话。返回 false 表示已达上限、这条路径没有被接纳。
+func (s *Session) addPath(p *path) bool {
 	s.mu.Lock()
+	if len(s.paths) >= maxPathsPerSession {
+		s.mu.Unlock()
+		p.markDeadReason("too many paths on this session")
+		return false
+	}
 	s.paths = append(s.paths, p)
+	first := len(s.paths) == 1
 	s.mu.Unlock()
 	s.noPathSince.Store(0)
 	s.pathsAdded.Add(1)
@@ -135,13 +154,30 @@ func (s *Session) addPath(p *path) {
 	go p.writeLoop()
 	go p.probeLoop(s.probeIvl, DefaultIdleProbeInterval)
 
-	// 新路径到位：把所有流的待发指针退回最后确认点，未确认的字节在新路径上重来一遍。
-	// 接收方按绝对偏移去重，所以重发是幂等的。
-	s.rewindAll()
+	// ★ 只有"会话此刻一条路径都没有"才需要全量退回重发。
+	//
+	// 这里曾经是无条件 rewindAll()，那是错的，而且错得很贵：
+	//  · 正常多路径爬坡（TCP 起来后再加 QUIC）会把**所有流**已发未确认的字节
+	//    全部重发一遍——数据明明还在一条健康的路径上飞，接收方按绝对偏移去重，
+	//    于是这些字节纯属浪费带宽。
+	//  · 更糟的是它由对端驱动：任何一次 join 都能触发一次全量重发，
+	//    最坏是 maxStreams × window = 1024 × 512 KiB ≈ 512 MB 的出向流量，
+	//    外加每条流一个 pump 协程。对端只要反复加路径就能把服务端的出口打满。
+	//
+	// 路径死了但还有别的活着，走的是 onPathDead → reassignFrom(deadID)，
+	// 那里只恢复钉在死路径上的那些流，是精确的。真正需要全量重发的只有
+	// "路径全死光之后重连回来"，而那一刻 len(s.paths) 正好是 1。
+	//
+	// 多路径 QUIC 的原则是一样的：在确认丢失或路径被判死之前不重传，
+	// 就是为了避免这种虚假重传（draft-ietf-quic-multipath）。
+	if first {
+		s.rewindAll()
+	}
 
 	s.mu.Lock()
 	s.pathCond.Broadcast()
 	s.mu.Unlock()
+	return true
 }
 
 func (s *Session) onPathDead(p *path) {
@@ -383,6 +419,7 @@ func (s *Session) rewindAll() {
 // resumeStream 在换路/重连后把一条流恢复到可发送状态。
 // 顺序很重要：先补 STREAM_OPEN（对端可能压根没收到过），再重发数据，最后补 FIN。
 func (s *Session) resumeStream(st *Stream) {
+	s.resumes.Add(1)
 	if st.needsOpenResend() {
 		s.sendOnStream(st, FrameStreamOpen, 0, st.openPayload)
 	}

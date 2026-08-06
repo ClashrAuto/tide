@@ -14,6 +14,10 @@ import "time"
 // 在环回或低延迟链路上，重连快到几毫秒，光看传输成功与否完全分辨不出来。
 func (s *Session) PathsEstablished() uint64 { return s.pathsAdded.Load() }
 
+// StreamResumes 是累计有多少次把一条流退回最后确认点重发。
+// 每一次都意味着一段已经发过的字节要再上一次线——正常的多路径爬坡不该让它涨。
+func (s *Session) StreamResumes() uint64 { return s.resumes.Load() }
+
 // PathCount 返回当前还活着的路径数。
 func (s *Session) PathCount() int {
 	s.mu.Lock()
