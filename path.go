@@ -80,6 +80,8 @@ type path struct {
 
 	state    atomic.Uint32
 	lastRecv atomic.Int64 // UnixNano
+	// lastSent 是最后一次真正把字节写上线的时刻，供 heartbeatLoop 判断"现在是不是静默"。
+	lastSent atomic.Int64 // UnixNano
 	created  time.Time
 	// 收发字节数。调度器的决策（哪条流走哪条路）除了看这个没有别的办法验证——
 	// "QUIC 路径建起来了"和"数据真的走了 QUIC"是两件事。
@@ -269,6 +271,7 @@ func (p *path) writeLoop() {
 			return
 		}
 		p.txBytes.Add(uint64(len(out)))
+		p.lastSent.Store(time.Now().UnixNano())
 	}
 }
 
@@ -311,6 +314,60 @@ func errText(err error) string {
 // 探测与健康
 // ---------------------------------------------------------------------------
 
+// jitter 给一个标称间隔加上 ±40% 的均匀抖动。
+//
+// ★ 固定周期的心跳是**最容易被认出来的时序特征**，而且根本不需要机器学习。
+// 实测未加抖动时，一条应用层完全静默的连接，线上包的到达间隔是
+// **均值 1000.2ms、标准差 0.15ms、变异系数 0.00015**——一个精确到 0.15 毫秒的节拍器。
+// 对到达间隔做个直方图，或者一次自相关，就一眼看穿；而真实 HTTPS 浏览的到达间隔
+// 是重尾且高度不规则的。填充把**长度**修得再像也没用，长度和时序是两个独立的维度。
+//
+// 抖动保持均值不变，所以路径死亡的检测时延基本不受影响（最坏晚 0.4 个间隔）。
+func jitter(d time.Duration) time.Duration {
+	span := int64(d) * 8 / 10 // ±40%
+	if span <= 0 {
+		return d
+	}
+	return d - time.Duration(span/2) + time.Duration(int64(fastRand())%span)
+}
+
+// heartbeatLoop 在判决窗口内把**静默间隔**填掉。
+//
+// ★ 这是 design.md 机制 6a 的另一半，padding.go 里 maybeHeartbeat 那段注释写得很清楚：
+// 只填"有数据要发的帧"是不够的，交互流量的静默间隔本身就是特征
+// （请求-等待-响应的节奏在包到达时间上一览无余）。
+// 但那个函数写完之后**从来没有被任何地方调用过**——长度那一半上线了，时序这一半没有。
+//
+// 学术上这套叫 adaptive padding（WTF-PAD 及 Tor 的 circuit padding 框架都基于它）：
+// 往包间隔里注入假流量，而不是恒定速率发送——后者能根治但会毁掉低延迟。
+func (p *path) heartbeatLoop() {
+	const nominal = 150 * time.Millisecond
+	for {
+		d := jitter(nominal)
+		select {
+		case <-p.dead:
+			return
+		case <-p.sess.closed:
+			return
+		case <-time.After(d):
+		}
+		if p.pad.Phase() != PhaseDecision {
+			return // 判决窗口过了、或填充被关了（bare），之后不再需要
+		}
+		// 链路本来就在发东西时不插：那时没有静默间隔可填，
+		// 硬插只是白花判决窗口那点预算。
+		if time.Since(time.Unix(0, p.lastSent.Load())) < d {
+			continue
+		}
+		if !p.pad.maybeHeartbeat() {
+			continue
+		}
+		// 空 PADDING 帧，长度由 padFor 从同一张 HTTPS 分布表里采样。
+		// 接收方 MUST 丢弃（spec §2.2），所以它对上层完全透明。
+		p.writeFrame(FramePadding, FlagPush, 0, nil)
+	}
+}
+
 func (p *path) probeLoop(interval, idleInterval time.Duration) {
 	// ★ 立刻探一次，不要先等一个周期。
 	// score() 在没有 RTT 样本时返回中性值 50（毫秒当量），而一条正常的 TCP 路径
@@ -318,7 +375,7 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 	// 调度器不会往它上面迁。实测这段窗口让每次会话开头有几秒钟的流量白白走在
 	// 慢一个数量级的路径上（单流 40 秒的测试里是 8.1MiB / 10%）。
 	p.sendProbe()
-	t := time.NewTimer(interval)
+	t := time.NewTimer(jitter(interval))
 	defer t.Stop()
 	for {
 		select {
@@ -340,7 +397,7 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		if p.sess.activeStreams() == 0 {
 			d = idleInterval
 		}
-		t.Reset(d)
+		t.Reset(jitter(d))
 	}
 }
 

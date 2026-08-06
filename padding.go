@@ -186,26 +186,25 @@ func (p *paddingScheduler) sampleTarget() uint32 {
 	return httpsLengthCDF[len(httpsLengthCDF)-1].hi
 }
 
-// maybeHeartbeat 决定判决窗口内是否插入一个纯 PADDING 帧。
+// maybeHeartbeat 决定判决窗口内**这一刻**要不要插一个纯 PADDING 帧。
 //
 // 只填充"有数据要发的帧"是不够的：交互流量的**静默间隔**本身就是特征
 // （请求-等待-响应的节奏在包到达时间上一览无余）。判决窗口内以低概率插入独立填充帧，
 // 把这段静默填成看起来像浏览器在后台拉资源。批量阶段不做——那时链路已经饱和，
 // 插心跳只会挤占带宽。
-func (p *paddingScheduler) maybeHeartbeat() (size int, ok bool) {
+//
+// ⚠️ 这个函数写完之后有很长一段时间**没有任何地方调用它**：填充的长度那一半上线了，
+// 时序这一半没有。调用方见 path.heartbeatLoop。
+//
+// 只返回"要不要发"，长度交给 padFor 从同一张分布表里采——两处各采一次会让
+// 心跳帧的长度分布和数据帧不一致，那本身又是一个可分的特征。
+func (p *paddingScheduler) maybeHeartbeat() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.disabled || p.phase() != PhaseDecision {
-		return 0, false
+		return false
 	}
-	if p.rng.Float64() > 0.35 {
-		return 0, false
-	}
-	t := int(p.sampleTarget())
-	if t < 8 {
-		return 0, false
-	}
-	return t, true
+	return p.rng.Float64() <= 0.35
 }
 
 func (p *paddingScheduler) disable() {

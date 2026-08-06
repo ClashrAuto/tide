@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -520,6 +521,93 @@ func TestWalletBatchesBounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 填充
 // ---------------------------------------------------------------------------
+
+// tsConn 记录底层 net.Conn 上每次 Write 的时刻 = DPI 看到的包到达时刻。
+type tsConn struct {
+	net.Conn
+	mu *sync.Mutex
+	at *[]time.Time
+}
+
+func (c *tsConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.mu.Lock()
+	*c.at = append(*c.at, time.Now())
+	c.mu.Unlock()
+	return n, err
+}
+
+// 应用层静默时，线上包的到达间隔**不得**是一个节拍器。
+//
+// ★ 填充把**长度**修得再像 HTTPS 也没用——长度和时序是两个彼此独立的维度，
+// 而时序这一维原先是完全裸奔的：探测循环 t.Reset(interval) 用的是常量，
+// 实测一条静默连接的包间隔是 **均值 1000.2ms、标准差 0.15ms、变异系数 0.00015**，
+// 一个精确到 0.15 毫秒的节拍器。识别它不需要任何机器学习，
+// 对到达间隔做个直方图就一眼看穿，而真实 HTTPS 浏览的间隔是重尾且高度不规则的。
+//
+// 修法两件：探测间隔加 ±40% 抖动，以及把写好却从没被调用过的 maybeHeartbeat
+// 接上（判决窗口内往静默间隔里插 PADDING 帧，即 WTF-PAD 那一类 adaptive padding）。
+func TestIdleTimingIsNotAMetronome(t *testing.T) {
+	var mu sync.Mutex
+	var at []time.Time
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := net.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &tsConn{Conn: c, mu: &mu, at: &at}, nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	if _, err := h.client.Session(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 开一条流让路径处于"有活跃流"状态，然后**什么都不发**。
+	c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	at = at[:0]
+	mu.Unlock()
+
+	time.Sleep(5 * time.Second)
+
+	mu.Lock()
+	ts := append([]time.Time(nil), at...)
+	mu.Unlock()
+
+	// 只看"真正的周期"：突发内部几十微秒的间隔不是时序特征。
+	var gaps []float64
+	for i := 1; i < len(ts); i++ {
+		if g := ts[i].Sub(ts[i-1]).Seconds() * 1000; g > 50 {
+			gaps = append(gaps, g)
+		}
+	}
+	if len(gaps) < 3 {
+		t.Skipf("静默期只采到 %d 个间隔，样本不够下结论", len(gaps))
+	}
+	var sum, sum2 float64
+	for _, g := range gaps {
+		sum += g
+		sum2 += g * g
+	}
+	n := float64(len(gaps))
+	mean := sum / n
+	cv := math.Sqrt(sum2/n-mean*mean) / mean
+	t.Logf("静默期 %d 个包 / %d 个间隔：均值 %.1fms 变异系数 %.4f", len(ts), len(gaps), mean, cv)
+
+	// 光是 ±40% 均匀抖动，变异系数就有 0.8/√12 ≈ 0.23；心跳帧会把它推得更高。
+	// 阈值取 0.15 —— 低于它基本只可能是"根本没抖"。
+	if cv < 0.15 {
+		t.Fatalf("空闲时包间隔的变异系数只有 %.5f（均值 %.1fms）—— 这是一个节拍器。"+
+			"长度伪装得再好也没用，一次自相关就能把这条连接从 HTTPS 里挑出来", cv, mean)
+	}
+}
 
 func TestPaddingPhases(t *testing.T) {
 	p := newPaddingScheduler()

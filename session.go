@@ -153,6 +153,8 @@ func (s *Session) addPath(p *path) bool {
 	go p.readLoop()
 	go p.writeLoop()
 	go p.probeLoop(s.probeIvl, DefaultIdleProbeInterval)
+	// 判决窗口内把静默间隔也填掉——填充的长度那一半早就上线了，时序这一半到此才接上。
+	go p.heartbeatLoop()
 
 	// ★ 只有"会话此刻一条路径都没有"才需要全量退回重发。
 	//
