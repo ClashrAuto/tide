@@ -2709,6 +2709,75 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 同一会话里 path_id 必须唯一 —— 这是密钥的输入，不是编号
+// ---------------------------------------------------------------------------
+
+// 记录层密钥是 pathKey(方向密钥, path_id)，**只由 path_id 决定**；
+// 而每条路径的 recordSealer 序号都从 0 起。于是两条路径共用一个 path_id
+// = 同一把密钥配同一串 nonce，AEAD 当场失效：两段密文异或就泄露明文，
+// Poly1305 的认证密钥也跟着复用，伪造随之成立。
+//
+// ★ 而 path_id 是**对端报上来的**：服务端从前直接 `pathID := wantPath` 照单全收，
+// 只在对方给 0 时才自己分配。更微妙的是客户端那边的注释写着
+// "服务端可能给了不同的 path_id（比如本端选的号已被占用）"——
+// 客户端一直按"服务端会替我换号"来写，而服务端根本没做这件事。
+// 又一次文档声称的属性与实现对不上，这次落在密钥派生的输入上。
+//
+// 多路径 QUIC 给的是同一条要求、同一个理由：
+// "为保证 nonce 唯一，path ID 不得在同一条连接内被另一条路径复用"
+// （draft-ietf-quic-multipath）。它把 path ID 拌进 nonce，本协议拌进密钥，
+// 但"同一连接内不得复用"这一条完全一样。
+func TestDuplicatePathIDIsRefused(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+
+	// 先确认"为什么必须唯一"：同号 ⇒ 同密钥。
+	dirKey := bytes.Repeat([]byte{7}, 32)
+	k1, err := pathKey(dirKey, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := pathKey(dirKey, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k3, err := pathKey(dirKey, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(k1, k2) {
+		t.Fatal("pathKey 不是 path_id 的纯函数？那下面的推理就不成立了")
+	}
+	if bytes.Equal(k1, k3) {
+		t.Fatal("不同 path_id 派生出同一把密钥")
+	}
+
+	first := fakePath(s, 5, "tcp", 20*time.Millisecond)
+	if !s.addPath(first) {
+		t.Fatal("第一条路径就没加进去")
+	}
+	dup := fakePath(s, 5, "quic", 10*time.Millisecond)
+	if s.addPath(dup) {
+		t.Fatal("同一个 path_id 的第二条路径被接纳了 —— " +
+			"两条路径于是共用一把记录层密钥，且各自的 nonce 都从 0 起")
+	}
+	if got := len(s.pathsSnapshot()); got != 1 {
+		t.Fatalf("会话里挂了 %d 条路径，应当只有 1 条", got)
+	}
+	if dup.State() != pathDead {
+		t.Fatal("被拒的路径没有被判死，它的连接会漏着")
+	}
+	// 换个号就该收下。
+	ok := fakePath(s, 6, "quic", 10*time.Millisecond)
+	if !s.addPath(ok) {
+		t.Fatal("换了 path_id 之后仍然被拒")
+	}
+	if !s.pathIDInUse(5) || !s.pathIDInUse(6) || s.pathIDInUse(7) {
+		t.Fatal("pathIDInUse 的判断不对")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 三处调度必须用同一套偏好
 // ---------------------------------------------------------------------------
 
@@ -2718,6 +2787,10 @@ func fakePath(s *Session, id uint32, kind string, srtt time.Duration) *path {
 	p.wcond = sync.NewCond(&p.wmu)
 	p.conn = &nopConn{}
 	p.pad = newPaddingScheduler()
+	// addPath 会起 readLoop，它要 fr。nopConn.Read 永远阻塞，所以这条读循环
+	// 只是干等着，不会干扰用例。
+	p.fr = newFrameReader(p.conn)
+	p.peek = newPeekReader(p.conn, 64)
 	p.state.Store(uint32(pathActive))
 	p.lastRecv.Store(time.Now().UnixNano())
 	p.hmu.Lock()

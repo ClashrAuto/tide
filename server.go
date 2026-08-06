@@ -694,9 +694,22 @@ func (s *Server) finishHandshake(t *teeConn, kHS, ad []byte, user, wantSession [
 		}
 	}
 
+	// path_id 决定记录层密钥（pathKey），而每条路径的 nonce 都从 0 起——
+	// 同一会话里两条路径共用一个 path_id 就是 (key, nonce) 复用，AEAD 当场失效。
+	// 所以对端报上来的号不能照单全收：已经被占用（或干脆没给）就换一个。
+	//
+	// ⚠️ 这里只是**尽早**换号，让正常客户端不必白跑一次握手；真正的不变量由
+	// Session.addPath 在插入时原子地保证——并发加入能绕过这里的检查，绕不过那里。
+	// 客户端本来就按"服务端可能给我换号"写的（它用 ACCEPT 里的 path_id），
+	// 只是服务端从前并没有真的换。
 	pathID := wantPath
-	if pathID == 0 {
-		pathID = s.nextPath.Add(1)
+	if pathID == 0 || (sess != nil && sess.pathIDInUse(pathID)) {
+		for {
+			pathID = s.nextPath.Add(1)
+			if sess == nil || !sess.pathIDInUse(pathID) {
+				break
+			}
+		}
 	}
 
 	// ★ 只有**新建会话**才签发票据。加入路径（含断线重连）不签。

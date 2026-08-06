@@ -153,6 +153,25 @@ func (s *Session) addPath(p *path) bool {
 		p.markDeadReason("too many paths on this session")
 		return false
 	}
+	// ★ path_id 在一条会话内 MUST 唯一，而且这是**安全**要求，不是整洁要求。
+	//
+	// 记录层的密钥是 pathKey(方向密钥, path_id)——纯粹由 path_id 决定；
+	// 而每条路径的 recordSealer 序号都从 0 起。两条路径若拿到同一个 path_id，
+	// 就是同一把密钥配同一串 nonce，AEAD 当场失效：两段密文异或即泄露明文，
+	// Poly1305 的认证密钥也跟着复用，伪造随之成立。
+	//
+	// 这里是**唯一**的插入点，也是唯一能和 s.paths 原子地一起判的地方。
+	// 握手里那次判（见 server.go）只是尽早给对端换一个号，挡不住并发加入的竞态。
+	// 多路径 QUIC 给出的是同一条要求，理由也一模一样：
+	// "为保证 nonce 唯一，path ID 不得在同一条连接内被另一条路径复用"
+	// （draft-ietf-quic-multipath）。
+	for _, q := range s.paths {
+		if q.id == p.id {
+			s.mu.Unlock()
+			p.markDeadReason("duplicate path id on this session")
+			return false
+		}
+	}
 	s.paths = append(s.paths, p)
 	first := len(s.paths) == 1
 	s.mu.Unlock()
@@ -189,6 +208,18 @@ func (s *Session) addPath(p *path) bool {
 	s.pathCond.Broadcast()
 	s.mu.Unlock()
 	return true
+}
+
+// pathIDInUse 报告这条会话此刻是否已经有路径用着这个 path_id。
+func (s *Session) pathIDInUse(id uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.paths {
+		if p.id == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) onPathDead(p *path) {
