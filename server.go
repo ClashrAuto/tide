@@ -966,12 +966,11 @@ func watchUDPIdle(ps *PacketStream, idle time.Duration) {
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
-	for range t.C {
-		ps.mu.Lock()
-		closed := ps.closed
-		ps.mu.Unlock()
-		if closed {
-			return // 关联已经没了，看门狗跟着退
+	for {
+		select {
+		case <-ps.done:
+			return // 关联已经没了，看门狗立刻跟着退
+		case <-t.C:
 		}
 		if time.Since(time.Unix(0, ps.lastActive.Load())) > idle {
 			ps.Close()

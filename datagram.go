@@ -40,6 +40,8 @@ type PacketStream struct {
 	// lastActive 是这条关联**任一方向**最后一次有流量的时刻（UnixNano）。
 	// 空闲回收看的是它，见 watchUDPIdle。
 	lastActive atomic.Int64
+	// done 在关联结束时关闭，让空闲看门狗立刻退出而不是睡到下一个 tick。
+	done chan struct{}
 }
 
 // OpenPacket 开一条 UDP 关联。dst 是"默认目标"，实际每个数据报都自带地址。
@@ -93,7 +95,7 @@ func (s *Session) OpenPacket(ctx context.Context, dst string) (*PacketStream, er
 }
 
 func newPacketStream(s *Session, st *Stream) *PacketStream {
-	ps := &PacketStream{st: st, sess: s}
+	ps := &PacketStream{st: st, sess: s, done: make(chan struct{})}
 	ps.cond = sync.NewCond(&ps.mu)
 	ps.lastActive.Store(time.Now().UnixNano())
 	return ps
@@ -189,6 +191,9 @@ func (ps *PacketStream) closeQueue() {
 		ps.queued = 0
 	}
 	ps.queue = nil
+	// 叫醒空闲看门狗。少了这一句它会一直睡到下一个 tick（默认 75 秒）才发现
+	// 关联已经没了——一条 goroutine 白挂 75 秒，而并发关联上限是 1024。
+	close(ps.done)
 	ps.cond.Broadcast()
 }
 
