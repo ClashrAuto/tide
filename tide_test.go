@@ -2602,6 +2602,216 @@ func TestDatagramAfterSessionCloseDoesNotPanic(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 已建关联的收队列：上界必须限**字节**，而且关联数本身必须封顶
+// ---------------------------------------------------------------------------
+
+// 收队列的上界只数条数，是"上界限的量不是真正涨的那个量"的第三次复发
+// （前两次：stream.go 的乱序缓冲、datagram.go 的抢跑暂存区）。
+//
+// 单条数据报的载荷上限是 MaxFrameBody-300 ≈ 56 KiB，512 条就是 **28 MiB**——
+// 而这只是**一条**关联。真实网络里 UDP 数据报几乎都在 1500 字节以内，
+// 所以正常流量永远碰不到这个数字，测试也就永远绿。
+//
+// 参考实现的做法正好分成两派，而分歧的原因恰恰在这里。quic-go 只限条数
+// （maxDatagramRcvQueueLen = 128），因为 QUIC 的 max_datagram_frame_size 把单条
+// 压在 ~1200 字节，条数与字节是同一个量；.NET / MsQuic 的
+// DatagramReceiveQueueLength 则明确是"缓冲入向数据报所用的**字节**数"，
+// 因为它的单条上限不小。TIDE 的单条上限是 56 KiB，属于后者，却抄了前者的形状。
+func TestDatagramQueueBoundedByBytes(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	const assoc = 9
+	st := newStream(s, assoc, "10.0.0.1:53", DefaultStreamWindow)
+	st.udp = true
+	st.pkt = newPacketStream(s, st)
+	s.mu.Lock()
+	s.streams[assoc] = st
+	s.mu.Unlock()
+
+	// 贴着单帧上限灌，且**一直不读**——这正是应用被调度器噎住那一瞬间的样子。
+	big := make([]byte, MaxFrameBody-300-64)
+	for i := 0; i < maxDatagramQueue*2; i++ {
+		if err := s.onDatagram(udpFrame(t, assoc, "10.0.0.1:53", big)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.pkt.mu.Lock()
+	held, n := st.pkt.queued, len(st.pkt.queue)
+	st.pkt.mu.Unlock()
+	if held > maxDatagramQueueBytes {
+		t.Fatalf("单关联收队列 %d 字节（%d 条），字节上界是 %d —— "+
+			"只限条数挡不住大数据报", held, n, maxDatagramQueueBytes)
+	}
+
+	// 全会话上界：多条关联加起来也不能越界，否则"每条都有界"和
+	// "关联数有界"这两个各自正确的决定合起来仍然是个大数。
+	for id := uint64(100); id < 140; id++ {
+		st := newStream(s, id, "10.0.0.1:53", DefaultStreamWindow)
+		st.udp = true
+		st.pkt = newPacketStream(s, st)
+		s.mu.Lock()
+		s.streams[id] = st
+		s.mu.Unlock()
+		for i := 0; i < 8; i++ {
+			s.onDatagram(udpFrame(t, id, "10.0.0.1:53", big))
+		}
+	}
+	if got := s.dgramBytes.Load(); got > maxSessionDatagramBytes {
+		t.Fatalf("全会话收队列 %d 字节，上界是 %d", got, maxSessionDatagramBytes)
+	}
+
+	// 读走的字节必须还回预算，否则跑一阵子之后所有关联都在丢包，
+	// 而且现象是"UDP 越用越差"，没有任何错误可查。
+	before := s.dgramBytes.Load()
+	st.pkt.SetReadDeadline(time.Now().Add(time.Second))
+	d, err := st.pkt.ReadFrom()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := s.dgramBytes.Load(); after != before-int64(len(d.Data)) {
+		t.Fatalf("读走 %d 字节后预算是 %d，应为 %d —— 读取没有归还预算",
+			len(d.Data), after, before-int64(len(d.Data)))
+	}
+}
+
+// OpenPacket 绕过了流数上限——而 OpenStream 与 onStreamOpen 两条路都查了。
+//
+// 这一条单独看只是"少写一个 if"，和上一条合起来才是完整的洞：
+// 每条关联能占多少内存没有字节上界（上一条），能开多少条关联没有数量上界（这一条），
+// 两个"无界"相乘就是无界。而 Coast 里 OpenPacket 的调用方是**局域网设备**
+// 发来的 SOCKS UDP ASSOCIATE，那是不可信输入。
+func TestOpenPacketHonoursStreamLimit(t *testing.T) {
+	const maxStreams = 16
+	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, maxStreams)
+	s.streamCount.Store(maxStreams)
+
+	s.mu.Lock()
+	beforeSID := s.nextSID
+	s.mu.Unlock()
+
+	// 上限用完时必须**立刻**回 ErrTooManyStreams。给个短超时是为了让漏查上限的
+	// 实现失败得干脆：它会去 waitPath 上等一条永远不会来的路径，
+	// 超时后返回 DeadlineExceeded，而不是把测试挂死。
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := s.OpenPacket(ctx, "10.0.0.1:53"); !errors.Is(err, ErrTooManyStreams) {
+		t.Fatalf("OpenPacket 在流数用尽时返回 %v，应为 ErrTooManyStreams", err)
+	}
+	s.mu.Lock()
+	afterSID := s.nextSID
+	s.mu.Unlock()
+	if afterSID != beforeSID {
+		t.Fatalf("被拒的 OpenPacket 仍然消耗了流号：%d → %d", beforeSID, afterSID)
+	}
+	if got := s.activeStreams(); got != maxStreams {
+		t.Fatalf("被拒的 OpenPacket 改了流计数：%d，应为 %d", got, maxStreams)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 读协程绝不能阻塞在写上
+// ---------------------------------------------------------------------------
+
+// 这条守的是一个**不变量**，不是某个具体场景：`handleFrame` 跑在读协程上，
+// 它无论如何都必须能返回，哪怕这条路径此刻一个字节都写不出去。
+//
+// 违反它的代价是整条会话彻底卡死，而且两端对称、无人报错：
+//
+//	pump 拿着某条 QUIC 流的写锁，堵在流控里等对端开窗；
+//	readLoop 收到该流的 FIN，去发 ACK，抢同一把写锁，堵住；
+//	而对端要开窗，恰恰得靠这个 readLoop 继续把数据读走。
+//
+// 这不是假想：一次 -race 全量跑里它把 TestQUICPathIsPaddedInDecisionWindowOnly
+// 卡了 9 分 33 秒，直到 10 分钟的测试超时才暴露；单独跑那个用例只要 0.42 秒。
+// 也就是说它只在**别的用例把负载堆上去之后**才出现——正是最容易被当成偶发红的形状。
+//
+// 处置照 Go 官方 net/http2 服务端：serve/read 协程绝不阻塞在写上，
+// 控制帧一律经通道交给别的协程写。
+func TestHandleFrameNeverBlocksOnAStuckPath(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+
+	// ★ 必须用 **QUIC 形态**的路径，否则这个用例什么都测不到：
+	// TCP 路径的 writeFrame 只往 p.wbuf 里追加，真正的 conn.Write 在 writeLoop 协程里，
+	// 它本来就不会阻塞。会阻塞的是 quicMux.write —— 它在持锁的情况下直接调
+	// 底层流的 Write。这个形状差异正是这个 bug 的根。
+	const sid = 3
+	p := &path{id: 7, kind: "quic", pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p.sess = s
+	p.wcond = sync.NewCond(&p.wmu)
+	p.conn = stuckConn{}
+	p.pad = newPaddingScheduler()
+	p.qmux = &quicMux{
+		path:    p,
+		streams: map[uint64]*qstream{sid: {s: stuckMuxStream{}}},
+	}
+	s.mu.Lock()
+	s.paths = append(s.paths, p)
+	s.mu.Unlock()
+
+	st := newStream(s, sid, "10.0.0.1:80", DefaultStreamWindow)
+	s.mu.Lock()
+	s.streams[sid] = st
+	s.mu.Unlock()
+	s.streamCount.Add(1)
+
+	// 扮演 pump：拿走这条 QUIC 流的写锁并永远堵在 Write 里，
+	// 也就是"对端的流控窗口满了"。
+	stuck := make(chan struct{})
+	go func() { close(stuck); p.writeFrame(FrameStreamData, 0, sid, []byte("x")) }()
+	<-stuck
+	time.Sleep(50 * time.Millisecond) // 让它确实进到 q.mu.Lock() 里面去
+
+	// 现在从"读协程"喂一帧带 FIN 的 STREAM_DATA。老实现在这里会走
+	// onFin → forceAck → sendOnStream → 阻塞。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		payload := append(AppendVarint(nil, 0), []byte("hello")...)
+		s.handleFrame(p, Frame{Type: FrameStreamData, Flags: FlagEnd, StreamID: sid, Payload: payload})
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleFrame 在一条写不出去的路径上阻塞了 —— " +
+			"读协程一旦停下来，对端的窗口就永远不会再打开，整条会话死锁")
+	}
+
+	// 超过流数上限时回的那个 RST 也在读协程上，同样不能阻塞。
+	s.streamCount.Store(int64(s.maxStream))
+	done2 := make(chan struct{})
+	go func() {
+		defer close(done2)
+		open := append([]byte{0}, AppendVarint(nil, DefaultStreamWindow)...)
+		open, _ = appendSocksAddr(open, "10.0.0.2:80")
+		s.handleFrame(p, Frame{Type: FrameStreamOpen, Flags: FlagPush, StreamID: 99, Payload: open})
+	}()
+	select {
+	case <-done2:
+	case <-time.After(3 * time.Second):
+		t.Fatal("拒绝流的 STREAM_RST 把读协程堵住了")
+	}
+}
+
+// stuckMuxStream 是一条写不动的 QUIC 流：Write 永不返回，正如流控窗口满了的样子。
+type stuckMuxStream struct{}
+
+func (stuckMuxStream) Read(p []byte) (int, error)  { select {} }
+func (stuckMuxStream) Write(p []byte) (int, error) { select {} }
+func (stuckMuxStream) Close() error                { return nil }
+
+// stuckConn 的 Write 永远不返回：一条已经写不动的路径。
+type stuckConn struct{ net.Conn }
+
+func (stuckConn) Close() error                       { return nil }
+func (stuckConn) Write(p []byte) (int, error)        { select {} }
+func (stuckConn) Read(p []byte) (int, error)         { select {} }
+func (stuckConn) LocalAddr() net.Addr                { return streamAddr("stuck") }
+func (stuckConn) RemoteAddr() net.Addr               { return streamAddr("stuck") }
+func (stuckConn) SetDeadline(t time.Time) error      { return nil }
+func (stuckConn) SetReadDeadline(t time.Time) error  { return nil }
+func (stuckConn) SetWriteDeadline(t time.Time) error { return nil }
+
 // udpFrame 拼一个 DATAGRAM 帧的载荷：SOCKS 地址 + 数据。
 func udpFrame(t *testing.T, assoc uint64, addr string, data []byte) Frame {
 	t.Helper()

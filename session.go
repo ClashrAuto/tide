@@ -62,6 +62,13 @@ type Session struct {
 	// 每一次都意味着一段已经发过的字节要再上一次线，所以它是虚假重传的直接度量：
 	// 正常爬坡（TCP 起来后再加 QUIC）**不该**让它涨，涨了就是在白烧带宽。
 	resumes atomic.Uint64
+	// dgramBytes 是全会话所有 UDP 关联收队列里的载荷字节数（见 maxSessionDatagramBytes）。
+	dgramBytes atomic.Int64
+
+	// ctrlOut 是不能在读协程里写的**一次性**控制帧（目前只有拒绝流的 RST）。
+	// 满了就丢：丢一个 RST 只是让对端多等一个超时，而为了发它把读侧堵住，
+	// 代价是整条会话。理由见 stream.go 的 maybeAckLocked。
+	ctrlOut chan pendingCtrl
 	// deadLog 留着最近几条路径的死因。路径死了就从 paths 里摘掉，
 	// 死因也跟着消失——而"反复建起来又死"恰恰只能靠死因序列来查。
 	deadLog deathLog
@@ -90,8 +97,10 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 		streams:   make(map[uint64]*Stream),
 		acceptCh:  make(chan *Stream, 64),
 		ticketReq: make(chan struct{}, 1),
+		ctrlOut:   make(chan pendingCtrl, 64),
 		closed:    make(chan struct{}),
 	}
+	go s.ctrlLoop()
 	s.pathCond = sync.NewCond(&s.mu)
 	// 流号奇偶分家（同 HTTP/2）：客户端用奇数、服务端用偶数，
 	// 双方可以同时开流而不需要任何协商。
@@ -650,12 +659,16 @@ func (s *Session) AcceptStream(ctx context.Context) (*Stream, error) {
 
 func (s *Session) removeStream(id uint64) {
 	s.mu.Lock()
-	_, ok := s.streams[id]
+	st, ok := s.streams[id]
 	delete(s.streams, id)
 	paths := append([]*path(nil), s.paths...)
 	s.mu.Unlock()
 	if ok {
 		s.streamCount.Add(-1)
+		// UDP 关联的收队列跟着走：不关就是两处泄漏，见 closeQueue 的说明。
+		if st != nil && st.pkt != nil {
+			st.pkt.closeQueue()
+		}
 	}
 	// 顺手关掉这条流占的 QUIC 流。不关就是纯泄漏——quic-go 的流上限
 	// （MaxIncomingStreams）用满之后，新流会阻塞在 OpenStream 上，
@@ -665,6 +678,54 @@ func (s *Session) removeStream(id uint64) {
 			p.qmux.closeStream(id)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 读协程里产生的出向帧：一律不在读协程上写
+// ---------------------------------------------------------------------------
+
+// ctrlLoop 发那些**一次性**的控制帧。
+//
+// 它堵住不要紧——读协程照常排空对端的数据，对端的窗口照常打开，这条写迟早通过。
+// 反过来（读协程自己去写）才是死锁：见 stream.go 的 maybeAckLocked。
+//
+// ★ 它和 ACK **不共用**协程。共用的话，一条卡住的流会把整条会话所有流的 ACK
+// 一起压住——那正是每条 TIDE 流一条独立 QUIC 流要消除的队头阻塞，
+// 在发送侧原样重建一遍就白分了。
+func (s *Session) ctrlLoop() {
+	for {
+		select {
+		case <-s.closed:
+			return
+		case pc := <-s.ctrlOut:
+			pc.p.writeFrame(pc.t, pc.flags, pc.sid, pc.payload)
+		}
+	}
+}
+
+// pendingCtrl 是一帧待发的一次性控制帧。
+type pendingCtrl struct {
+	p       *path
+	t       FrameType
+	flags   uint8
+	sid     uint64
+	payload []byte
+}
+
+// deferCtrl 把一帧控制帧交给 ackLoop 去写。★ 不阻塞：队列满就丢。
+// 调用点全在 handleFrame 里，也就是读协程上——在那里直接 writeFrame
+// 就是 stream.go maybeAckLocked 里描述的那个死锁。
+func (s *Session) deferCtrl(p *path, t FrameType, flags uint8, sid uint64, payload []byte) {
+	select {
+	case s.ctrlOut <- pendingCtrl{p: p, t: t, flags: flags, sid: sid, payload: payload}:
+	default:
+	}
+}
+
+func refusedPayload() []byte {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(StreamErrRefused))
+	return buf[:]
 }
 
 func (s *Session) stream(id uint64) *Stream {
@@ -797,9 +858,7 @@ func (s *Session) onStreamOpen(p *path, f Frame) error {
 		return ErrProtocol
 	}
 	if int(s.streamCount.Load()) >= s.maxStream {
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(StreamErrRefused))
-		p.writeFrame(FrameStreamRst, FlagPush, f.StreamID, buf[:])
+		s.deferCtrl(p, FrameStreamRst, FlagPush, f.StreamID, refusedPayload())
 		return nil
 	}
 
@@ -835,9 +894,7 @@ func (s *Session) onStreamOpen(p *path, f Frame) error {
 	case <-s.closed:
 	default:
 		// accept 队列满：拒绝而不是无限排队，否则上游一慢就把内存吃光。
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(StreamErrRefused))
-		p.writeFrame(FrameStreamRst, FlagPush, f.StreamID, buf[:])
+		s.deferCtrl(p, FrameStreamRst, FlagPush, f.StreamID, refusedPayload())
 		s.removeStream(f.StreamID)
 	}
 	return nil

@@ -78,6 +78,8 @@ type Stream struct {
 	readDL, writeDL atomic.Int64 // UnixNano，0 = 无
 	closeOnce       sync.Once
 	closed          atomic.Bool
+	// ackBusy：这条流当前是否已有一个协程在写 ACK。见 scheduleAck。
+	ackBusy atomic.Bool
 }
 
 func newStream(s *Session, id uint64, dst string, window uint64) *Stream {
@@ -463,10 +465,81 @@ func (st *Stream) drainReorderLocked() {
 
 // maybeAckLocked 在累计到阈值或被强制时回一个 STREAM_ACK。
 // 必须在 rmu 持有时调用。
+//
+// ★ 这里**只登记，不发送**。发送交给 scheduleAck 起的那个临时协程。
+//
+// 原先是在这里直接 sendOnStream 的，旁边还留着一句"在 rmu 内直接发是安全的：
+// sendOnStream 不会回调进接收侧"——那句话本身没错，但它防的是**重入**，
+// 而真正的危险是**阻塞**，两者毫无关系。这条路径是从 readLoop 里下来的
+// （handleFrame → onData/onFin → forceAck），于是：
+//
+//	pump 拿着这条流的写锁，堵在 quic-go 的流控里等对端开窗；
+//	readLoop 想发 ACK，去抢同一把写锁，堵住；
+//	而对端要开窗，恰恰得靠这个 readLoop 继续把数据读走。
+//
+// 两端对称，于是整条会话彻底卡死——实测在一次 -race 全量跑里卡了 9 分 33 秒，
+// 直到测试框架超时才被发现。
+//
+// ★ 根因是两条数据面的形状不一致。TCP 路径的 writeFrame 只把帧追加进 p.wbuf
+// 再 Signal 一下，真正的 conn.Write 在独立的 writeLoop 协程里，所以它**从不阻塞**；
+// quicMux.write 却是在持锁的情况下直接调 quic-go 的 Stream.Write。
+// 同一个 writeFrame 入口，一条路径上不阻塞、另一条阻塞——调用方（这里）
+// 按前者的直觉写，就踩中了后者。
+//
+// 处置照 Go 官方 net/http2 服务端的做法：**serve/read 协程绝不阻塞在写上**。
+// 那边的原话是 writeFrame"排一帧、不施加反压——阻塞的是 handler，不是 serve 协程"；
+// 控制帧一律经通道交给别的协程写。这里同构：readLoop 只做一次原子置位，
+// 真正的写留给别的协程，它堵住也不影响读侧继续排空。
 func (st *Stream) maybeAckLocked(force bool) {
 	if !force && st.recvOff-st.ackedAdv < ackThreshold {
 		return
 	}
+	st.scheduleAck()
+}
+
+// forceAck 供 FIN、迁移完成等需要立刻同步状态的时机。
+func (st *Stream) forceAck() { st.scheduleAck() }
+
+// scheduleAck 交代"这条流该发 ACK 了"，然后立刻返回。
+//
+// ★ 每条流各自一个临时协程，而**不是**全会话共用一个发送协程。
+// 共用的话，一条卡在流控里的流会把其它所有流的 ACK 一起压住——
+// 那正是"每条 TIDE 流一条独立 QUIC 流"要消除的队头阻塞（spec §12.5），
+// 在发送侧原样重建一遍就白分了。
+//
+// ackBusy 保证一条流同时最多一个协程在写，所以协程数有界（≤ 并发流上限），
+// 且 ACK 是累积量，同一条流并发发两个也无害。
+func (st *Stream) scheduleAck() {
+	if st.ackBusy.Swap(true) {
+		return // 已经有协程在写这条流的 ACK，它写完会自己再看一眼
+	}
+	go st.ackFlushLoop()
+}
+
+func (st *Stream) ackFlushLoop() {
+	for {
+		st.flushAck()
+		st.ackBusy.Store(false)
+		// 写的这段时间里又来了新数据？自己接着发，别指望下一帧来触发——
+		// 对端可能正等着这个 ACK 才敢继续发，没有"下一帧"。
+		st.rmu.Lock()
+		more := st.recvOff != st.ackedAdv
+		st.rmu.Unlock()
+		if !more {
+			return
+		}
+		if st.ackBusy.Swap(true) {
+			return // 别人接手了
+		}
+	}
+}
+
+// flushAck 现算一个 STREAM_ACK 并发出去。只由 ackFlushLoop 调用。
+//
+// ⚠️ 算完就把 rmu 放掉，**绝不能带着 rmu 去写**：onData 也要 rmu，
+// 带着锁写就等于把刚从 readLoop 挪走的那个死锁原样挪到 rmu 上。
+func (st *Stream) flushAck() {
+	st.rmu.Lock()
 	ack := st.recvOff
 	// 通告上界 = 已连续接收 + 剩余缓冲空间。读得慢的应用会自然把窗口压小，
 	// 反压一路传回发送端，而不是让中间缓冲无限膨胀。
@@ -476,19 +549,12 @@ func (st *Stream) maybeAckLocked(force bool) {
 	}
 	maxOff := ack + uint64(free)
 	st.ackedAdv = ack
+	st.rmu.Unlock()
 
 	payload := make([]byte, 0, 16)
 	payload = AppendVarint(payload, ack)
 	payload = AppendVarint(payload, maxOff)
-	// 在 rmu 内直接发是安全的：sendOnStream 不会回调进接收侧。
 	st.sess.sendOnStream(st, FrameStreamAck, 0, payload)
-}
-
-// forceAck 供 FIN、迁移完成等需要立刻同步状态的时机。
-func (st *Stream) forceAck() {
-	st.rmu.Lock()
-	st.maybeAckLocked(true)
-	st.rmu.Unlock()
 }
 
 func (st *Stream) onAck(ack, maxOff uint64) {

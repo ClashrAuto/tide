@@ -32,6 +32,7 @@ type PacketStream struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	queue  []*Datagram
+	queued int // queue 里的载荷字节数，与 sess.dgramBytes 同步增减
 	closed bool
 	rdl    time.Time
 }
@@ -45,6 +46,14 @@ func (s *Session) OpenPacket(ctx context.Context, dst string) (*PacketStream, er
 	case <-s.closed:
 		return nil, ErrClosed
 	default:
+	}
+	// ★ UDP 关联也是流，也要占流数上限。
+	// OpenStream 与 onStreamOpen 两条路都查了，唯独这里漏了——于是"最多 1024 条流"
+	// 这个上限可以用 UDP 绕开。在 Coast 里这条路的调用方是局域网设备发来的
+	// SOCKS UDP ASSOCIATE，属于不可信输入；而每条关联自己还带着一个收队列，
+	// 两个无界相乘就没有上界可言了。
+	if int(s.streamCount.Load()) >= s.maxStream {
+		return nil, ErrTooManyStreams
 	}
 	s.mu.Lock()
 	id := s.nextSID
@@ -132,6 +141,8 @@ func (ps *PacketStream) ReadFrom() (*Datagram, error) {
 	}
 	d := ps.queue[0]
 	ps.queue = ps.queue[1:]
+	ps.queued -= len(d.Data)
+	ps.sess.dgramBytes.Add(-int64(len(d.Data)))
 	return d, nil
 }
 
@@ -144,15 +155,32 @@ func (ps *PacketStream) SetReadDeadline(t time.Time) error {
 }
 
 func (ps *PacketStream) Close() error {
+	ps.closeQueue()
+	return ps.st.Close()
+}
+
+// closeQueue 关掉收队列、唤醒读者并归还预算。
+//
+// 和 Close 分开是因为 removeStream 也要调它，而 Close 会回头去关流——
+// 从 removeStream 调 Close 就绕回来了。两处都必须调：
+//   - 应用自己关（Close）；
+//   - 对端 RST 或流被摘掉（removeStream）。少了后者有两个后果，
+//     且都只在跑久了之后才显形：没读走的字节永久占着会话的数据报预算，
+//     于是所有关联慢慢开始丢包而查不出原因；DefaultPacketHandler 的读循环
+//     没有超时，会永远阻塞在 ReadFrom 上，连同它的 UDP socket 一起泄漏。
+func (ps *PacketStream) closeQueue() {
 	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	if ps.closed {
-		ps.mu.Unlock()
-		return nil
+		return
 	}
 	ps.closed = true
+	if ps.queued > 0 {
+		ps.sess.dgramBytes.Add(-int64(ps.queued))
+		ps.queued = 0
+	}
+	ps.queue = nil
 	ps.cond.Broadcast()
-	ps.mu.Unlock()
-	return ps.st.Close()
 }
 
 func (ps *PacketStream) LocalAddr() net.Addr { return ps.sess.LocalAddr() }
@@ -160,23 +188,88 @@ func (ps *PacketStream) LocalAddr() net.Addr { return ps.sess.LocalAddr() }
 // Assoc 返回关联标识。
 func (ps *PacketStream) Assoc() uint64 { return ps.st.id }
 
-// maxDatagramQueue：单个关联最多排多少个未读数据报。
-// 满了就丢最老的——UDP 的语义下，一个陈旧的数据报比一个新的更没价值，
-// 而无上界排队会在应用读得慢时把内存吃光。
-const maxDatagramQueue = 512
+// 已建关联的收队列上界。满了就丢最老的——UDP 的语义下，一个陈旧的数据报比一个
+// 新的更没价值（mvfst 的入向数据报缓冲也是这个策略），而无上界排队会在应用
+// 读得慢时把内存吃光。
+//
+// ★ 三个上界缺一不可，理由和下面抢跑暂存区那三个是同一套，只是这里晚发现了一轮。
+//
+//  1. **条数**。每条排队记录除了载荷还有 slice 表项与 Datagram 结构，
+//     合计上百字节且**与载荷长度无关**。LSQUIC 的 QUIC-LEAK（CVE-2025-54939）
+//     就栽在这个量上：每个包 ~96 字节的结构体，一条 UDP 数据报换 ~960 字节 RAM，
+//     内存以带宽 70% 的速度线性增长。只限字节挡不住"小数据报刷条数"。
+//
+//  2. **单关联字节**。这一条原先没有，而它才是这里真正会涨的量：
+//     单条数据报的载荷上限是 MaxFrameBody-300 ≈ 56 KiB，512 条就是 28 MiB。
+//     参考实现在这一点上分成两派，分歧的根源正是单条上限：quic-go 只限条数
+//     （maxDatagramRcvQueueLen = 128），因为 QUIC 的 max_datagram_frame_size
+//     把单条压在 ~1200 字节，条数与字节是同一个量；.NET / MsQuic 的
+//     DatagramReceiveQueueLength 则明确是"缓冲入向数据报所用的**字节**数"。
+//     TIDE 的单条上限属于后者，却抄了前者的形状。
+//     256 KiB 按 1500 字节的真实数据报算约 175 条，够吸收一次调度抖动了。
+//
+//  3. **全会话字节**。前两条只约束一条关联；关联数虽然被 maxStream 封顶
+//     （OpenPacket 漏查那一处已一并补上），1024 × 256 KiB 仍是 256 MiB。
+//     "每条都有界"和"条数有界"这两个各自正确的决定，乘起来仍然是个大数——
+//     这是本项目反复踩的同一类坑，所以再加一道硬顶。
+const (
+	maxDatagramQueue        = 512
+	maxDatagramQueueBytes   = 256 << 10
+	maxSessionDatagramBytes = 4 << 20
+)
 
 func (ps *PacketStream) deliver(d *Datagram) {
 	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	if ps.closed {
-		ps.mu.Unlock()
 		return
 	}
-	if len(ps.queue) >= maxDatagramQueue {
-		ps.queue = ps.queue[1:]
+	n := len(d.Data)
+	if n > maxDatagramQueueBytes {
+		return // 单条就超预算：留着也只会把别人挤光
 	}
+
+	// 先按本关联的两个上界腾地方，丢最老的。
+	for len(ps.queue) >= maxDatagramQueue || ps.queued+n > maxDatagramQueueBytes {
+		ps.evictOldestLocked()
+	}
+	// 再看全会话预算。★ 腾的仍然是**自己**的最老那条，不去动别的关联：
+	// 一来跨关联驱逐要跨锁，二来"谁在发谁就能回收自己的额度"意味着一条正在
+	// 收数据的关联永远不会被别人饿死。全会话预算被别的关联占满时才丢新的——
+	// 那时丢谁都是丢，而丢新的至少不会把已经排好的顺序打乱。
+	for !ps.sess.reserveDatagram(n) {
+		if len(ps.queue) == 0 {
+			return
+		}
+		ps.evictOldestLocked()
+	}
+
 	ps.queue = append(ps.queue, d)
+	ps.queued += n
 	ps.cond.Signal()
-	ps.mu.Unlock()
+}
+
+// evictOldestLocked 丢掉队首并归还两级预算。调用方必须持有 ps.mu 且队列非空。
+func (ps *PacketStream) evictOldestLocked() {
+	old := ps.queue[0]
+	ps.queue = ps.queue[1:]
+	ps.queued -= len(old.Data)
+	ps.sess.dgramBytes.Add(-int64(len(old.Data)))
+}
+
+// reserveDatagram 从全会话预算里划走 n 字节；不够就不划，返回 false。
+// CAS 循环而不是先加后判：先加会让预算短暂越界，而越界的那一瞬间正是
+// 攻击者要的——多条关联同时抢，"短暂"就变成"持续"。
+func (s *Session) reserveDatagram(n int) bool {
+	for {
+		cur := s.dgramBytes.Load()
+		if cur+int64(n) > maxSessionDatagramBytes {
+			return false
+		}
+		if s.dgramBytes.CompareAndSwap(cur, cur+int64(n)) {
+			return true
+		}
+	}
 }
 
 func (s *Session) onDatagram(f Frame) error {
