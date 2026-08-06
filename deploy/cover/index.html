@@ -4,3 +4,8 @@
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem}</style>
 <h1>It works</h1>
 <p>This server is running. Nothing to see here.</p>
+<!-- tide-default-cover: 这是 TIDE 仓库自带的占位掩护页，**部署前必须换掉**。
+     它在每一个用默认配置的部署上逐字节相同——扫一遍 Content-Length + 正文
+     就能把所有默认部署一网打尽，而这正是掩护站点要防的事。
+     tide-server 启动时会检测这个标记并告警；换成你自己的内容（或反代到真实站点）
+     之后标记消失，告警自动停止。 -->
