@@ -23,7 +23,31 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mode="${1:---index}"
 
+# 编排文件里设的每一个 TIDE_* 变量，服务端必须真的读它。
+#
+# ★ 这一条防的是本项目反复出现的那类错误：**写了但没接上**。
+# 编排里多一个变量、二进制里少一处读取，两边各自都是合法文件，谁也不会报错，
+# 而用户改了那个变量之后什么都不会发生——配置静默失效是最难查的一种。
+# 第 26 轮真的踩到过一次：TIDE_PORT 改了对外端口，横幅却照着容器内的监听端口
+# 打客户端配置，于是"贴进客户端就能用"的那段配置连不上，且没有任何线索指向端口。
+check_compose_env() {
+  echo "== 编排变量是否都被真的读取 =="
+  local missing=""
+  local v
+  for v in $(grep -oE '^\s+TIDE_[A-Z_]+:' docker-compose.yaml | tr -d ' :' | sort -u); do
+    if ! grep -q "\"$v\"" cmd/tide-server/main.go; then
+      missing="$missing $v"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    echo "docker-compose.yaml 设了这些变量，但 cmd/tide-server 一个都不读：$missing"
+    echo "用户改了它们不会有任何效果，也不会有任何报错。"
+    return 1
+  fi
+}
+
 run_all() {
+  check_compose_env
   echo "== gofmt =="
   fmt=$(gofmt -l .)
   if [ -n "$fmt" ]; then echo "以下文件未格式化："; echo "$fmt"; return 1; fi

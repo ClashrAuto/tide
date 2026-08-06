@@ -44,7 +44,8 @@ func main() {
 		users      = flag.String("users", env("TIDE_USERS", ""), "comma-separated name:password pairs")
 		grace      = flag.Duration("grace", envDuration("TIDE_GRACE", tide.DefaultSessionGrace), "session grace period")
 		allowBare  = flag.Bool("allow-bare", env("TIDE_ALLOW_BARE", "") != "", "allow negotiating bare-frame mode")
-		advertise  = flag.String("advertise", env("TIDE_ADVERTISE", ""), "host clients will dial; only used to print the sample config")
+		advertise  = flag.String("advertise", env("TIDE_ADVERTISE", ""), "host clients will dial (may include :port); only used to print the sample config")
+		advPort    = flag.String("advertise-port", env("TIDE_ADVERTISE_PORT", ""), "port clients will dial, when it differs from -listen (container port mapping)")
 		keygenOnly = flag.Bool("keygen", false, "print a fresh key pair and exit")
 	)
 	flag.Parse()
@@ -150,7 +151,7 @@ func main() {
 		}()
 	}
 
-	printBanner(priv, *listen, *quicListen, *h3, *cover, *advertise, *certHost, userMap, generated)
+	printBanner(priv, *listen, *quicListen, *h3, *cover, *advertise, *advPort, *certHost, userMap, generated)
 	go warnIfDefaultCover(*cover)
 
 	sig := make(chan os.Signal, 1)
@@ -163,17 +164,10 @@ func main() {
 	<-ctx.Done()
 }
 
-func printBanner(priv *tide.PrivateKey, listen, quicListen string, h3 bool, cover, advertise, certHost string,
+func printBanner(priv *tide.PrivateKey, listen, quicListen string, h3 bool, cover, advertise, advertisePort, certHost string,
 	users map[[16]byte]string, selfSigned bool) {
 
-	host := advertise
-	if host == "" {
-		host = "<your-server>"
-	}
-	port := "8443"
-	if _, p, err := net.SplitHostPort(listen); err == nil && p != "" {
-		port = p
-	}
+	host, port := advertiseHostPort(advertise, advertisePort, listen)
 	names := make([]string, 0, len(users))
 	for _, n := range users {
 		names = append(names, n)
@@ -219,6 +213,37 @@ func printBanner(priv *tide.PrivateKey, listen, quicListen string, h3 bool, cove
 		fmt.Printf("    skip-cert-verify: true   # 自签证书才需要；换成真证书后请删掉这行\n")
 	}
 	fmt.Println()
+}
+
+// advertiseHostPort 决定横幅里那段客户端配置该写哪个 server / port。
+//
+// ★ 端口不能想当然地取 -listen。容器里监听地址与客户端要拨的地址**不是同一个**：
+// docker compose 写的是 `${TIDE_PORT:-8443}:8443`，容器内永远监听 8443，
+// 而宿主发布的是 TIDE_PORT。照着监听端口打，用户把 .env 里的端口一改，
+// 横幅就开始给出一份连不上的配置，且没有任何线索指向端口——
+// 而 README 的整个卖点就是"docker compose logs tide 会打印客户端该贴的完整配置"。
+//
+// 容器**没有办法**自己发现宿主侧的映射端口（moby/moby#7421 从 2014 年开到现在），
+// 标准做法就是把同一个值再用环境变量传一遍。编排文件里用同一个 ${TIDE_PORT} 填
+// TIDE_ADVERTISE_PORT，两个值就不可能漂移。
+func advertiseHostPort(advertise, advertisePort, listen string) (host, port string) {
+	host = advertise
+	if host == "" {
+		host = "<your-server>"
+	}
+	port = "8443"
+	if _, p, err := net.SplitHostPort(listen); err == nil && p != "" {
+		port = p
+	}
+	if advertisePort != "" {
+		port = advertisePort
+	}
+	// 用户很自然会把端口直接写进 -advertise。写了就听他的——它比任何默认都具体。
+	// SplitHostPort 对不带端口的主机名/裸 IPv6 会报错，那时保持原样即可。
+	if h, p, err := net.SplitHostPort(host); err == nil && p != "" {
+		host, port = h, p
+	}
+	return host, port
 }
 
 // defaultCoverMarker 是仓库自带那张占位掩护页里的标记。
