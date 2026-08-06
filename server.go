@@ -811,11 +811,12 @@ func (s *Server) acceptLoop(sess *Session) {
 		}
 		if st.udp {
 			ps := st.pkt
+			idle := s.cfg.udpTimeout()
 			go func() {
 				if s.PacketHandler != nil {
 					s.PacketHandler(context.Background(), ps)
 				} else {
-					DefaultPacketHandler(context.Background(), ps)
+					packetRelay(context.Background(), ps, idle)
 				}
 			}()
 			continue
@@ -850,6 +851,26 @@ func DefaultHandler(ctx context.Context, st *Stream) {
 
 // DefaultPacketHandler 为一条 UDP 关联建一个本地 socket 并转发。
 func DefaultPacketHandler(ctx context.Context, ps *PacketStream) {
+	packetRelay(ctx, ps, DefaultUDPTimeout)
+}
+
+// packetRelay 是 DefaultPacketHandler 的本体，多一个空闲上限参数供服务端配置与测试。
+//
+// ★ 空闲回收和"流结束 = 关联结束"（见 stream.go 的 endAssoc）是**两条独立的**
+// 回收路径，缺一不可。前者管的是对端一声不吭消失的情况（客户端崩了、路径断了、
+// 或者干脆是个恶意实现），后者管的是正常关闭。某家 SOCKS5 服务的事故复盘写得
+// 很直白：他们同时依赖"TCP 连接关闭"和"空闲超时"，两条都没配好，
+// 于是 node_sockstat_UDP_inuse 爬到两万八，而 CPU/内存/HTTP 健康检查全是绿的。
+//
+// ⚠️ 从前这里的形状是错的：上行协程给 pc 设 2 分钟读超时，**超时就 return**，
+// 但外层还堵在 ps.ReadFrom() 上，于是 pc 不会被关、handler 也不会返回。
+// 结果不是"关联被回收"，而是"关联半死"——客户端还能往外发，回包却再也回不来了，
+// 而且两端都不报错。比泄漏更难查。
+//
+// 现在照 mihomo 的做法：任一方向有流量就把读超时**顶回去**（它在 WriteTo 之后
+// 直接去重设对端协程的 deadline，Go 里对阻塞中的 Read 调 SetReadDeadline 是安全的
+// 且立即生效），真超时了就把**整条关联**收掉，两个方向一起。
+func packetRelay(ctx context.Context, ps *PacketStream, idle time.Duration) {
 	defer ps.Close()
 	pc, err := net.ListenPacket("udp", ":0")
 	if err != nil {
@@ -858,9 +879,13 @@ func DefaultPacketHandler(ctx context.Context, ps *PacketStream) {
 	defer pc.Close()
 
 	go func() {
+		// 上行方向一旦结束，整条关联就结束：关掉 ps 把外层从 ReadFrom 里唤醒。
+		// 少了这一句就是上面说的"半死"。
+		defer ps.Close()
+		defer pc.Close()
 		buf := make([]byte, 64*1024)
 		for {
-			pc.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			pc.SetReadDeadline(time.Now().Add(idle))
 			n, addr, err := pc.ReadFrom(buf)
 			if err != nil {
 				return
@@ -882,5 +907,7 @@ func DefaultPacketHandler(ctx context.Context, ps *PacketStream) {
 		if _, err := pc.WriteTo(d.Data, ua); err != nil {
 			return
 		}
+		// 下行有流量 = 这条关联还活着，把上行那边的空闲计时顶回去。
+		pc.SetReadDeadline(time.Now().Add(idle))
 	}
 }

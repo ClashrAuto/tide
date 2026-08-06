@@ -37,6 +37,14 @@ const (
 
 	DefaultMaxStreams = 1024
 
+	// DefaultUDPTimeout 是一条 UDP 关联多久没有任何方向的流量就被回收。
+	//
+	// 5 分钟不是拍脑袋：RFC 4787 REQ-5 规定 NAT 的 UDP 映射定时器 **MUST NOT**
+	// 短于 2 分钟，并 RECOMMENDED 默认 5 分钟以上；mihomo 的 sing 系入站用的
+	// 也正是 5 分钟。定短了会打断长命 UDP 会话（游戏、静默期长的 QUIC），
+	// 而那种失败同样是静默的——只表现为"过一会儿就断"。
+	DefaultUDPTimeout = 5 * time.Minute
+
 	// 重连退避。上限 5s 而不是更大：0-RTT 让每次尝试只花一个 RTT，
 	// 重试便宜，就该退避得保守一点，别让恢复时间被退避本身拖长。
 	reconnectBackoffMin = 100 * time.Millisecond
@@ -193,6 +201,8 @@ type ServerConfig struct {
 	StreamWindow uint64
 	// MaxStreams 单会话并发流上限。
 	MaxStreams int
+	// UDPTimeout 覆盖 DefaultUDPTimeout：UDP 关联的空闲回收期。
+	UDPTimeout time.Duration
 
 	// Congestion 同 ClientConfig.Congestion。
 	Congestion string
@@ -243,6 +253,13 @@ func (c *ServerConfig) maxStreams() int {
 		return c.MaxStreams
 	}
 	return DefaultMaxStreams
+}
+
+func (c *ServerConfig) udpTimeout() time.Duration {
+	if c.UDPTimeout > 0 {
+		return c.UDPTimeout
+	}
+	return DefaultUDPTimeout
 }
 
 func (c *ServerConfig) ticketCount() uint16 {

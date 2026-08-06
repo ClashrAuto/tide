@@ -2709,6 +2709,147 @@ func TestOpenPacketHonoursStreamLimit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// UDP 关联的寿命
+// ---------------------------------------------------------------------------
+
+// serverStreams 数服务端此刻还挂着几条流。
+func serverStreams(t *testing.T, srv *Server) int {
+	t.Helper()
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	n := 0
+	for _, ss := range srv.sessions {
+		n += ss.sess.activeStreams()
+	}
+	return n
+}
+
+// 关掉一条 UDP 关联，服务端那半边必须跟着消失。
+//
+// ★ 这是**每一次正常关闭**都会踩到的泄漏，不是什么边角情况。
+// 关联的对端只收到 STREAM_FIN，而 onFin 只置了个 gotFin 标志——
+// PacketStream.ReadFrom 根本不看它，于是服务端的 DefaultPacketHandler
+// 永远堵在 ReadFrom 上，连同它的 UDP socket 和那条流的计数一起留着。
+// TCP 流没这个问题：它的 handler 走 io.Copy，读到 EOF 就 Close 了。
+//
+// 后果是累积的：一条长命会话每做一次 DNS 查询就漏一条，攒够 1024 条之后
+// **连 TCP 流都开不出来了**（流数上限是共用的），而现象只是"用着用着就连不上"。
+// SOCKS5 的实现踩过一模一样的坑——某家的事故复盘里 node_sockstat_UDP_inuse
+// 爬到两万八，而 CPU/内存/HTTP 健康检查全是绿的。
+//
+// 规范上这件事早有定论：RFC 1928 说 UDP 关联在承载 ASSOCIATE 请求的那条 TCP
+// 连接终止时终止。TIDE 里关联本来就是一条流，那就该是"流结束 = 关联结束"。
+func TestClosingUDPAssociationReleasesTheServerSide(t *testing.T) {
+	h := newHarness(t, nil)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	ctx := context.Background()
+	base := serverStreams(t, h.srv)
+	const n = 6
+	for i := 0; i < n; i++ {
+		ps, err := h.client.DialPacket(ctx, pc.LocalAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 真的搬一个数据报过去，确保服务端那半边确实建起来了——
+		// 否则"没泄漏"可能只是因为压根没建。
+		ps.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for try := 0; try < 5; try++ {
+			ps.WriteTo([]byte("ping"), pc.LocalAddr().String())
+			if _, err := ps.ReadFrom(); err == nil {
+				break
+			}
+		}
+		ps.Close()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if serverStreams(t, h.srv) <= base {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("关掉 %d 条 UDP 关联之后服务端还挂着 %d 条流（起始 %d）—— "+
+		"每次正常关闭都漏一条，攒满流数上限后连 TCP 都开不出来",
+		n, serverStreams(t, h.srv), base)
+}
+
+// 对端一声不吭地消失时，靠的是空闲超时。
+//
+// 光有"流结束 = 关联结束"不够：客户端崩了、路径断了、或者干脆是个恶意实现，
+// FIN 永远不会来。上面那家 SOCKS5 的复盘里写得很清楚——他们同时依赖
+// "TCP 连接关闭"和"空闲超时"两条，而两条都没配好，于是端口耗尽。
+// 两条各挡一类，缺一不可。
+//
+// 超时值照 RFC 4787 REQ-5：NAT 的 UDP 映射定时器 MUST NOT 短于 2 分钟，
+// RECOMMENDED 5 分钟以上（mihomo 的 sing 系入站用的正是 5 分钟）。
+func TestIdleUDPAssociationIsReclaimed(t *testing.T) {
+	const idle = 600 * time.Millisecond
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) { sc.UDPTimeout = idle })
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	ctx := context.Background()
+	base := serverStreams(t, h.srv)
+	ps, err := h.client.DialPacket(ctx, pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+	ps.SetReadDeadline(time.Now().Add(5 * time.Second))
+	ok := false
+	for try := 0; try < 5; try++ {
+		ps.WriteTo([]byte("ping"), pc.LocalAddr().String())
+		if _, err := ps.ReadFrom(); err == nil {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		t.Fatal("关联建不起来，后面的断言无从谈起")
+	}
+
+	// 静默久于空闲期。
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if serverStreams(t, h.srv) <= base {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("空闲 %v 之后服务端仍挂着 %d 条流（起始 %d）—— "+
+		"对端不发 FIN 时关联永远收不回来", idle, serverStreams(t, h.srv), base)
+}
+
+// ---------------------------------------------------------------------------
 // 读协程绝不能阻塞在写上
 // ---------------------------------------------------------------------------
 

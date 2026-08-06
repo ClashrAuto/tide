@@ -586,6 +586,7 @@ func (st *Stream) onFin(finOff uint64) {
 	}
 	st.rcond.Broadcast()
 	st.rmu.Unlock()
+	st.endAssoc()
 	st.forceAck()
 }
 
@@ -601,6 +602,27 @@ func (st *Stream) fail(err error) {
 	st.rcond.Broadcast()
 	st.rmu.Unlock()
 	st.failWrite(err)
+	st.endAssoc()
+}
+
+// endAssoc 结束这条流承载的 UDP 关联（如果它是一条关联的话）。
+//
+// ★ RFC 1928 早就把这件事定死了：UDP 关联在承载 ASSOCIATE 请求的那条 TCP 连接
+// 终止时终止。TIDE 里关联本来就**是**一条流，那就该是"流结束 = 关联结束"。
+//
+// 少了这一步，对端关掉关联时本端只收到一个 STREAM_FIN，而 onFin 从前只置了个
+// gotFin 标志——PacketStream.ReadFrom 根本不看它。于是 DefaultPacketHandler
+// 永远堵在 ReadFrom 上，连同它的 UDP socket 和那条流的计数一起留着。
+// TCP 流没这个问题只是因为它的 handler 走 io.Copy，读到 EOF 自己就 Close 了；
+// UDP 这条路上根本没有 EOF 这个概念。
+//
+// 后果是累积的，而且现象与原因毫无关联：一条长命会话每做一次 DNS 查询漏一条，
+// 攒够并发流上限之后**连 TCP 流都开不出来**（上限是共用的），
+// 用户看到的只是"用着用着就连不上了"。
+func (st *Stream) endAssoc() {
+	if st.pkt != nil {
+		st.pkt.closeQueue()
+	}
 }
 
 func (st *Stream) failWrite(err error) {
