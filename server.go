@@ -385,14 +385,26 @@ const (
 )
 
 func (s *Server) handleHello(t *teeConn, f Frame, cb [cbHashLen]byte) (*path, *Session, error) {
+	// ★ 版本必须在 parseHello **之前**查。
+	//
+	// 版本字节存在的全部意义是让"线格式变了"这件事能被明确地认出来。
+	// 而 parseHello 的第一件事是按**当前版本**的 kemShareLen 校验长度——
+	// 换句话说，一个旧版本客户端会先在长度上被否掉，返回 ErrProtocol，
+	// 版本字节根本没被看过一眼。运维看到的是"协议错误"，
+	// 而真相是"这两端版本不一样"，两者的处置完全不同。
+	//
+	// 版本字节在 payload[0]，不需要任何解析就能读。
+	if len(f.Payload) < 1 {
+		return nil, nil, ErrProtocol
+	}
+	if f.Payload[0] != ProtocolVersion {
+		// 版本不支持 MUST 走失败关闭，MUST NOT 回版本错误——
+		// 任何区别性响应都是可探测的指纹（spec §9）。ErrVersion 只进本端日志。
+		return nil, nil, ErrVersion
+	}
 	h, ok := parseHello(f.Payload)
 	if !ok {
 		return nil, nil, ErrProtocol
-	}
-	// 版本不支持 MUST 走失败关闭，MUST NOT 回版本错误——
-	// 任何区别性响应都是可探测的指纹（spec §9）。
-	if h.version != ProtocolVersion {
-		return nil, nil, ErrVersion
 	}
 	ikm, err := decapsulate(s.cfg.PrivateKey, h.kemShare)
 	if err != nil {

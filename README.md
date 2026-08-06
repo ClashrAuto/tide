@@ -2,7 +2,7 @@
 
 **T**ransport-**I**ndependent **D**ata **E**nvelope —— Coast 自研的代理协议。
 
-> **状态：draft-01，有可用实现，规范未冻结。**
+> **状态：draft-02，有可用实现，规范未冻结。**
 > 三期机制全部落地并在实网（树莓派 5 ↔ x86，`netem` 制造损伤）上验过。
 > 仍不建议第三方据此实现服务端——线格式可能随实测继续调整。
 
@@ -31,7 +31,7 @@ tide/
 ├── go.mod                  # 独立 module，供 clash fork 引用
 ├── docs/
 │   ├── design.md           # 设计动机与取舍论证（先读这个）
-│   └── spec.md             # 线格式规范（规范性文本，draft-01）
+│   └── spec.md             # 线格式规范（规范性文本，draft-02）
 ├── cmd/tide-selftest/      # 自检 + 实网波动压测工具
 ├── varint.go frame.go record.go        # 线格式
 ├── crypto.go handshake.go ticket.go    # 混合后量子握手 + 单次票据
@@ -116,7 +116,7 @@ spec §12 的八个条目**全部定稿**。最后一项 §12.6（QUIC 面的主
 不是沉默、也不是模拟；TIDE 的流与 UDP 数据报都跑在 h3 之上（RFC 9297）。
 h3 模式默认关闭，用 `H3: true` 打开。
 
-## 实测（详见 spec §11.2）
+## 实测（详见 spec §11.3）
 
 树莓派 5 ↔ x86，`netem` 只损伤目的端口 8443（TCP/UDP 同时）：
 

@@ -18,17 +18,20 @@ import (
 	"golang.org/x/sys/cpu"
 )
 
-// 版本字节。draft-01 相对 spec.md 的 draft-00 有三处线格式变化，见 spec.md §11 变更记录：
-// STREAM_DATA 带绝对 offset、新增 STREAM_ACK/TICKET_REQUEST、填充长度改为尾部 u16。
+// 版本字节。**线格式一变就必须改这里**——它是"两端版本不一样"唯一能被明确认出来的
+// 途径。draft-02 相对 draft-01 有三处不兼容变化（kem_share、ACCEPT.srv_eph、zero_seal.eph），
+// 见 spec.md §11.3。
+//
+// ⚠️ HKDF 的 label 跟着一起改：不同版本的握手即使被部分回移，也不该派生出同一把密钥。
 const (
-	ProtocolVersion     uint8 = 0x01
-	labelHandshake            = "tide/draft-01 handshake"
-	labelSession              = "tide/draft-01 session"
-	labelC2S                  = "tide/draft-01 c2s"
-	labelS2C                  = "tide/draft-01 s2c"
-	labelPath                 = "tide/draft-01 path"
-	labelTicket               = "tide/draft-01 ticket"
-	labelZeroRTT              = "tide/draft-01 0rtt"
+	ProtocolVersion     uint8 = 0x02
+	labelHandshake            = "tide/draft-02 handshake"
+	labelSession              = "tide/draft-02 session"
+	labelC2S                  = "tide/draft-02 c2s"
+	labelS2C                  = "tide/draft-02 s2c"
+	labelPath                 = "tide/draft-02 path"
+	labelTicket               = "tide/draft-02 ticket"
+	labelZeroRTT              = "tide/draft-02 0rtt"
 	ChannelBindingLabel       = "tide-channel-binding"
 )
 
@@ -421,7 +424,7 @@ func ticketKey(seed []byte, id uint64) ([]byte, error) {
 // 表现为 A 的流量被记在 B 头上、或者 A 能用 B 的票据。
 // 用 SHA-256 折叠保证任意两个不同口令映射到同一个 id 的概率可忽略。
 func UserIDFromPassword(password string) [16]byte {
-	sum := sha256.Sum256([]byte("tide/draft-01 user\x00" + password))
+	sum := sha256.Sum256([]byte("tide/draft-02 user\x00" + password))
 	var id [16]byte
 	copy(id[:], sum[:16])
 	return id

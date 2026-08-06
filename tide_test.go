@@ -623,6 +623,45 @@ func (c *captureConn) ExportKeyingMaterial(label string, ctx []byte, n int) ([]b
 	return cs.ExportKeyingMaterial(label, ctx, n)
 }
 
+// 版本不匹配必须被**当作版本问题**认出来，而不是掉进"协议错误"里。
+//
+// ★ 版本字节存在的全部意义，就是让"两端版本不一样"这件事能被明确识别。
+// 但 handleHello 原先是先 parseHello 再查版本，而 parseHello 的第一件事是按
+// **当前版本**的 kemShareLen 校验长度——于是一个旧版本客户端总是先在长度上被否掉，
+// 返回 ErrProtocol，版本字节根本没被看过一眼。
+//
+// 这不是纯洁癖：draft-01 → draft-02 改了三处线格式（kem_share 1120→2304、
+// ACCEPT.srv_eph 32→1120、zero_seal.eph 32→1216），升级期两端版本不一致是常态。
+// 运维看到"协议错误"和看到"版本不匹配"，要做的事完全不同。
+func TestVersionMismatchIsReportedAsVersionError(t *testing.T) {
+	h := newHarness(t, nil)
+
+	// 一个"旧版本"的 HELLO：版本字节是 0x01，且 kem_share 用的是旧长度。
+	oldKemShare := 32 + 1088 // draft-01 的 kemShareLen
+	body := make([]byte, 1+oldKemShare+32+2+authPlainLen+16)
+	if _, err := rand.Read(body); err != nil {
+		t.Fatal(err)
+	}
+	body[0] = 0x01 // draft-01
+	sl := authPlainLen + 16
+	body[1+oldKemShare+32] = byte(sl >> 8)
+	body[1+oldKemShare+33] = byte(sl)
+
+	_, _, err := h.srv.handleHello(&teeConn{Conn: &nopConn{}}, Frame{Type: FrameHello, Payload: body}, [cbHashLen]byte{})
+	if !errors.Is(err, ErrVersion) {
+		t.Fatalf("旧版本的 HELLO 报的是 %v，不是 ErrVersion —— "+
+			"版本字节没能起作用：它在 parseHello 的长度校验之后才被查，"+
+			"而旧客户端总是先在长度上出局。升级期两端版本不一致是常态，"+
+			"运维看到“协议错误”和看到“版本不匹配”要做的事完全不同", err)
+	}
+
+	// 反过来：当前版本但内容是垃圾，必须仍然是 ErrProtocol，别把两类混为一谈。
+	body[0] = ProtocolVersion
+	if _, _, err := h.srv.handleHello(&teeConn{Conn: &nopConn{}}, Frame{Type: FrameHello, Payload: body}, [cbHashLen]byte{}); errors.Is(err, ErrVersion) {
+		t.Fatal("当前版本的畸形 HELLO 被报成了版本错误")
+	}
+}
+
 func TestTicketWalletFallsBackTo1RTT(t *testing.T) {
 	w := newTicketWallet()
 	now := time.Now()
