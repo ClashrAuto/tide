@@ -17,8 +17,19 @@ var (
 	ErrVersion         = errors.New("tide: unsupported version")
 	ErrNoPath          = errors.New("tide: no usable path")
 	ErrSessionGone     = errors.New("tide: session grace period expired")
-	ErrFlowControl     = errors.New("tide: peer exceeded flow-control window")
-	ErrTooManyStreams  = errors.New("tide: stream limit reached")
+
+	// ErrSessionRefused：外层 TLS 握完了，握手帧也发出去了，服务端却没有回 ACCEPT
+	// 就把连接关了（§7 失败关闭：字节被原样转给掩护源站）。
+	//
+	// ★ 它和"网络不通"必须分开对待。走到这一步说明**服务端是可达的**——
+	// TLS 都握完了。所以拿着同一个 session_id 一遍遍重连是永远不会成功的：
+	// 服务端重启之后根本不认识这个会话。而 recoverLoop 原先对所有错误一视同仁，
+	// 会一直重试到 grace 用完（默认 120s），这期间用户的每一条连接都失败。
+	// 2026-08-07 树莓派实测：服务端重启后要连续失败 24 次才恢复，
+	// 而那 24 次几乎全是在等 grace 到期。
+	ErrSessionRefused = errors.New("tide: server refused the session (fail-closed)")
+	ErrFlowControl    = errors.New("tide: peer exceeded flow-control window")
+	ErrTooManyStreams = errors.New("tide: stream limit reached")
 )
 
 // StreamError 是 STREAM_RST 携带的错误码。

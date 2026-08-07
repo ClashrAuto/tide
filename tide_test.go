@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"math/big"
@@ -3847,5 +3848,64 @@ func TestUDPOverH3Datagrams(t *testing.T) {
 		t.Fatalf("the h3 path's stream bytes grew by %d during a UDP-only exchange — "+
 			"the datagrams went over a reliable stream instead of RFC 9297 HTTP Datagrams, "+
 			"which silently gives UDP retransmission it must not have (spec §9.1)", grew)
+	}
+}
+
+// 服务端明确拒绝会话时，recoverLoop MUST 立刻放弃，不能耗到 grace 到期。
+//
+// ★ 复现的是 2026-08-07 用户实测的后半段。第一段（0-RTT 票据整包作废）修好之后，
+// 服务端重启后仍要连续失败 24 次才恢复——因为客户端还抱着旧 session_id 不放：
+// 每次重拨都带 flagJoinSession，而重启后的服务端根本不认识这个会话，
+// 于是被失败关闭（§7）转给掩护源站，客户端读不到 ACCEPT。
+// recoverLoop 原先对所有错误一视同仁，一直重试到 grace 用完（默认 120s），
+// 这期间用户的每一条连接都在失败。
+//
+// 关键区分：TLS 都握完了才没等到 ACCEPT，说明**服务端可达但不认识我们**，
+// 重试同一个 session_id 永远不会成功；而网络类错误必须照旧退避重试，
+// 那才是 grace 存在的理由（切网/漫游）。
+// 树莓派实测：加上这条之后，服务端 healthy 之后的失败次数从 24 降到 0。
+func TestRecoverLoopGivesUpWhenServerRefusesSession(t *testing.T) {
+	s := newSession([16]byte{1}, true, DefaultStreamWindow, 30*time.Second, time.Second, 16)
+	var calls atomic.Int32
+	s.redial = func(ctx context.Context, sess *Session) (*path, error) {
+		calls.Add(1)
+		return nil, fmt.Errorf("%w: EOF", ErrSessionRefused)
+	}
+
+	done := make(chan struct{})
+	go func() { s.recoverLoop(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("服务端已经明确拒绝，recoverLoop 却还在重试（已拨 %d 次）——"+
+			"它会一直耗到 grace 到期，这期间用户的每一条连接都失败", calls.Load())
+	}
+	select {
+	case <-s.closed:
+	default:
+		t.Fatal("recoverLoop 退出了却没把会话收掉 —— 下一次 Client.Session() 会拿到" +
+			"这个已经被服务端遗忘的会话，继续用同一个 session_id 失败下去")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("被拒之后又重试了 %d 次；确定无望的重试一次都不该有", n-1)
+	}
+}
+
+// 反过来：网络类错误 MUST 继续退避重试，不能被上面那条误伤。
+// grace 的全部价值就在这里——切网/漫游时保住会话，用户的 TCP 连接一条不断。
+func TestRecoverLoopKeepsRetryingOnNetworkError(t *testing.T) {
+	s := newSession([16]byte{2}, true, DefaultStreamWindow, 30*time.Second, time.Second, 16)
+	var calls atomic.Int32
+	s.redial = func(ctx context.Context, sess *Session) (*path, error) {
+		calls.Add(1)
+		return nil, errors.New("dial tcp: i/o timeout")
+	}
+	go s.recoverLoop()
+	time.Sleep(1500 * time.Millisecond)
+	s.closeWith(ErrClosed)
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("网络错误只重试了 %d 次 —— 被 ErrSessionRefused 那条误伤了，"+
+			"切网/漫游时会话会被过早收掉，用户的连接全断", n)
 	}
 }

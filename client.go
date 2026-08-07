@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -546,10 +547,14 @@ func zeroRTTHandshakeKey(ticketKey, cb []byte) ([]byte, error) {
 func (c *Client) readAccept(s *Session, conn net.Conn, kHS, ad []byte, pathID uint32, kind string, eph *ephSecrets) (*path, error) {
 	f, err := readFrameExact(conn)
 	if err != nil {
-		return nil, err
+		// 外层 TLS 已经握完、握手帧也发出去了，到这里读不到 ACCEPT，
+		// 说明服务端把我们**失败关闭**转给掩护源站了（§7），不是网络不通。
+		// 标成 ErrSessionRefused，recoverLoop 据此立刻放弃这个会话而不是
+		// 拿同一个 session_id 重试到 grace 到期（见 errors.go 的说明）。
+		return nil, fmt.Errorf("%w: %v", ErrSessionRefused, err)
 	}
 	if f.Type != FrameAccept {
-		return nil, ErrProtocol
+		return nil, ErrSessionRefused
 	}
 	plain, err := openFixed(kHS, acceptNonce, f.Payload, ad, false)
 	if err != nil {

@@ -564,6 +564,16 @@ func (s *Session) recoverLoop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		p, err := s.redial(ctx, s)
 		cancel()
+		// ★ 服务端明确拒绝（TLS 握完了却不回 ACCEPT）≠ 网络不通。
+		// 前者说明服务端可达但已经不认识这个 session_id（多半是它重启过），
+		// 拿着同一个 id 重试到 grace 到期是纯粹的浪费——而这段时间里
+		// 用户的每一条连接都在失败。立刻收掉这个会话，
+		// 下一次 Client.Session() 会建一个全新的（走 1-RTT），一次就好。
+		// 网络类错误仍然照常退避重试：那正是 grace 存在的理由（切网/漫游）。
+		if errors.Is(err, ErrSessionRefused) {
+			s.closeWith(ErrSessionGone)
+			return
+		}
 		if err == nil && p != nil {
 			if !s.addPath(p) {
 				// 会话已经挂满：这条重连的路径被顶回来了，别当成"恢复成功"，
