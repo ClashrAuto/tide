@@ -1262,3 +1262,12 @@ func (d *deathLog) snapshot() []string {
 	}
 	return out
 }
+
+// pathlessFor 返回"这条会话已经一条路径都没有"持续了多久。0 = 当前有路径。
+func (s *Session) pathlessFor() time.Duration {
+	t := s.noPathSince.Load()
+	if t == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, t))
+}

@@ -96,8 +96,23 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 		case <-s.closed:
 			c.sess = nil
 		default:
-			c.mu.Unlock()
-			return s, nil
+			// ★ 宽限期是给**已有的流**用的，不该让**新连接**跟着一起等。
+			//
+			// 会话一条路径都没有时，recoverLoop 会带着同一个 session_id 重拨，
+			// 最长可以拖满整个 grace（默认 120s）。这期间把这条会话交给新连接，
+			// 等于让每一个新请求都排进一个当下根本发不出字节的会话里。
+			// 树莓派实测：服务端重启后约三次里有一次要 **123 秒**才恢复，
+			// 而 123s ≈ grace；诊断输出里 `paths established` 自始至终没涨过，
+			// 也就是说那 120 秒里一条新路径都没建起来，新连接却一直在等它。
+			//
+			// 已有的流仍然享受完整宽限（它们的数据还在重传缓冲里，
+			// 一旦重连上就能续上，这正是 grace 存在的理由）；
+			// 新连接则另起一条会话，代价只是一次握手（实测约 500ms）。
+			if s.pathlessFor() < newSessionAfterPathless {
+				c.mu.Unlock()
+				return s, nil
+			}
+			c.sess = nil
 		}
 	}
 	c.mu.Unlock()

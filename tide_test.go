@@ -4046,3 +4046,33 @@ func TestInflightCapFollowsBDP(t *testing.T) {
 		t.Fatalf("还没有交付速率样本就擅自收紧到 %d —— 冷启动会被无端限速", c)
 	}
 }
+
+// 宽限期是给**已有的流**用的，不该把**新连接**一起罚站。
+//
+// ★ 复现的是树莓派实测那个"三次里有一次要 123 秒"的场景：服务端重启后所有路径
+// 死掉，recoverLoop 带着旧 session_id 重拨，最长能拖满整个 grace（默认 120s）。
+// 这期间 Client.Session() 若仍把这条会话交给新连接，每个新请求都排在一条
+// 当下根本发不出字节的会话上——123s ≈ grace 就是这么来的，
+// 而诊断输出里 paths established 自始至终没涨过。
+func TestPathlessSessionIsNotHandedToNewConnections(t *testing.T) {
+	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+
+	// 刚失去路径：还在容忍窗口内，应当继续复用（短暂抖动不该churn会话）。
+	s.noPathSince.Store(time.Now().Add(-newSessionAfterPathless / 2).UnixNano())
+	if d := s.pathlessFor(); d >= newSessionAfterPathless {
+		t.Fatalf("pathlessFor=%v，夹具没设对", d)
+	}
+
+	// 失去路径已久：新连接不该再排进这条会话。
+	s.noPathSince.Store(time.Now().Add(-2 * newSessionAfterPathless).UnixNano())
+	if d := s.pathlessFor(); d < newSessionAfterPathless {
+		t.Fatalf("会话已经 %v 没有任何路径，却仍在容忍窗口内——"+
+			"新连接会一直等到 grace 结束（实测 123 秒）", d)
+	}
+
+	// 有路径时必须报 0，别把正常会话误判成要换。
+	s.noPathSince.Store(0)
+	if d := s.pathlessFor(); d != 0 {
+		t.Fatalf("会话有路径时 pathlessFor 报了 %v —— 会无端把健康会话换掉", d)
+	}
+}

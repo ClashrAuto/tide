@@ -53,6 +53,19 @@ const (
 	// 而那种失败同样是静默的——只表现为"过一会儿就断"。
 	DefaultUDPTimeout = 5 * time.Minute
 
+	// newSessionAfterPathless：会话失去全部路径超过这么久之后，**新连接**改建新会话，
+	// 不再排队等这条正在宽限期里重连的会话。已有的流仍然享受完整 grace——
+	// 它们的未确认字节还在重传缓冲里，重连上就能续上，那正是 grace 的用途。
+	//
+	// ★ 没有这一条，grace 会把**新连接**一起罚站。树莓派实测：服务端重启后约每三次
+	// 有一次要 123 秒才恢复，而 123s ≈ DefaultSessionGrace；诊断输出里
+	// `paths established` 自始至终没涨过——那 120 秒里一条新路径都没建起来，
+	// 新请求却全都排在这条发不出字节的会话上等着。
+	//
+	// 取 3s：路径判死本身就要 ~8s（静默计时器），能走到这里说明是真的断了；
+	// 再多等只是让新请求陪着耗到 grace 结束。代价是一次握手（实测约 500ms）。
+	newSessionAfterPathless = 3 * time.Second
+
 	// 重连退避。上限 5s 而不是更大：0-RTT 让每次尝试只花一个 RTT，
 	// 重试便宜，就该退避得保守一点，别让恢复时间被退避本身拖长。
 	reconnectBackoffMin = 100 * time.Millisecond
