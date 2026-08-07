@@ -370,7 +370,9 @@ func (c *Client) dialH3Path(ctx context.Context, s *Session, join bool) (*path, 
 	//
 	// ⚠️ 两者不能混用：NewClientConn 会自己开一条 h3 控制流并发 SETTINGS，
 	// 同一条 QUIC 连接上再让 RoundTrip 开第二条，就是两条控制流 = h3 协议错误。
-	captured, err := quic.DialAddr(ctx, c.quicAddr(), quicClientTLS(c.tlsCfg), h3QUICConfig())
+	// 与原生 QUIC 路径同样要走 ListenPacket 钩子：裸套接字会被自己的 TUN 捕获成环路，
+	// 见 ClientConfig.ListenPacket 的说明。
+	captured, err := c.dialQUIC(ctx, c.quicAddr(), quicClientTLS(c.tlsCfg), h3QUICConfig())
 	if err != nil {
 		return nil, err
 	}

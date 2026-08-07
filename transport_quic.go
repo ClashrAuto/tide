@@ -118,11 +118,38 @@ func quicConfig() *quic.Config {
 	}
 }
 
+// dialQUIC 建一条 QUIC 连接。有 ListenPacket 钩子就用钩子给的套接字，
+// 否则回退到 quic.DialAddr。
+//
+// ★ 走钩子这条路不是可选的优化：裸 DialAddr 开出来的 UDP 套接字没有 clash 的
+// 接口绑定与"内核自身流量"标记，在开了 TUN 的机器上会被**自己的 TUN** 捕获、
+// 经嗅探器把目的地改写成 SNI（tide.local）后解析失败，形成环路。
+// 详见 ClientConfig.ListenPacket 的说明。
+func (c *Client) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.Config, qc *quic.Config) (*quic.Conn, error) {
+	if c.cfg.ListenPacket == nil {
+		return quic.DialAddr(ctx, addr, tlsCfg, qc)
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	pc, err := c.cfg.ListenPacket(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := quic.Dial(ctx, pc, ua, tlsCfg, qc)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
 // dialQUICPath 拨一条 QUIC 路径。
 func (c *Client) dialQUICPath(ctx context.Context, s *Session, join bool) (*path, error) {
 	addr := c.quicAddr()
 	base := c.tlsCfg
-	conn, err := quic.DialAddr(ctx, addr, quicClientTLS(base), quicConfig())
+	conn, err := c.dialQUIC(ctx, addr, quicClientTLS(base), quicConfig())
 	if err != nil {
 		return nil, err
 	}

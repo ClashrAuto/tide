@@ -127,6 +127,22 @@ type ClientConfig struct {
 	// Dial 允许注入自定义拨号（clash 侧用来走 dialer 的接口绑定/DNS）。
 	Dial DialFunc
 
+	// ListenPacket 允许注入 QUIC/h3 路径用的 UDP 套接字。
+	//
+	// ★ 不给这个钩子的话，QUIC 路径会用 quic.DialAddr 自己开一个**裸 UDP 套接字**，
+	// 于是它绕过了 Dial 所代表的一切：接口绑定、fwmark、以及最要命的——
+	// "这是内核自己发出去的流量"这个标记。
+	//
+	// 后果在开了 TUN 的机器上是致命的：客户端自己发往服务端的 QUIC 包被**自己的 TUN**
+	// 捕获，绕回路由器，嗅探器再从 QUIC ClientHello 里读出 SNI（比如 tide.local）
+	// 把目的地改写成那个名字，然后解析失败。日志里就是没完没了的
+	//   [UDP] dial ... --> tide.local:8443 error: can't resolve ip
+	// 这是一个把自己绕进去的环路，且 TCP 路径完全正常，所以特别难往这上面想。
+	// 2026-08-07 用户实测截图即此现象（Coast 1.0.974，增强/TUN 开启）。
+	//
+	// 为空时回退到 quic.DialAddr（库单独使用、没有 TUN 的场景照常工作）。
+	ListenPacket ListenPacketFunc
+
 	// Congestion 指定 TCP 路径的拥塞控制算法（Linux 专有，如 "bbr"、"cubic"）。
 	// 空 = **不动系统默认**。填 "-" 同义。
 	//
@@ -150,6 +166,10 @@ func (c *ClientConfig) congestion() string {
 
 // DialFunc 与 net.Dialer.DialContext 同形。
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// ListenPacketFunc 交出一个用于 QUIC/h3 的 UDP 套接字。addr 是即将拨的对端地址，
+// 供实现方按目的地选网卡/加标记。
+type ListenPacketFunc func(ctx context.Context, addr string) (net.PacketConn, error)
 
 func (c *ClientConfig) validate() error {
 	if c.Server == "" {
