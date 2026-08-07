@@ -56,6 +56,13 @@ services:
       TIDE_CERT_KEY: "/data/tls.key"
       # 客户端 SNI 要与证书一致。换成真证书时，把它改成你的真实域名。
       TIDE_CERT_HOST: "${TIDE_SNI:-tide.local}"
+      # ★ 通告的 ALPN 必须是**掩护源站真会说的协议**。
+      #   失败关闭时应答探测方的是掩护源站，所以谈成了 h2 而掩护源站只会 HTTP/1.1
+      #   的话，探测方会拿到"协商了 h2 却回 HTTP/1.1 400"——真 h2 服务端不会这样，
+      #   这个特征比"不通告 ALPN"强得多，而且功能上毫无症状。
+      #   本编排的掩护源站是 nginx 默认站点（只会 HTTP/1.1），所以默认就只报 http/1.1。
+      #   换成开了 h2c 的掩护源站（nginx: listen 80 http2;）才改成 h2,http/1.1。
+      TIDE_COVER_ALPN: "${TIDE_COVER_ALPN:-http/1.1}"
       # 只用来把示例配置打得更完整，不影响运行。
       TIDE_ADVERTISE: "${TIDE_ADVERTISE:-}"
       # ★ 必须把对外端口再传一遍。容器内永远监听 8443（上面 TIDE_LISTEN 写死的），

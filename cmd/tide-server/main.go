@@ -38,6 +38,7 @@ func main() {
 		h3         = flag.Bool("h3", env("TIDE_H3", "") != "", "serve the QUIC accelerator over HTTP/3 (spec §12.6); MUST match the client's h3 setting")
 		keyFile    = flag.String("key-file", env("TIDE_KEY_FILE", "/data/tide.key"), "static key file (auto-generated if missing)")
 		cover      = flag.String("cover", env("TIDE_COVER", ""), "cover origin host:port (required)")
+		coverALPN  = flag.String("cover-alpn", env("TIDE_COVER_ALPN", "http/1.1"), "ALPN list to advertise, comma-separated; MUST be protocols the cover origin can actually serve")
 		certFile   = flag.String("cert", env("TIDE_CERT", "/data/tls.crt"), "outer TLS certificate (PEM)")
 		keyPEMFile = flag.String("cert-key", env("TIDE_CERT_KEY", "/data/tls.key"), "outer TLS private key (PEM)")
 		certHost   = flag.String("cert-host", env("TIDE_CERT_HOST", "tide.local"), "CN/SAN for the auto-generated self-signed certificate")
@@ -107,7 +108,16 @@ func main() {
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS13,
 			// 一个只谈 TLS 却不通告任何 ALPN 的服务端本身就是特征。
-			NextProtos: []string{"h2", "http/1.1"},
+			//
+			// ★ 但通告什么，取决于**掩护源站能服务什么**，不取决于什么好看。
+			// 失败关闭时应答探测方的是掩护源站（§7），所以 ALPN 谈成了 h2、
+			// 而掩护源站只会 HTTP/1.1 的话，探测方会拿到一个
+			// “协商了 h2，却回了一句 HTTP/1.1 400”的组合——真 h2 服务端永远不会这样。
+			// 这比“不通告 ALPN”特征强得多。默认因此只报 http/1.1：
+			// 绝大多数掩护源站（nginx 默认站点、静态页）就只会这个，
+			// 而一个只支持 http/1.1 的 HTTPS 站点毫不稀奇。
+			// 掩护源站真的开了 h2c 时，用 -cover-alpn h2,http/1.1 打开。
+			NextProtos: parseALPN(*coverALPN),
 		},
 		CoverAddr:    *cover,
 		AllowBare:    *allowBare,
@@ -158,6 +168,7 @@ func main() {
 
 	printBanner(priv, *listen, *quicListen, *h3, *cover, *advertise, *advPort, *certHost, userMap, generated)
 	go warnIfDefaultCover(*cover)
+	go warnIfALPNMismatch(*cover, parseALPN(*coverALPN))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -288,6 +299,79 @@ func advertiseHostPort(advertise, advertisePort, listen string) (host, port stri
 // defaultCoverMarker 是仓库自带那张占位掩护页里的标记。
 // 换掉页面（或反代到真实站点）之后它自然消失，告警随之停止——
 // 也就是说这个检测不需要维护任何哈希常量，页面怎么改都不会误报。
+// parseALPN 把逗号分隔的 ALPN 列表切开。空串等于"不通告"——那本身是个特征，
+// 但既然是显式写空的，就照办，不替运维改主意。
+func parseALPN(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// warnIfALPNMismatch 检查"通告的 ALPN"与"掩护源站真会说的协议"是否一致。
+//
+// ★ 这条不一致是**比不通告 ALPN 更强的特征**，而且完全没有症状：
+// 代理功能一切正常，只有主动探测方看得见。2026-08-07 在真实部署上就是这样发现的——
+// curl 默认提 h2，服务端（当时硬编码通告 h2,http/1.1）欣然选了 h2，
+// 探测方于是发出 HTTP/2 连接前言 "PRI * HTTP/2.0"，而掩护源站 nginx 只会 HTTP/1.1，
+// 回了个 400。真 h2 服务端绝不会"协商了 h2 却用 HTTP/1.1 回话"。
+//
+// Xray 对同一个问题的做法是按协商结果分流到不同后端（其文档明说，
+// 起因正是 nginx 的 h2c 与 http/1.1 无法在同一端口共存）。
+// TIDE 只有一个掩护源站，所以走另一条同样自洽的路：**通告的以掩护源站为准**。
+func warnIfALPNMismatch(cover string, alpn []string) {
+	if cover == "" || cover == "drop" {
+		return
+	}
+	advertisesH2 := false
+	for _, p := range alpn {
+		if p == "h2" {
+			advertisesH2 = true
+		}
+	}
+	if !advertisesH2 {
+		return
+	}
+	if coverSpeaksH2C(cover) {
+		return
+	}
+	fmt.Printf("\n  ⚠️  通告了 ALPN \"h2\"，但掩护源站 %s **不会说 h2c**。\n"+
+		"     这在功能上毫无症状，却是一个很强的主动探测特征：探测方提 h2、\n"+
+		"     服务端选了 h2，接着它发 HTTP/2 连接前言，掩护源站却用 HTTP/1.1 回话\n"+
+		"     （通常是 400）。真正的 h2 服务端不会这样。\n"+
+		"     要么去掉 h2（-cover-alpn http/1.1，默认值），\n"+
+		"     要么让掩护源站真的开 h2c（nginx: listen 80 http2;）。\n\n", cover)
+}
+
+// coverSpeaksH2C 发一次 HTTP/2 连接前言，看掩护源站是按 h2 回（SETTINGS 帧）
+// 还是按 HTTP/1.1 回（"HTTP/1.1 400 ..."）。
+func coverSpeaksH2C(cover string) bool {
+	c, err := net.DialTimeout("tcp", cover, 5*time.Second)
+	if err != nil {
+		// 连不上是另一个问题（§7.2 自己会处理），不在这里把话说死。
+		return true
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	// 前言 + 一个空 SETTINGS 帧（长度 0、类型 0x04、流 0）。
+	preface := append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+		0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00)
+	if _, err := c.Write(preface); err != nil {
+		return true
+	}
+	var head [9]byte
+	if _, err := io.ReadFull(c, head[:]); err != nil {
+		return false
+	}
+	if string(head[:5]) == "HTTP/" {
+		return false // 明摆着的 HTTP/1.x 应答
+	}
+	return head[3] == 0x04 // 帧头第 4 字节是类型；SETTINGS = 0x04
+}
+
 const defaultCoverMarker = "tide-default-cover"
 
 // warnIfDefaultCover 启动时抓一次掩护源站，看它是不是还在用仓库自带的占位页。

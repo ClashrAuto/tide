@@ -1,6 +1,86 @@
 package main
 
-import "testing"
+import (
+	"io"
+	"net"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestParseALPN(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []string
+	}{
+		{"http/1.1", []string{"http/1.1"}},
+		{"h2,http/1.1", []string{"h2", "http/1.1"}},
+		{" h2 , http/1.1 ", []string{"h2", "http/1.1"}},
+		{"", nil},
+	} {
+		if got := parseALPN(c.in); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("parseALPN(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// 通告的 ALPN 必须与掩护源站真会说的协议一致。
+//
+// ★ 不一致时代理功能**完全正常**，只有主动探测方看得见：探测方提 h2、
+// 服务端选 h2，然后它发 HTTP/2 连接前言，掩护源站却用 HTTP/1.1 回话。
+// 真 h2 服务端不会这样。2026-08-07 在真实部署上撞到的就是这个：
+// 硬编码通告 h2,http/1.1，掩护源站是只会 HTTP/1.1 的 nginx，
+// curl 默认提 h2 于是拿到 "PRI * HTTP/2.0" → 400。
+func TestCoverH2CDetection(t *testing.T) {
+	// 只会 HTTP/1.1 的掩护源站：对前言回 400。
+	h1 := mockCover(t, func(c net.Conn) {
+		io.ReadFull(c, make([]byte, 24))
+		c.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
+	})
+	if coverSpeaksH2C(h1) {
+		t.Error("把只会 HTTP/1.1 的掩护源站判成了 h2c —— 于是 h2 不一致的告警不会响，" +
+			"而这个特征在功能上没有任何症状")
+	}
+
+	// 会 h2c 的掩护源站：回一个 SETTINGS 帧。
+	h2 := mockCover(t, func(c net.Conn) {
+		io.ReadFull(c, make([]byte, 24))
+		c.Write([]byte{0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00})
+	})
+	if !coverSpeaksH2C(h2) {
+		t.Error("把真的会 h2c 的掩护源站判成了不会 —— 会对正确配置误报")
+	}
+}
+
+func mockCover(t *testing.T, handle func(net.Conn)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); handle(c) }()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// 默认必须是"只通告 http/1.1"：绝大多数掩护源站就只会这个，
+// 而默认值决定了绝大多数部署的实际形态（CWE-1188）。
+func TestDefaultALPNMatchesTypicalCover(t *testing.T) {
+	if got := parseALPN("http/1.1"); len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("默认 ALPN 解析成了 %v", got)
+	}
+	if strings.Contains("http/1.1", "h2") {
+		t.Fatal("默认值里不该出现 h2")
+	}
+}
 
 // 启动横幅打出来的那段客户端配置，`port:` 一栏必须是**客户端要拨的**端口，
 // 而不是服务端在本地监听的端口。容器里这两个经常不是一回事。
