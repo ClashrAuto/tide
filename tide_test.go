@@ -3488,11 +3488,11 @@ func TestHandleFrameNeverBlocksOnAStuckPath(t *testing.T) {
 	p := &path{id: 7, kind: "quic", pending: make(map[uint64]time.Time), dead: make(chan struct{})}
 	p.sess = s
 	p.wcond = sync.NewCond(&p.wmu)
-	p.conn = stuckConn{}
+	p.conn = newStuckConn(t)
 	p.pad = newPaddingScheduler()
 	p.qmux = &quicMux{
 		path:    p,
-		streams: map[uint64]*qstream{sid: {s: stuckMuxStream{}}},
+		streams: map[uint64]*qstream{sid: {s: newStuckMuxStream(t)}},
 	}
 	s.mu.Lock()
 	s.paths = append(s.paths, p)
@@ -3542,19 +3542,40 @@ func TestHandleFrameNeverBlocksOnAStuckPath(t *testing.T) {
 	}
 }
 
-// stuckMuxStream 是一条写不动的 QUIC 流：Write 永不返回，正如流控窗口满了的样子。
-type stuckMuxStream struct{}
+// stuckMuxStream 是一条写不动的 QUIC 流：Write 挂住不返回，正如流控窗口满了的样子。
+//
+// ★ 必须**可释放**。夹具如果永远挂着，它留下的协程会污染同一进程里后面跑的
+// 泄漏守卫（TestNoGoroutineLeak*）——`go test -count=N` 会在同一个进程里把整套
+// 用例重跑 N 遍，于是第 1 遍留下的僵尸协程会让第 2、3 遍的守卫误报。
+// 用 release 通道，用例结束时 close 掉，夹具协程随即退出。
+type stuckMuxStream struct{ release chan struct{} }
 
-func (stuckMuxStream) Read(p []byte) (int, error)  { select {} }
-func (stuckMuxStream) Write(p []byte) (int, error) { select {} }
-func (stuckMuxStream) Close() error                { return nil }
+func newStuckMuxStream(t *testing.T) stuckMuxStream {
+	s := stuckMuxStream{release: make(chan struct{})}
+	t.Cleanup(func() { close(s.release) })
+	return s
+}
 
-// stuckConn 的 Write 永远不返回：一条已经写不动的路径。
-type stuckConn struct{ net.Conn }
+func (s stuckMuxStream) Read(p []byte) (int, error)  { <-s.release; return 0, io.EOF }
+func (s stuckMuxStream) Write(p []byte) (int, error) { <-s.release; return 0, io.ErrClosedPipe }
+func (s stuckMuxStream) Close() error                { return nil }
+
+// stuckConn 的 Write 挂住不返回：一条已经写不动的路径。同样必须可释放，
+// 理由见 stuckMuxStream 上面那段。
+type stuckConn struct {
+	net.Conn
+	release chan struct{}
+}
+
+func newStuckConn(t *testing.T) stuckConn {
+	c := stuckConn{release: make(chan struct{})}
+	t.Cleanup(func() { close(c.release) })
+	return c
+}
 
 func (stuckConn) Close() error                       { return nil }
-func (stuckConn) Write(p []byte) (int, error)        { select {} }
-func (stuckConn) Read(p []byte) (int, error)         { select {} }
+func (c stuckConn) Write(p []byte) (int, error)      { <-c.release; return 0, io.ErrClosedPipe }
+func (c stuckConn) Read(p []byte) (int, error)       { <-c.release; return 0, io.EOF }
 func (stuckConn) LocalAddr() net.Addr                { return streamAddr("stuck") }
 func (stuckConn) RemoteAddr() net.Addr               { return streamAddr("stuck") }
 func (stuckConn) SetDeadline(t time.Time) error      { return nil }

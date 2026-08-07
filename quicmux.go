@@ -232,16 +232,33 @@ func (m *quicMux) dropStream(q *qstream) {
 }
 
 // closeStream 在 TIDE 流结束时关掉对应的 QUIC 流，别让它泄漏。
+//
+// ★ 这里**绝不能无条件等 q.mu**。调用链是
+// Stream.Close() → Session.removeStream() → 本函数，也就是**应用那句 Close**；
+// 而 q.mu 此刻可能被一个卡在流控里的写者持着（对端不给窗口、链路拥塞、
+// 或对端已经没了）。等下去就是应用的 Close() 永远返回不了，而且毫无报错。
+//
+// Go 官方 x/net/http2 有一模一样的问题（golang/go#48908）：
+// "closing a response body can block indefinitely ... the attempt can block
+// either while acquiring the stream write mutex, or while writing"。
+//
+// 处置：拿得到锁就优雅关（发 FIN，让对端把剩下的读完）；拿不到就说明写者正卡着，
+// 改用 CancelWrite 把它踢出来。此时**本来也发不出**优雅 FIN——没有流控额度，
+// FIN 一样送不到对端。所以这不是降级，是那种情形下唯一能做的事。
 func (m *quicMux) closeStream(sid uint64) {
 	m.mu.Lock()
 	q := m.streams[sid]
 	delete(m.streams, sid)
 	m.mu.Unlock()
-	if q != nil {
-		q.mu.Lock()
+	if q == nil {
+		return
+	}
+	if q.mu.TryLock() {
 		q.s.Close() // 只关写侧，让对端把剩下的读完
 		q.mu.Unlock()
+		return
 	}
+	q.cancelWrite()
 }
 
 func (m *quicMux) close() {

@@ -560,3 +560,48 @@ func TestNoGoroutineLeakWhenWriterIsFlowControlled(t *testing.T) {
 	}
 	t.Fatalf("写侧被流控卡住时关闭，本包还留着 %d 条协程", len(left))
 }
+
+// Stream.Close() 绝不能因为对端不给流控额度就永远挂住。
+//
+// ★ 调用链：Stream.Close() → Session.removeStream() → quicMux.closeStream()，
+// 而 closeStream 会 **q.mu.Lock()** 之后再关那条 QUIC 流。
+// 如果此刻 pump/writeLoop 正阻塞在同一条流的 Write 里（对端不给窗口、
+// 链路拥塞、或对端已经没了），它就持着 q.mu —— 于是 closeStream 卡在抢锁上，
+// 应用那句 conn.Close() 永远返回不了。
+//
+// 这不是臆测的形状：Go 官方 x/net/http2 有一模一样的 issue（golang/go#48908）——
+// "closing a response body can block indefinitely ... the attempt can block
+// either while acquiring the stream write mutex, or while writing"。
+//
+// 在 Coast 里这条链路就是 tunnel.HandleTCPConn 收尾时那句 Close，
+// 挂住就是整条连接处理协程卡死，而且不会有任何报错。
+func TestCloseStreamDoesNotBlockOnAStalledWriter(t *testing.T) {
+	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+	p := &path{id: 3, kind: "quic", sess: s, pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p.wcond = sync.NewCond(&p.wmu)
+	p.conn = &nopConn{}
+	p.pad = newPaddingScheduler()
+	p.fr = newFrameReader(p.conn)
+	p.peek = newPeekReader(p.conn, 64)
+
+	const sid = 5
+	q := &qstream{s: newStuckMuxStream(t)}
+	m := &quicMux{path: p, streams: map[uint64]*qstream{sid: q}}
+	p.qmux = m
+
+	// 扮演 pump：拿住 q.mu 并永远卡在 Write 里。
+	started := make(chan struct{})
+	go func() { close(started); m.write(FrameStreamData, 0, sid, []byte("x")) }()
+	<-started
+	time.Sleep(100 * time.Millisecond) // 让它确实进到 Write 里面
+
+	done := make(chan struct{})
+	go func() { defer close(done); m.closeStream(sid) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("closeStream 卡在抢 q.mu 上 —— 应用那句 conn.Close() 会永远挂着，" +
+			"而且没有任何报错")
+	}
+}
