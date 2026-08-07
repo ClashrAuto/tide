@@ -580,7 +580,7 @@ func TestNoGoroutineLeakWhenWriterIsFlowControlled(t *testing.T) {
 func TestCloseStreamDoesNotBlockOnAStalledWriter(t *testing.T) {
 	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
 	defer s.closeWith(ErrClosed)
-	p := &path{id: 3, kind: "quic", sess: s, pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p := &path{id: 3, kind: "quic", sess: s, pending: make(map[uint64]probeRec), dead: make(chan struct{})}
 	p.wcond = sync.NewCond(&p.wmu)
 	p.conn = &nopConn{}
 	p.pad = newPaddingScheduler()

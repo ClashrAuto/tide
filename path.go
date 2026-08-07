@@ -47,7 +47,31 @@ const (
 	suspectAfterLostProbes = 2 // 连续丢 2 个探测 → suspect
 	deadAfterLostProbes    = 4 // 连续丢 4 个 → dead
 	recoverAfterGoodProbes = 3 // 连续 3 个好探测才回 active
+
+	// maxProbeBackoffShift 是探测超时的指数退避上限（2^6 = 64 倍）。
+	maxProbeBackoffShift = 6
+	// maxProbeTimeout 是退避后的硬上界，免得一条真死的路径拖到天荒地老。
+	maxProbeTimeout = 30 * time.Second
+	// probeRetainHorizon 是**已判丢**的探测记录再保留多久。
+	// 保留是为了让迟到的应答仍能贡献 RTT 样本（见 probeRec）。
+	probeRetainHorizon = 2 * maxProbeTimeout
 )
+
+// probeRec 是一条探测的发送记录。
+//
+// ★ reaped 表示"已经按超时记为丢失"，但记录**不删**——迟到的应答仍然是
+// 一个完全无歧义的 RTT 样本。Karn 算法之所以禁止用超时段的样本，是因为
+// TCP 会重传，应答归属哪一次发送无从分辨（RFC 6298 §5）；而 TIDE 的探测
+// 带唯一 seq 且**从不重传**，那个歧义根本不存在。
+//
+// 这条不是优化，是**估计器唯一的学习通道**：判丢就删记录的话，srtt 只能
+// 收到"比当前超时更快"的样本，于是链路一旦变慢到超过下界，估计器就再也
+// 看不到任何真实 RTT——超时永远停在 2s，而每个探测都超过 2s，路径必死。
+// 2026-08-07 跨洲实链（空载 166ms、满载 4~14s）上就是这么每 20s 死 5 次的。
+type probeRec struct {
+	sent   time.Time
+	reaped bool
+}
 
 type path struct {
 	id   uint32
@@ -74,7 +98,7 @@ type path struct {
 	minRTT  time.Duration
 	loss    float64 // EWMA
 	probeSq uint64
-	pending map[uint64]time.Time
+	pending map[uint64]probeRec
 	goodRun int
 	badRun  int
 
@@ -123,7 +147,7 @@ func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey
 		sess:    s,
 		conn:    conn,
 		pad:     newPaddingScheduler(),
-		pending: make(map[uint64]time.Time),
+		pending: make(map[uint64]probeRec),
 		created: time.Now(),
 		dead:    make(chan struct{}),
 	}
@@ -414,7 +438,7 @@ func (p *path) sendProbe() {
 	p.hmu.Lock()
 	p.probeSq++
 	seq := p.probeSq
-	p.pending[seq] = time.Now()
+	p.pending[seq] = probeRec{sent: time.Now()}
 	p.hmu.Unlock()
 
 	var buf [16]byte
@@ -440,13 +464,15 @@ func (p *path) onProbeAck(payload []byte) {
 	}
 	seq := binary.BigEndian.Uint64(payload[:8])
 	p.hmu.Lock()
-	sent, ok := p.pending[seq]
+	rec, ok := p.pending[seq]
 	if !ok {
 		p.hmu.Unlock()
 		return
 	}
 	delete(p.pending, seq)
-	rtt := time.Since(sent)
+	rtt := time.Since(rec.sent)
+	// rec.reaped 的样本照收不误——这正是"链路变慢了"唯一能传进估计器的路径。
+	// 见 probeRec 的说明：探测 seq 唯一且不重传，没有 Karn 歧义。
 	p.updateRTTLocked(rtt)
 	p.loss = p.loss * 0.85 // 一个成功样本把丢包估计往下拉
 	p.goodRun++
@@ -493,34 +519,72 @@ func (p *path) updateRTTLocked(rtt time.Duration) {
 func (p *path) probeTimeout() time.Duration {
 	p.hmu.Lock()
 	defer p.hmu.Unlock()
+	return p.probeTimeoutLocked()
+}
+
+// probeTimeoutLocked 在 3×SRTT+4×RTTVAR 的基础上按连续丢失次数**指数退避**。
+//
+// 退避不是可选的调优：RFC 6298 §5.5（"the host MUST set RTO <- RTO * 2"）和
+// RFC 9002 §6.2 的 PTO（duration × 2^pto_count）都要求它，理由一样——
+// 连续超时最可能的解释是"链路真的变慢/拥塞了"，而不是"对端没了"。
+// 少了这一项，尺子就是死的：链路一旦慢过下界，每个探测都判丢，谁也救不回来。
+func (p *path) probeTimeoutLocked() time.Duration {
 	t := 3*p.srtt + 4*p.rttvar
 	if t < DefaultProbeTimeout {
 		t = DefaultProbeTimeout
+	}
+	if n := p.badRun; n > 0 {
+		if n > maxProbeBackoffShift {
+			n = maxProbeBackoffShift
+		}
+		t <<= uint(n)
+	}
+	if t > maxProbeTimeout {
+		t = maxProbeTimeout
 	}
 	return t
 }
 
 func (p *path) reapProbes() {
-	to := p.probeTimeout()
 	now := time.Now()
-	lost := 0
 	p.hmu.Lock()
-	for seq, sent := range p.pending {
-		if now.Sub(sent) > to {
-			delete(p.pending, seq)
-			lost++
-		}
-	}
-	if lost > 0 {
-		for i := 0; i < lost; i++ {
+	// 逐个判、每判丢一个就重算尺子：退避必须在这一轮内生效。
+	// 否则一次 reap 会拿同一把（最短的）尺子把所有在途探测一次性判死，
+	// 指数退避还没来得及张开，badRun 就已经越过 deadAfterLostProbes 了。
+	for seq, rec := range p.pending {
+		switch {
+		case rec.reaped:
+			// 已判丢的记录只留一段时间，供迟到的应答贡献样本，之后回收。
+			if now.Sub(rec.sent) > probeRetainHorizon {
+				delete(p.pending, seq)
+			}
+		case now.Sub(rec.sent) > p.probeTimeoutLocked():
+			rec.reaped = true
+			p.pending[seq] = rec
 			p.loss = p.loss*0.85 + 0.15
+			p.badRun++
+			p.goodRun = 0
 		}
-		p.badRun += lost
-		p.goodRun = 0
 	}
 	bad := p.badRun
 	loss := p.loss
 	p.hmu.Unlock()
+
+	// ★ 收到过字节的路径不能凭探测判死。
+	//
+	// 探测超时只说明"这一来一回超过了尺子"，不说明对端没了——RFC 9002 §6.2
+	// 把这点写得很直白："a PTO timer expiration event does not indicate packet loss"。
+	// 本文件对 checkSilence 早就是这么讲的（noteRecv 的注释：满速传输的路径
+	// 不能被静默计时器判死），只是这条推理没有走到探测这一侧来。
+	//
+	// 判死交给 checkSilence——它看的是物理证据（多久没收到一个字节），
+	// 那是比"探测慢了"硬得多的判据。这里最多降级，让调度器把流挪走。
+	if bad >= deadAfterLostProbes {
+		if idle := time.Since(time.Unix(0, p.lastRecv.Load())); idle < p.probeTimeout() {
+			p.setState(pathDegraded)
+			return
+		}
+	}
 
 	switch {
 	case bad >= deadAfterLostProbes:

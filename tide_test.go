@@ -1690,14 +1690,11 @@ func TestRedundancyMasksPathLoss(t *testing.T) {
 
 // 路径健康状态机不能抖：一个孤立的坏样本不足以把 active 打到 dead。
 func TestPathStateHysteresis(t *testing.T) {
-	p := &path{pending: make(map[uint64]time.Time), dead: make(chan struct{})}
-	p.sess = newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
-	p.wcond = sync.NewCond(&p.wmu)
-	p.conn = &nopConn{}
+	p := newProbeTestPath()
 
 	// 一次丢失：仍然可用。
 	p.hmu.Lock()
-	p.pending[1] = time.Now().Add(-time.Hour)
+	p.pending[1] = probeRec{sent: time.Now().Add(-time.Hour)}
 	p.hmu.Unlock()
 	p.reapProbes()
 	if !p.usable() {
@@ -1706,12 +1703,131 @@ func TestPathStateHysteresis(t *testing.T) {
 	// 连续丢到阈值：才降级。
 	for i := 2; i <= suspectAfterLostProbes; i++ {
 		p.hmu.Lock()
-		p.pending[uint64(i)] = time.Now().Add(-time.Hour)
+		p.pending[uint64(i)] = probeRec{sent: time.Now().Add(-time.Hour)}
 		p.hmu.Unlock()
 		p.reapProbes()
 	}
 	if p.State() != pathSuspect {
 		t.Fatalf("after %d consecutive losses state is %v, want suspect", suspectAfterLostProbes, p.State())
+	}
+}
+
+func newProbeTestPath() *path {
+	p := &path{pending: make(map[uint64]probeRec), dead: make(chan struct{})}
+	p.sess = newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+	p.wcond = sync.NewCond(&p.wmu)
+	p.conn = &nopConn{}
+	return p
+}
+
+// 一条**还在源源不断收字节**的路径，不能因为探测慢了就被判死。
+//
+// 复现的是 2026-08-07 跨洲实链上的死亡螺旋：空载 RTT 166ms（于是 srtt 很小、
+// 超时钉在 2s 下界），满载排队延迟涨到 4~14s，于是每一个探测都超时判丢，
+// 4 个之后路径被判死——而与此同时数据一直在正常流动。客户端 20s 内重连 5~9 次，
+// 每次重连都要重新握手并重传，把已经拥塞的链路推得更糟。
+//
+// RFC 9002 §6.2 把这点讲得很明白：探测超时本身不构成丢包证据。
+func TestSlowPathIsNotKilledWhileStillDelivering(t *testing.T) {
+	p := newProbeTestPath()
+	// 空载时学到的 srtt：小。超时因此停在 2s 下界。
+	p.hmu.Lock()
+	p.srtt, p.rttvar = 166*time.Millisecond, 10*time.Millisecond
+	p.hmu.Unlock()
+
+	// 远超判死阈值的连续探测超时，但字节一直在到。
+	for i := 1; i <= deadAfterLostProbes*3; i++ {
+		p.lastRecv.Store(time.Now().UnixNano()) // 数据仍在流动
+		p.hmu.Lock()
+		p.pending[uint64(i)] = probeRec{sent: time.Now().Add(-time.Hour)}
+		p.hmu.Unlock()
+		p.reapProbes()
+	}
+
+	if p.State() == pathDead {
+		t.Fatalf("path was declared dead after %d slow probes while it was still "+
+			"delivering bytes — this is the intercontinental death spiral: the link "+
+			"was merely slow, and killing it forces a reconnect that makes congestion worse",
+			deadAfterLostProbes*3)
+	}
+}
+
+// 迟到的探测应答必须仍然喂给 RTT 估计器。
+//
+// 这是估计器**唯一**能学到"链路变慢了"的通道：判丢就把记录删掉的话，
+// srtt 只收得到比当前超时更快的样本，尺子只会越缩越短，永远张不开。
+// 探测 seq 唯一且从不重传，所以 Karn 歧义（RFC 6298 §5）在这里不存在。
+func TestLateProbeAckStillTeachesTheEstimator(t *testing.T) {
+	p := newProbeTestPath()
+	p.lastRecv.Store(time.Now().UnixNano())
+
+	const realRTT = 6 * time.Second // 满载真实往返，远超 2s 下界
+	p.hmu.Lock()
+	p.srtt, p.rttvar = 166*time.Millisecond, 10*time.Millisecond
+	p.pending[1] = probeRec{sent: time.Now().Add(-realRTT)}
+	p.hmu.Unlock()
+
+	p.reapProbes() // 按老尺子判丢
+	p.hmu.Lock()
+	rec, still := p.pending[1]
+	p.hmu.Unlock()
+	if !still || !rec.reaped {
+		t.Fatal("the timed-out probe record was dropped, so a late reply can no longer " +
+			"be attributed — the estimator loses its only way to learn the link slowed down")
+	}
+
+	// 应答迟到了，但它到了。
+	var ack [16]byte
+	binary.BigEndian.PutUint64(ack[:8], 1)
+	p.onProbeAck(ack[:])
+
+	p.hmu.Lock()
+	srtt := p.srtt
+	p.hmu.Unlock()
+	if srtt <= 166*time.Millisecond {
+		t.Fatalf("srtt is still %v after a %v round trip came back — the late sample "+
+			"was discarded, so probeTimeout stays pinned at the %v floor and every "+
+			"subsequent probe on this link is doomed to be counted lost",
+			srtt, realRTT, DefaultProbeTimeout)
+	}
+
+	// 真正要保证的性质：连续的迟到样本能把尺子撑过链路的实际往返，
+	// 路径因此活下来。EWMA 一个样本只走 1/8，所以看的是收敛，不是单步。
+	for i := 2; i <= 12; i++ {
+		p.hmu.Lock()
+		p.pending[uint64(i)] = probeRec{sent: time.Now().Add(-realRTT)}
+		p.hmu.Unlock()
+		p.reapProbes()
+		binary.BigEndian.PutUint64(ack[:8], uint64(i))
+		p.onProbeAck(ack[:])
+	}
+	if to := p.probeTimeout(); to <= realRTT {
+		p.hmu.Lock()
+		srtt = p.srtt
+		p.hmu.Unlock()
+		t.Fatalf("after a dozen %v round trips the probe timeout is only %v (srtt=%v) — "+
+			"it never grew past the link's actual RTT, so probes keep being counted lost",
+			realRTT, to, srtt)
+	}
+}
+
+// 连续丢失必须把尺子指数放大（RFC 6298 §5.5 / RFC 9002 §6.2）。
+func TestProbeTimeoutBacksOffExponentially(t *testing.T) {
+	p := newProbeTestPath()
+	base := p.probeTimeout()
+	p.hmu.Lock()
+	p.badRun = 3
+	p.hmu.Unlock()
+	if got := p.probeTimeout(); got <= base {
+		t.Fatalf("after 3 consecutive losses the probe timeout is still %v (was %v) — "+
+			"without backoff the ruler is frozen, and a link that genuinely slowed down "+
+			"can never be measured again", got, base)
+	}
+	p.hmu.Lock()
+	p.badRun = 999
+	p.hmu.Unlock()
+	if got := p.probeTimeout(); got > maxProbeTimeout {
+		t.Fatalf("backoff ran away to %v, past the %v cap", got, maxProbeTimeout)
 	}
 }
 
@@ -1832,7 +1948,7 @@ func TestPathsPerSessionBounded(t *testing.T) {
 	for i := 0; i < maxPathsPerSession*4; i++ {
 		p := &path{
 			id: uint32(i + 1), kind: "tcp", sess: s, conn: &nopConn{},
-			pad: newPaddingScheduler(), pending: make(map[uint64]time.Time),
+			pad: newPaddingScheduler(), pending: make(map[uint64]probeRec),
 			created: time.Now(), dead: make(chan struct{}),
 		}
 		p.wcond = sync.NewCond(&p.wmu)
@@ -1882,7 +1998,7 @@ func TestFullSessionDoesNotSpinDialingQUIC(t *testing.T) {
 	for len(sess.pathsSnapshot()) < maxPathsPerSession {
 		p := &path{
 			id: 900 + uint32(len(sess.pathsSnapshot())), kind: "tcp", sess: sess, conn: &nopConn{},
-			pad: newPaddingScheduler(), pending: make(map[uint64]time.Time),
+			pad: newPaddingScheduler(), pending: make(map[uint64]probeRec),
 			created: time.Now(), dead: make(chan struct{}),
 		}
 		p.wcond = sync.NewCond(&p.wmu)
@@ -2848,7 +2964,7 @@ func TestDuplicatePathIDIsRefused(t *testing.T) {
 
 // fakePath 造一条评分可控的路径。score() 只看 srtt/rttvar/loss，设好就行。
 func fakePath(s *Session, id uint32, kind string, srtt time.Duration) *path {
-	p := &path{id: id, kind: kind, sess: s, pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p := &path{id: id, kind: kind, sess: s, pending: make(map[uint64]probeRec), dead: make(chan struct{})}
 	p.wcond = sync.NewCond(&p.wmu)
 	p.conn = &nopConn{}
 	p.pad = newPaddingScheduler()
@@ -3485,7 +3601,7 @@ func TestHandleFrameNeverBlocksOnAStuckPath(t *testing.T) {
 	// 它本来就不会阻塞。会阻塞的是 quicMux.write —— 它在持锁的情况下直接调
 	// 底层流的 Write。这个形状差异正是这个 bug 的根。
 	const sid = 3
-	p := &path{id: 7, kind: "quic", pending: make(map[uint64]time.Time), dead: make(chan struct{})}
+	p := &path{id: 7, kind: "quic", pending: make(map[uint64]probeRec), dead: make(chan struct{})}
 	p.sess = s
 	p.wcond = sync.NewCond(&p.wmu)
 	p.conn = newStuckConn(t)
