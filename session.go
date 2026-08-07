@@ -1008,7 +1008,14 @@ func (s *Session) retransmitLoop() {
 			// 而那里持着 wmu，不能再回头去拿 s.mu（会形成反向加锁顺序）。
 			st.pathRTT.Store(int64(s.rttForStreamLocked(st)))
 			st.pathMinRTT.Store(int64(s.minRTTForStreamLocked(st)))
-			// 每条流按**它自己那条路径**的 RTT 判，不用全局最快值——理由见 rtoForStreamLocked。
+			// 每条流按**它自己那条路径**的 RTT 判，不用全局最快值。
+			//
+			// ★ 拿全局最快路径的 RTT 去 judge 一条跑在慢路径上的流，是错的判据。
+			// 2026-08-07 soak 实测：QUIC 路径 RTT 250ms、同时并存的 TCP 路径 8.2s。
+			// 一条被钉在 TCP 上的流，却按 250ms 去算「多久没进展算卡住」，于是它
+			// **永远**处于卡住状态，每个 RTO 都要重发一次整窗——这正是那场 76 倍
+			// 放大的风暴的判据来源。退避能把风暴压住，但判据本身错了就还是会一直
+			// 做无用重发。
 			if st.stalledFor(now, rtoFromRTT(time.Duration(st.pathRTT.Load()))) {
 				stuck = append(stuck, st)
 			}
@@ -1022,12 +1029,6 @@ func (s *Session) retransmitLoop() {
 	}
 }
 
-func (s *Session) currentRTO() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return rtoFromRTT(s.fastestRTTLocked())
-}
-
 func (s *Session) fastestRTTLocked() time.Duration {
 	best := time.Duration(0)
 	for _, p := range s.paths {
@@ -1038,16 +1039,12 @@ func (s *Session) fastestRTTLocked() time.Duration {
 	return best
 }
 
-// rtoForStreamLocked 用**这条流实际所在那条路径**的 RTT 算 RTO。
+// rtoForStreamLocked 用**这条流实际所在那条路径**的 RTT 算 RTO；路径没绑定或已消失
+// 时退回全局最快值。为什么必须按流所在路径而不是全局最快值，见 retransmitLoop 里
+// stalledFor 那处的说明。
 //
-// ★ 拿全局最快路径的 RTT 去judge一条跑在慢路径上的流，是错的判据。
-// 2026-08-07 soak 实测：QUIC 路径 RTT 250ms、同时并存的 TCP 路径 8.2s。
-// 一条被钉在 TCP 上的流，却按 250ms 去算"多久没进展算卡住"，
-// 于是它**永远**处于卡住状态，每个 RTO 都要重发一次整窗——
-// 这正是那场 76 倍放大的风暴的判据来源。退避能把风暴压住，
-// 但判据本身错了就还是会一直做无用重发。
-//
-// 路径没绑定或已经消失时退回全局最快值（老行为），那时也没有更好的依据。
+// 生产路径不走这里（那边读的是 st.pathRTT 这个原子缓存，避免在持 wmu 时回头拿 s.mu）；
+// 保留它是给 TestRTOPerPath 当断言口子用的 —— 那条测试是这整个判据修复的回归守卫。
 func (s *Session) rtoForStreamLocked(st *Stream) time.Duration {
 	return rtoFromRTT(s.rttForStreamLocked(st))
 }
