@@ -193,3 +193,140 @@ func TestNoGoroutineLeakAfterCloseH3(t *testing.T) {
 	}
 	t.Fatalf("h3 模式下关掉之后，本包还留着 %d 条协程", len(left))
 }
+
+// 客户端**不告而别**时，服务端也必须把自己收干净。
+//
+// ★ 这是真实世界里最常见的收尾路径，却是测试覆盖最薄的一条：
+// 网络断了、进程被杀、手机切后台——客户端根本没机会调 Close()。
+// 服务端这一侧走的是完全不同的代码：路径读循环出错 → onPathDead →
+// recoverLoop（服务端没有 redial，只能空转等）→ graceWatcher 到点 →
+// closeWith(ErrSessionGone)。上面两条用例走的都是"两边都优雅关闭"，
+// 一行都覆盖不到这条路。
+//
+// 断言的是**服务端**关干净了：客户端这边故意不 Close，模拟它已经消失。
+func TestNoGoroutineLeakAfterClientVanishes(t *testing.T) {
+	func() {
+		h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+			// 宽限期压短，否则用例要等两分钟。
+			sc.SessionGrace = 800 * time.Millisecond
+			cc.SessionGrace = 800 * time.Millisecond
+			cc.ProbeInterval = 100 * time.Millisecond
+		})
+		ctx := context.Background()
+		c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write([]byte("hello"))
+		buf := make([]byte, 5)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		c.Read(buf)
+
+		// ★ 模拟"客户端凭空消失"。
+		//
+		// ⚠️ 光把连接掐断是不够的——那只是一次网络抖动，而客户端的 recoverLoop
+		// 会**正常地**重连回来、把宽限期计时清零。第一版就是这么写的，
+		// 结果会话十秒都没被回收，我差点当成 bug；其实那是协议在按设计工作
+		// （§9 的整个存在意义就是让抖动不断线）。
+		//
+		// 要让"客户端消失"成立，必须让它**回不来**：先把监听关掉，
+		// 再掐断连接。这才是服务端视角下的"对端不告而别"。
+		h.ln.Close()
+		sess, _ := h.client.Session(ctx)
+		if sess != nil {
+			killAllPaths(sess)
+		}
+
+		// 等服务端的宽限期走完并把会话收掉。
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			h.srv.mu.Lock()
+			n := len(h.srv.sessions)
+			h.srv.mu.Unlock()
+			if n == 0 {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		h.srv.mu.Lock()
+		left := len(h.srv.sessions)
+		h.srv.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("宽限期过后服务端还挂着 %d 条会话", left)
+		}
+
+		// 到此为止服务端**没有**被 Close：要测的正是"会话自然消亡"之后
+		// 服务端不该留下与这条会话有关的协程。
+		h.srv.Close()
+		h.client.Close()
+		h.cover.Close()
+	}()
+
+	var left []string
+	for i := 0; i < 80; i++ {
+		time.Sleep(100 * time.Millisecond)
+		left = residualTideGoroutines("TestNoGoroutineLeakAfterClientVanishes")
+		if len(left) == 0 {
+			return
+		}
+	}
+	for _, g := range left {
+		t.Logf("残留协程: %s", g)
+	}
+	t.Fatalf("客户端不告而别、宽限期到点之后，本包还留着 %d 条协程", len(left))
+}
+
+// 会话死掉之后客户端会**另建一条**（Client.Session 里那段替换逻辑）。
+// 旧会话上那些长命协程（ctrlLoop / maintainQUIC / maintainRedundancy /
+// retransmitLoop / rebalanceLoop / ticketServeLoop）必须跟着旧会话一起退，
+// 否则每换一次会话就漏一批——而换会话在移动网络下是常态。
+func TestNoGoroutineLeakAcrossSessionReplacement(t *testing.T) {
+	func() {
+		port := freeUDPPort(t)
+		h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+			cc.EnableQUIC = true
+			cc.QUICPort = port
+			cc.Redundancy = true
+			cc.ProbeInterval = 100 * time.Millisecond
+		})
+		serveQUICOn(t, h, port)
+		ctx := context.Background()
+
+		for round := 0; round < 3; round++ {
+			c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+			if err != nil {
+				t.Fatalf("第 %d 轮拨号失败：%v", round, err)
+			}
+			c.Write([]byte("hello"))
+			buf := make([]byte, 5)
+			c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			c.Read(buf)
+			c.Close()
+
+			// 直接把会话判死，模拟宽限期耗尽。下一次 DialContext 会另建一条。
+			sess, _ := h.client.Session(ctx)
+			if sess != nil {
+				sess.closeWith(ErrSessionGone)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		h.client.Close()
+		h.srv.Close()
+		h.ln.Close()
+		h.cover.Close()
+	}()
+
+	var left []string
+	for i := 0; i < 80; i++ {
+		time.Sleep(100 * time.Millisecond)
+		left = residualTideGoroutines("TestNoGoroutineLeakAcrossSessionReplacement")
+		if len(left) == 0 {
+			return
+		}
+	}
+	for _, g := range left {
+		t.Logf("残留协程: %s", g)
+	}
+	t.Fatalf("反复换会话之后，本包还留着 %d 条协程", len(left))
+}
