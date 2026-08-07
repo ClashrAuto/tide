@@ -3909,3 +3909,58 @@ func TestRecoverLoopKeepsRetryingOnNetworkError(t *testing.T) {
 			"切网/漫游时会话会被过早收掉，用户的连接全断", n)
 	}
 }
+
+// 重发必须按连续回退次数指数退避，否则在慢链路上会形成自我强化的重发风暴。
+//
+// ★ 复现的是 2026-08-07 树莓派 10 分钟实测到的那次：应用只写了 7.2 MiB，
+// QUIC 路径上实际发出 549.9 MiB（76 倍），p50 往返 1 分 13 秒，4 条流全部写超时。
+// 机理：currentRTO 只有 2×**最快**路径 RTT + 200ms、下界 500ms，而拥塞时真实往返
+// 能到几十秒。于是"还没收到 ACK"被当成卡住，每隔一个固定 rto 就把整个未确认窗口
+// 重发一遍；重发把链路压得更满，往返更长，于是更"卡住"——正反馈。
+//
+// 退避一加，第 n 次回退要等 rto×2ⁿ，很快追上真实往返，风暴自然熄火。
+// 与探测超时那处退避同源（RFC 6298 §5.5：连续超时 MUST 加倍）。
+func TestRewindBacksOffExponentially(t *testing.T) {
+	st := &Stream{}
+	now := time.Now()
+	const rto = 500 * time.Millisecond
+
+	// 没回退过：等待就是一个 rto。
+	st.lastRewind.Store(now.Add(-rto - time.Millisecond).UnixNano())
+	st.lastProgress.Store(now.Add(-time.Hour).UnixNano())
+	st.sendOff, st.ackOff = 1, 0 // 有在途数据
+	if !st.stalledFor(now, rto) {
+		t.Fatal("一个 rto 之后仍不认为卡住，重发根本不会发生")
+	}
+
+	// 连续回退之后，同样的时间间隔必须**不再**触发重发。
+	for i := 0; i < 5; i++ {
+		st.noteRewind(now)
+	}
+	st.lastRewind.Store(now.Add(-rto - time.Millisecond).UnixNano())
+	if st.stalledFor(now, rto) {
+		t.Fatalf("连续回退 5 次之后，只等了一个 rto 就又要重发——"+
+			"这正是那场 76 倍放大的风暴（7.2 MiB 的数据发出去 549.9 MiB）；"+
+			"退避没生效，rewinds=%d", st.rewinds.Load())
+	}
+
+	// 退避是有限的：等够了 rto×2⁵ 就该重发，不能永远不动。
+	st.lastRewind.Store(now.Add(-(rto << 5) - time.Second).UnixNano())
+	if !st.stalledFor(now, rto) {
+		t.Fatal("等够了退避时间仍不重发 —— 退避不该把流彻底饿死")
+	}
+
+	// 对端一确认，退避清零。
+	st.rewinds.Store(9)
+	st.wmu.Lock()
+	st.ackOff = 0
+	st.sendOff = 8
+	st.retx = make([]byte, 8) // onAck 会按确认量裁剪重传缓冲
+	st.wcond = sync.NewCond(&st.wmu)
+	st.wmu.Unlock()
+	st.onAck(1, 1<<20) // ackOff 前进
+	if n := st.rewinds.Load(); n != 0 {
+		t.Fatalf("对端确认了字节，退避却没清零（rewinds=%d）——"+
+			"链路恢复之后重发会一直用着最大退避，白白慢下去", n)
+	}
+}

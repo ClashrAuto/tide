@@ -70,6 +70,15 @@ type Stream struct {
 	// 而不是"最后一次发送时间"——发得再多，对端没确认就等于没进展。
 	lastProgress atomic.Int64
 	lastRewind   atomic.Int64
+	// rewinds: 连续回退次数（对端一确认就清零）。用来给重发做指数退避。
+	//
+	// ★ 少了它就是一场自我强化的重发风暴：currentRTO 只有 2×最快路径RTT+200ms、
+	// 下界 500ms，而链路真实往返在拥塞时可以是几十秒。于是"还没收到 ACK"被当成
+	// 卡住，每隔一个 rto 就把整个未确认窗口重发一遍——重发又把链路压得更满，
+	// 往返更长，更"卡住"。2026-08-07 树莓派 10 分钟实测：应用只写了 7.2 MiB，
+	// QUIC 路径上实际发出 549.9 MiB（76 倍），p50 往返 1 分 13 秒，4 条流全部
+	// 因为写超时失败。
+	rewinds atomic.Uint32
 	// migrateVotes 由 Session.rebalance 在 s.mu 下读写（和 streams map 同一把锁），
 	// 所以是普通字段而不是 atomic。
 	migrateVotes int
@@ -128,7 +137,17 @@ func (st *Stream) stalledFor(now time.Time, rto time.Duration) bool {
 		return false
 	}
 	// 刚回退过就先等等，别把重发变成风暴。
-	if lr := st.lastRewind.Load(); lr != 0 && now.Sub(time.Unix(0, lr)) < rto {
+	//
+	// ★ 等待时间必须**按连续回退次数指数增长**，固定 rto 是挡不住风暴的：
+	// rto 由最快路径的 RTT 算出（下界 500ms），而拥塞时真实往返能到几十秒，
+	// 于是"等一个 rto"= 在一次合法 ACK 能回来之前就重发上百次。
+	// 退避一加，第 n 次回退要等 rto×2ⁿ，很快就追上真实往返，风暴自然熄火。
+	// 这与探测超时那处退避同源（RFC 6298 §5.5：连续超时 MUST 加倍）。
+	wait := rto << minU32(st.rewinds.Load(), maxRewindBackoffShift)
+	if wait > maxRewindWait {
+		wait = maxRewindWait
+	}
+	if lr := st.lastRewind.Load(); lr != 0 && now.Sub(time.Unix(0, lr)) < wait {
 		return false
 	}
 	if st.needsOpenResend() {
@@ -140,7 +159,24 @@ func (st *Stream) stalledFor(now time.Time, rto time.Duration) bool {
 	return inflight
 }
 
-func (st *Stream) noteRewind(now time.Time) { st.lastRewind.Store(now.UnixNano()) }
+func (st *Stream) noteRewind(now time.Time) {
+	st.lastRewind.Store(now.UnixNano())
+	st.rewinds.Add(1)
+}
+
+const (
+	// maxRewindBackoffShift 是重发退避的指数上限（2^7 = 128 倍）。
+	maxRewindBackoffShift = 7
+	// maxRewindWait 是退避后的硬上界。再慢的链路也不该让一条流彻底不动。
+	maxRewindWait = 60 * time.Second
+)
+
+func minU32(a, b uint32) uint32 {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // ackThreshold：累积多少字节就回一个 ACK。
 // 32 KiB 在"ACK 帧开销"与"发送方重传缓冲占用"之间取平衡：太大则发送方缓冲长期打满、
@@ -570,6 +606,10 @@ func (st *Stream) onAck(ack, maxOff uint64) {
 			st.pendOff = st.ackOff
 		}
 		st.lastProgress.Store(time.Now().UnixNano())
+		// 对端真的确认了字节 —— 退避清零，下一次卡住时重新从一个 rto 起步。
+		// 清零点必须是"ackOff 前进"，不能是"发出去了"：发得再多没被确认都不算进展，
+		// 否则退避永远归零，等于没退避。
+		st.rewinds.Store(0)
 	}
 	if maxOff > st.peerMaxOff {
 		st.peerMaxOff = maxOff
