@@ -151,6 +151,7 @@ func (ps *PacketStream) ReadFrom() (*Datagram, error) {
 		ps.cond.Wait()
 	}
 	d := ps.queue[0]
+	ps.queue[0] = nil // 见 evictOldestLocked 上面那段说明：不置 nil 就回收不掉
 	ps.queue = ps.queue[1:]
 	ps.queued -= len(d.Data)
 	ps.sess.dgramBytes.Add(-int64(len(d.Data)))
@@ -265,8 +266,17 @@ func (ps *PacketStream) deliver(d *Datagram) {
 }
 
 // evictOldestLocked 丢掉队首并归还两级预算。调用方必须持有 ps.mu 且队列非空。
+//
+// ★ 摘掉队首之前必须把那个槽位置 nil。
+//
+// `q = q[1:]` 只是把视窗右移，被摘掉的那个 *Datagram **仍然被底层数组引用着**，
+// 于是它连同它的载荷都无法被回收——而记账（dgramBytes / queued）已经把它减掉了。
+// 结果是"账上是 0、内存还占着"，正是本仓库反复踩的那一类
+// （乱序缓冲、抢跑暂存区都栽在"上界限的量不是真正涨的那个量"上）。
+// Go 官方在 1.22 里把 slices.Delete 等改成 clear the tail，就是为了这件事。
 func (ps *PacketStream) evictOldestLocked() {
 	old := ps.queue[0]
+	ps.queue[0] = nil
 	ps.queue = ps.queue[1:]
 	ps.queued -= len(old.Data)
 	ps.sess.dgramBytes.Add(-int64(len(old.Data)))
@@ -376,6 +386,7 @@ func (s *Session) holdEarlyDatagram(d *Datagram) {
 	e.expires = now.Add(earlyDatagramTTL)
 	if len(e.dgrams) >= earlyDatagramPerAssoc {
 		s.earlyBytes -= len(e.dgrams[0].Data)
+		e.dgrams[0] = nil       // 不置 nil 的话底层数组还引用着它，回收不掉
 		e.dgrams = e.dgrams[1:] // 丢最老的：陈旧的 UDP 比新鲜的更没价值
 	}
 	e.dgrams = append(e.dgrams, d)

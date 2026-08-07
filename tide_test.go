@@ -2486,12 +2486,21 @@ func TestReorderBufferFootprint(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		used := heap() - before
+		// ⚠️ 必须用**有符号**减法。堆是可能比测量前更小的——GC 回收掉的别处垃圾
+		// 多于本用例分配的量时就会这样，而 heap() 里那次 runtime.GC() 让这件事
+		// 相当常见。用 uint64 相减会下溢成 1.8e19，于是用例以
+		// "乱序缓冲实占 18446744073709526128 字节"失败——一个吓人且完全错误的结论：
+		// 真相是堆**缩小**了 25 KB。这一轮连跑两遍 verify 才撞出来，第一遍是绿的。
+		// 偶发红的门禁比没有门禁更糟：它会训练所有人无视它。
+		used := int64(heap()) - int64(before)
 		runtime.KeepAlive(st)
+		if used < 0 {
+			used = 0 // 堆缩小了，说明本用例的占用被噪音淹没，按 0 记
+		}
 
 		// 留 2 倍余量：Go 版本、GC 时机、map 装载因子都会让这个数浮动，
 		// 但 81 倍那种量级的错误一定会被抓住。
-		if limit := uint64(DefaultStreamWindow) * 2; used > limit {
+		if limit := int64(DefaultStreamWindow) * 2; used > limit {
 			t.Fatalf("segLen=%d: 乱序缓冲实占 %d 字节，窗口只有 %d —— "+
 				"上界限的是载荷字节而不是真实内存，对端可以用小段把它放大到 OOM",
 				segLen, used, DefaultStreamWindow)

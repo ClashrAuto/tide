@@ -330,3 +330,129 @@ func TestNoGoroutineLeakAcrossSessionReplacement(t *testing.T) {
 	}
 	t.Fatalf("反复换会话之后，本包还留着 %d 条协程", len(left))
 }
+
+// 全会话的数据报字节预算，在所有关联收干净之后必须**回到 0**。
+//
+// ★ 这和协程泄漏是同一类不变量，只是量不同：预算是手工记账的
+// （reserve / evictOldestLocked / ReadFrom / closeQueue 四处各自加减），
+// 手工记账最容易在某条分支上漏掉一次归还。而它的失效方式格外阴：
+// 预算被永久占住之后，所有关联开始**慢慢丢数据报**——没有报错、没有日志，
+// 只表现为"UDP 用久了越来越差"。第 23/24 轮就是冲着这个加的记账，
+// 但当时没有任何东西守着"最后要归零"。
+//
+// 用例把四条归还路径全走一遍：读走、被挤掉、应用主动关、流被摘掉。
+func TestDatagramBudgetReturnsToZero(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 64)
+	defer s.closeWith(ErrClosed)
+
+	mkAssoc := func(id uint64) *Stream {
+		st := newStream(s, id, "10.0.0.1:53", DefaultStreamWindow)
+		st.udp = true
+		st.pkt = newPacketStream(s, st)
+		s.mu.Lock()
+		s.streams[id] = st
+		s.mu.Unlock()
+		s.streamCount.Add(1)
+		return st
+	}
+	payload := make([]byte, 4096)
+
+	// (1) 读走的那条。
+	a := mkAssoc(11)
+	for i := 0; i < 4; i++ {
+		s.onDatagram(udpFrame(t, 11, "10.0.0.1:53", payload))
+	}
+	a.pkt.SetReadDeadline(time.Now().Add(time.Second))
+	for i := 0; i < 4; i++ {
+		if _, err := a.pkt.ReadFrom(); err != nil {
+			t.Fatalf("读第 %d 个数据报失败：%v", i, err)
+		}
+	}
+	if got := s.dgramBytes.Load(); got != 0 {
+		t.Fatalf("全部读走之后预算是 %d，应为 0", got)
+	}
+
+	// (2) 被挤掉的那条：灌到超过单关联上界，触发 evictOldestLocked。
+	b := mkAssoc(13)
+	for i := 0; i < maxDatagramQueue*2; i++ {
+		s.onDatagram(udpFrame(t, 13, "10.0.0.1:53", payload))
+	}
+	// (3) 应用主动关。
+	b.pkt.Close()
+
+	// (4) 流被摘掉（对端 RST / 流回收），不经过 PacketStream.Close。
+	mkAssoc(15)
+	for i := 0; i < 8; i++ {
+		s.onDatagram(udpFrame(t, 15, "10.0.0.1:53", payload))
+	}
+	s.removeStream(15)
+
+	// 再来一条，直接靠会话关闭收尾。
+	mkAssoc(17)
+	for i := 0; i < 8; i++ {
+		s.onDatagram(udpFrame(t, 17, "10.0.0.1:53", payload))
+	}
+	s.closeWith(ErrClosed)
+
+	if got := s.dgramBytes.Load(); got != 0 {
+		t.Fatalf("所有关联都收掉之后预算仍是 %d，应为 0 —— "+
+			"预算被永久占住之后所有关联会慢慢开始丢数据报，"+
+			"没有报错也没有日志，只表现为 UDP 用久了越来越差", got)
+	}
+}
+
+// 摘掉队首之后，被摘掉的那个槽位必须置 nil。
+//
+// ★ `q = q[1:]` 只是把视窗右移，被摘掉的元素**仍然被底层数组引用着**，
+// 于是它连同它的载荷都无法被回收——而记账（dgramBytes / queued）已经把它减掉了。
+// 结果是"账上是 0、内存还占着"：上一条用例断言预算归零，它照样会通过。
+// 这正是本仓库反复踩的那一类——上界限的量不是真正涨的那个量
+// （乱序缓冲、抢跑暂存区都栽在这上面）。
+//
+// 不是理论问题：单条数据报载荷上限约 56 KiB，队列上限 512 条，
+// 一条读到一半的关联最坏能把几十 MB 挂在"已经不可见但仍可达"的槽位里。
+// Go 官方在 1.22 把 slices.Delete 等改成 clear the tail，就是为了这件事。
+func TestPoppedDatagramSlotIsCleared(t *testing.T) {
+	s := newSession([16]byte{}, false, DefaultStreamWindow, time.Minute, time.Second, 16)
+	defer s.closeWith(ErrClosed)
+	const assoc = 21
+	st := newStream(s, assoc, "10.0.0.1:53", DefaultStreamWindow)
+	st.udp = true
+	st.pkt = newPacketStream(s, st)
+	s.mu.Lock()
+	s.streams[assoc] = st
+	s.mu.Unlock()
+
+	for i := 0; i < 4; i++ {
+		if err := s.onDatagram(udpFrame(t, assoc, "10.0.0.1:53", make([]byte, 1024))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 留一份指向同一底层数组的视窗，读走之后从它看那个槽位。
+	st.pkt.mu.Lock()
+	view := st.pkt.queue
+	st.pkt.mu.Unlock()
+
+	st.pkt.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := st.pkt.ReadFrom(); err != nil {
+		t.Fatal(err)
+	}
+	if view[0] != nil {
+		t.Fatal("读走之后队首槽位仍指向那个数据报 —— 底层数组还引用着它，" +
+			"载荷回收不掉，而记账已经把它减掉了（账上是 0，内存还占着）")
+	}
+
+	// 被挤掉的那条路径同样要清。
+	for i := 0; i < maxDatagramQueue*2; i++ {
+		s.onDatagram(udpFrame(t, assoc, "10.0.0.1:53", make([]byte, 1024)))
+	}
+	st.pkt.mu.Lock()
+	full := st.pkt.queue[:len(st.pkt.queue):len(st.pkt.queue)]
+	st.pkt.mu.Unlock()
+	for i, d := range full {
+		if d == nil {
+			t.Fatalf("队列里第 %d 个元素是 nil —— 清槽位清过头了", i)
+		}
+	}
+}

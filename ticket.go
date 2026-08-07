@@ -217,6 +217,7 @@ func (s *MemTicketStore) capUserLocked(user [16]byte) {
 	bs := s.users[user]
 	for len(bs) > maxLiveBatchesPerUser {
 		old := bs[0]
+		bs[0] = nil // 不置 nil 的话被淘汰的批次仍被底层数组引用着，回收不掉
 		bs = bs[1:]
 		s.dropIndexLocked(old.base)
 	}
@@ -332,7 +333,12 @@ func (w *ticketWallet) add(base uint64, count uint16, seed [32]byte, now time.Ti
 	if len(w.batches) >= maxWalletBatches {
 		// 还是满的：丢最老的那批。take 是从头扫的，最老的一批最接近用完，
 		// 丢它的代价最小（最坏情况是那几张票没用上，退回 1-RTT，不影响正确性）。
-		w.batches = append(w.batches[:0], w.batches[1:]...)
+		// 左移一格，再把空出来的末尾槽位清掉——不清的话它仍指向被挤掉的那批票据，
+		// 底层数组引用着就回收不了。Go 官方在 1.22 里给 slices.Delete 加的
+		// clear-the-tail 正是这件事。
+		copy(w.batches, w.batches[1:])
+		w.batches[len(w.batches)-1] = nil
+		w.batches = w.batches[:len(w.batches)-1]
 	}
 	w.batches = append(w.batches, &walletBatch{
 		base: base, count: count, seed: seed, next: base,

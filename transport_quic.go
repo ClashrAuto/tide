@@ -34,11 +34,26 @@ type quicConn struct {
 func (q *quicConn) LocalAddr() net.Addr  { return q.conn.LocalAddr() }
 func (q *quicConn) RemoteAddr() net.Addr { return q.conn.RemoteAddr() }
 
+// Close 关掉这条 QUIC 路径。**只从路径判死那条路上调**（markDeadReason）。
+//
+// ★ 这里绝不能用 Stream.Close()。quic-go 的文档是明写的约束：
+// "Close() must not be called concurrently with Write()"——而本函数正是从
+// markDeadReason 过来的，此刻 path.writeLoop 极可能**正阻塞在 Write 里等流控额度**
+// （对端不给窗口、链路拥塞、或者对端已经没了）。
+//
+// 违反那条约束的后果实测到了：Stream.Close() 自己不返回，于是它**下面**那句
+// conn.CloseWithError 根本执行不到，writeLoop 就永远挂着——一条路径连同它的
+// 缓冲一起泄漏。第 39 轮那道协程守卫抓到的正是这个，而且是偶发的：
+// 只有 writeLoop 恰好卡在流控里时才复现（连跑三遍 verify 才撞出两次）。
+//
+// 正确的 API 是 CancelWrite——官方原话是 "Write will unblock immediately"，
+// 而且"在 Close 之后调用 CancelWrite 是合法的"。这里干脆不再调 Stream.Close()：
+// 反正下一句就把整条 QUIC 连接关掉了，给流做一次优雅 FIN 没有任何意义。
 func (q *quicConn) Close() error {
 	q.Stream.CancelRead(0)
-	err := q.Stream.Close()
+	q.Stream.CancelWrite(0)
 	q.conn.CloseWithError(0, "")
-	return err
+	return nil
 }
 
 // ExportKeyingMaterial 让 QUIC 路径也能做信道绑定（spec §4）。
