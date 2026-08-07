@@ -57,6 +57,22 @@ func (q *qstream) cancelRead() {
 	}
 }
 
+// cancelWrite 让一个**正阻塞在 Write 上**的写者立刻返回。
+//
+// ★ 拆毁路径时只能用它，不能用 s.Close()。quic-go 明写
+// "Close() must not be called concurrently with Write()"，而拆毁恰恰发生在
+// 写者可能正卡在流控里的时候（对端不给窗口、链路拥塞、或对端已经没了）。
+// 违反那条约束时 Close 自己不返回，调用它的那条拆毁链路就整个卡住——
+// 于是**后面**该做的清理（关整条 QUIC 连接）根本轮不到执行，写者永远挂着。
+//
+// 官方对 CancelWrite 的原话是 "Write will unblock immediately"。
+// 拆毁时也不需要优雅 FIN：整条 QUIC 连接马上就要被关掉了。
+func (q *qstream) cancelWrite() {
+	if s, ok := q.s.(*quic.Stream); ok {
+		s.CancelWrite(0)
+	}
+}
+
 type quicMux struct {
 	conn     *quic.Conn
 	isClient bool
@@ -212,7 +228,7 @@ func (m *quicMux) dropStream(q *qstream) {
 	}
 	m.mu.Unlock()
 	q.cancelRead()
-	q.s.Close()
+	q.cancelWrite()
 }
 
 // closeStream 在 TIDE 流结束时关掉对应的 QUIC 流，别让它泄漏。
@@ -242,8 +258,12 @@ func (m *quicMux) close() {
 	m.streams = map[uint64]*qstream{}
 	m.mu.Unlock()
 	for _, q := range all {
+		// ★ 这里**不能**用 q.s.Close()：拆毁时 pump/writeLoop 很可能正阻塞在
+		// 这条流的 Write 上等流控额度，而 Close 不得与 Write 并发调用。
+		// 见 cancelWrite 上面那段说明——违反之后整条拆毁链路会卡在这里，
+		// markDeadReason 后面那句 p.conn.Close() 根本执行不到。
 		q.cancelRead()
-		q.s.Close()
+		q.cancelWrite()
 	}
 }
 

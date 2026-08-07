@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -455,4 +456,107 @@ func TestPoppedDatagramSlotIsCleared(t *testing.T) {
 			t.Fatalf("队列里第 %d 个元素是 nil —— 清槽位清过头了", i)
 		}
 	}
+}
+
+// 在**写侧被流控卡住**的情况下关掉一切，仍然不能漏协程。
+//
+// ★ 这是把第 40 轮那个 bug 从"偶发"变成"必现"的用例。
+//
+// 那个 bug 是 quicConn.Close() 用了 Stream.Close()，而 quic-go 明写它不得与 Write
+// 并发调用；路径判死时若 writeLoop 正阻塞在 Write 上等流控额度，Close 自己就不返回，
+// 于是它下面那句 CloseWithError 执行不到，writeLoop 永远挂着。
+//
+// 上面几条泄漏用例抓到过它，但**靠的是运气**：只有整套测试的负载恰好让 writeLoop
+// 卡在流控里时才复现（连跑三遍 verify 撞出两次，而单独 -count=20 一次都没中）。
+// 一个只在负载下偶发的守卫，等于把"能不能发现回归"交给排队时机。
+//
+// 所以这里**主动制造**那个状态：客户端猛写、**故意一个字节都不读**，
+// 服务端的回声于是把客户端的接收窗口塞满，服务端那侧的 writeLoop 就阻塞在
+// QUIC 流控里。这时候再关，才是真正要测的那条路径。
+func TestNoGoroutineLeakWhenWriterIsFlowControlled(t *testing.T) {
+	func() {
+		port := freeUDPPort(t)
+		h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+			cc.EnableQUIC = true
+			cc.QUICPort = port
+			cc.ProbeInterval = 200 * time.Millisecond
+		})
+		serveQUICOn(t, h, port)
+		ctx := context.Background()
+
+		// ★ 必须先等到 QUIC 路径，并把流**钉**在它上面。
+		//
+		// 第一版没钉，用例照样绿——因为调度器按评分把这些流留在了 TCP 上
+		// （环回链路上 TCP 评分本来就更好，见 §8.1），于是被卡住的是 TCP 那条
+		// writeLoop，而 bug 在 quicConn.Close()。一个测不到目标代码的守卫
+		// 比没有守卫更糟：它只提供虚假的信心。
+		sess, err := h.client.Session(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var qp *path
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) && qp == nil {
+			for _, p := range sess.pathsSnapshot() {
+				if p.kind == "quic" {
+					qp = p
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if qp == nil {
+			t.Skip("QUIC 路径没起来，测不到目标代码")
+		}
+
+		var conns []net.Conn
+		for i := 0; i < 4; i++ {
+			c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.(*Stream).pathID.Store(qp.id)
+			conns = append(conns, c)
+		}
+
+		// 每条流写远超窗口的量，并且**从不读**。回声塞满接收窗口之后，
+		// 两侧的 writeLoop 都会停在 quic-go 的 Write 里等额度。
+		blob := make([]byte, 32*1024)
+		var wg sync.WaitGroup
+		for _, c := range conns {
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				for i := 0; i < 64; i++ {
+					if _, err := c.Write(blob); err != nil {
+						return // 写侧自己也被流控挡住了，正是我们要的状态
+					}
+				}
+			}(c)
+		}
+		wg.Wait()
+		time.Sleep(300 * time.Millisecond)
+
+		// ★ 就在写侧被卡住的这一刻关掉一切。
+		for _, c := range conns {
+			c.Close()
+		}
+		h.client.Close()
+		h.srv.Close()
+		h.ln.Close()
+		h.cover.Close()
+	}()
+
+	var left []string
+	for i := 0; i < 80; i++ {
+		time.Sleep(100 * time.Millisecond)
+		left = residualTideGoroutines("TestNoGoroutineLeakWhenWriterIsFlowControlled")
+		if len(left) == 0 {
+			return
+		}
+	}
+	for _, g := range left {
+		t.Logf("残留协程: %s", g)
+	}
+	t.Fatalf("写侧被流控卡住时关闭，本包还留着 %d 条协程", len(left))
 }
