@@ -2,6 +2,7 @@ package tide
 
 import (
 	"context"
+	"io"
 	"net"
 	"runtime"
 	"strconv"
@@ -605,3 +606,75 @@ func TestCloseStreamDoesNotBlockOnAStalledWriter(t *testing.T) {
 			"而且没有任何报错")
 	}
 }
+
+// 临时性 accept 错误不能让整个入站永久停止接受连接。
+//
+// ★ 最常见的是 EMFILE（进程 fd 用尽），其次是 ENFILE / ECONNRESET / ECONNABORTED。
+// 它们都会过去，而 Serve 一旦在那里 return，进程还在、端口还 listen 着、
+// 日志里什么都没有，现象只是"服务好好的，但再也连不上"。
+// 调用方还往往把返回值丢掉（clash 那个 listener 从前正是 `_ = srv.Serve(l)`），
+// 于是最后一点线索也没了。
+//
+// 处置照 Go 官方 net/http.Server：指数退避重试，5ms 起、封顶 1s。
+func TestServeRetriesTemporaryAcceptErrors(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(&ServerConfig{
+		PrivateKey: priv, TLSConfig: testTLSServer(t),
+		CoverAddr: "127.0.0.1:1", AllowAnyUser: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	ln := &flakyListener{fails: 4, reached: make(chan struct{}), hold: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ln) }()
+
+	select {
+	case <-ln.reached:
+		// 熬过了 4 次临时错误，仍在接受连接——正是要断言的。
+	case err := <-done:
+		t.Fatalf("Serve 在临时性 accept 错误上放弃了：%v —— "+
+			"入站就此永久停止接受连接，而且没有任何日志", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve 既没继续也没返回")
+	}
+	close(ln.hold)
+	srv.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 之后 Serve 没有退出")
+	}
+}
+
+// flakyListener 先吐 fails 次临时性错误，之后在 reached 上示意并挂住。
+type flakyListener struct {
+	fails   int
+	reached chan struct{}
+	hold    chan struct{}
+	once    sync.Once
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	if l.fails > 0 {
+		l.fails--
+		return nil, tempAcceptErr{}
+	}
+	l.once.Do(func() { close(l.reached) })
+	<-l.hold
+	return nil, io.EOF
+}
+func (l *flakyListener) Close() error   { return nil }
+func (l *flakyListener) Addr() net.Addr { return streamAddr("flaky") }
+
+// tempAcceptErr 模拟 EMFILE 那一类：Temporary() 为真、Timeout() 为假。
+type tempAcceptErr struct{}
+
+func (tempAcceptErr) Error() string   { return "accept: too many open files" }
+func (tempAcceptErr) Timeout() bool   { return false }
+func (tempAcceptErr) Temporary() bool { return true }

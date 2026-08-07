@@ -3,6 +3,7 @@ package tide
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -76,6 +77,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 // Serve 在 l 上接受连接。l 应当已经是**明文** listener：
 // TLS 由本函数套上，因为信道绑定要拿到 tls.Conn 本身。
 func (s *Server) Serve(l net.Listener) error {
+	var delay time.Duration
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -87,8 +89,38 @@ func (s *Server) Serve(l net.Listener) error {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			// ★ 临时性错误不能当成"服务结束"。
+			//
+			// 最常见的是 EMFILE（进程文件描述符用尽），其次是 ENFILE / ECONNRESET /
+			// ECONNABORTED。它们都会过去，而一旦在这里 return，**整个入站就永久停止
+			// 接受连接**了——进程还在、端口还listen着、日志里什么都没有，
+			// 现象只是"服务好好的，但再也连不上"。调用方还往往把这个返回值丢掉
+			// （clash 那个 listener 从前就是 `_ = srv.Serve(l)`），于是连最后一点
+			// 线索也没了。
+			//
+			// 处置照 Go 官方 net/http.Server：指数退避重试，5ms 起、封顶 1s。
+			// ⚠️ net.Error.Temporary 已标记废弃，但 net/http 至今仍用这个接口断言来
+			// 识别可重试的 accept 错误，标准库里也没有替代品——这里跟它保持一致。
+			var te interface{ Temporary() bool }
+			if errors.As(err, &te) && te.Temporary() {
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay *= 2
+				}
+				if delay > time.Second {
+					delay = time.Second
+				}
+				select {
+				case <-s.stopped:
+					return nil
+				case <-time.After(delay):
+				}
+				continue
+			}
 			return err
 		}
+		delay = 0
 		setCongestion(c, s.cfg.congestion())
 		go s.handleConn(c)
 	}
