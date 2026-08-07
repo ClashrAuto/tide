@@ -445,7 +445,16 @@ func (c *Client) handshake(ctx context.Context, s *Session, conn net.Conn, join 
 		}
 		// 0-RTT 被拒（票据过期/服务端重启/位图不同步）时连接已经不可用了——
 		// 服务端按 §6 把它转给掩护站点了，不能在同一条连接上重试。
-		// 这里返回错误，由上层退避后重拨；那次重拨会因为钱包里没有可用票据而走 1-RTT。
+		//
+		// ★ 必须把**整个钱包**丢掉，不能只丢刚用掉的那一张。
+		// 钱包里的票据来自同一批签发，服务端一重启就集体作废：一张被拒，其余全是死票。
+		// 原先只丢一张，于是上层每退避重拨一次就再抽一张死票再失败一次——
+		// DefaultTicketCount = 1024，客户端要连续失败上千次连接才轮得到 1-RTT。
+		// 用户那边看到的就是「所有访问全都不通」，且没有任何错误指向票据。
+		// 2026-08-07 实测：服务端容器重建后，客户端反复发 ZERO_RTT(0x03) 被失败关闭
+		// 转给掩护源站，日志里只有一句 `dial ... error: EOF`。
+		// RFC 9001 §4.6.2 对 QUIC 的要求是同一个意思：0-RTT 被拒 MUST 重置全部相关状态。
+		c.wallet.discardAll()
 		return nil, err
 	}
 	return c.oneRTT(s, conn, cb, flags, pathID, sid, kind)

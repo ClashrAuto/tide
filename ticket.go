@@ -431,3 +431,24 @@ func parseTicketGrant(b []byte) (base uint64, count uint16, seed [32]byte, ok bo
 	copy(seed[:], b[10:ticketGrantLen])
 	return base, count, seed, true
 }
+
+// discardAll 丢掉钱包里的全部票据。
+//
+// ★ 0-RTT 被拒时必须整包丢，不能只丢刚用掉的那一张。
+//
+// 钱包里的票据来自同一批签发（同一个 seed/base 谱系）。服务端重启、票据位图重置、
+// 或者换了一台后端之后，**这一批全都是死的**——一张被拒，其余每一张也都会被拒。
+// 只丢一张的话，每次重拨都会再抽一张死票再失败一次；DefaultTicketCount = 1024，
+// 于是客户端要连续失败一千多次连接才轮到 1-RTT。在用户那边的表现就是
+// 「所有访问全都不通」，而且没有任何错误信息指向票据。
+//
+// RFC 9001 §4.6.2 对 QUIC 的要求是同一个意思：0-RTT 被拒时客户端 MUST 重置
+// 与这次尝试相关的**全部**状态，而不是只丢掉这一次。
+//
+// 代价是可控的：万一只是单张票据重放（而非服务端重启），也不过是多做一次 1-RTT
+// 握手，随即换回一整批新票据。用一次握手换「永远不会被死票卡住」，这笔账很划算。
+func (w *ticketWallet) discardAll() {
+	w.mu.Lock()
+	w.batches = nil
+	w.mu.Unlock()
+}

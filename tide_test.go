@@ -702,6 +702,45 @@ func TestTicketWalletFallsBackTo1RTT(t *testing.T) {
 	}
 }
 
+// 0-RTT 被拒之后，钱包里剩下的票据**必须一起作废**。
+//
+// ★ 复现的是 2026-08-07 用户实测到的「所有访问全都不通」：
+// 服务端容器重建后票据位图清零，客户端手里那一批（DefaultTicketCount = 1024 张）
+// 集体作废。而原先的实现只丢掉刚用掉的那一张，于是上层每退避重拨一次，
+// 就再抽一张死票、再被失败关闭转给掩护源站、再失败一次——要连续失败一千多次
+// 才轮得到 1-RTT。客户端日志里只有一句 `dial ... error: EOF`，
+// 掩护源站的访问日志里则是一长串 ZERO_RTT(0x03) 帧。
+//
+// RFC 9001 §4.6.2 对 QUIC 的要求是同一个意思：0-RTT 被拒时 MUST 重置全部相关状态。
+func TestRejectedZeroRTTDiscardsWholeWallet(t *testing.T) {
+	w := newTicketWallet()
+	now := time.Now()
+	var seed [32]byte
+	const batch = 1024 // 与 DefaultTicketCount 同量级
+	w.add(100, batch, seed, now)
+
+	// 第一张：拿去做 0-RTT，被服务端拒了。
+	if _, _, ok := w.take(now); !ok {
+		t.Fatal("wallet should hand out the first ticket")
+	}
+	w.discardAll()
+
+	if _, _, ok := w.take(now); ok {
+		t.Fatalf("0-RTT 被拒之后钱包里还剩票据（同一批还有 %d 张）——"+
+			"每次重拨都会再抽一张死票再失败一次，客户端要连续失败上千次连接"+
+			"才轮得到 1-RTT，用户看到的就是「全部都连不上」", batch-1)
+	}
+	if n := w.remaining(now); n != 0 {
+		t.Fatalf("remaining() 还报 %d 张，钱包没清干净", n)
+	}
+
+	// 作废之后必须还能正常接收新一批（1-RTT 握手会带回来），不能把钱包弄成死的。
+	w.add(9000, 4, seed, now)
+	if _, _, ok := w.take(now); !ok {
+		t.Fatal("作废之后钱包收不下新票据了 —— 那样 0-RTT 就永久失效了")
+	}
+}
+
 // TICKET_REQUEST 是全协议最便宜的帧（4 字节），却让服务端起协程、读 crypto/rand、
 // 在票据库里新建一批留存 24 小时的位图，再回 42 字节。
 // 逐帧响应就是 RFC 9000 §21.9 说的那种"处理开销相对带宽不成比例"，
