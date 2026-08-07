@@ -79,6 +79,18 @@ type Stream struct {
 	// QUIC 路径上实际发出 549.9 MiB（76 倍），p50 往返 1 分 13 秒，4 条流全部
 	// 因为写超时失败。
 	rewinds atomic.Uint32
+	// deliveredRate/lastAckAt：交付速率估计（字节/秒，wmu 保护），用来把在途字节
+	// 限制在 BDP 附近。见 inflightCapLocked——固定窗口在小 BDP 链路上会同时
+	// 损失时延和吞吐。
+	deliveredRate float64
+	lastAckAt     time.Time
+	// pathRTT 是这条流所在路径的 RTT（纳秒），由 retransmitLoop 每轮刷新。
+	// 做成 atomic 是为了让 inflightCapLocked 在持 wmu 时能直接读，
+	// 不必再去拿 s.mu —— 那会形成 wmu→s.mu 的反向加锁顺序。
+	pathRTT atomic.Int64
+	// pathMinRTT 是同一条路径的**最小**往返（传播时延）。BDP 必须用它算——
+	// 用被排队撑大的 SRTT 会把"队列里积压的字节"误算成链路容量，窗口越算越大。
+	pathMinRTT atomic.Int64
 	// migrateVotes 由 Session.rebalance 在 s.mu 下读写（和 streams map 同一把锁），
 	// 所以是普通字段而不是 atomic。
 	migrateVotes int
@@ -243,10 +255,12 @@ func (st *Stream) writeChunk(p []byte) (int, error) {
 			st.wmu.Unlock()
 			return 0, ErrStreamClosed
 		}
-		// 两道闸：对端通告的接收上界，以及本端重传缓冲的容量。
-		// 后者是内存的硬约束——没有它，一条卡住的路径能让重传缓冲无限增长。
+		// 三道闸：对端通告的接收上界、本端重传缓冲的容量、以及**按 BDP 收紧的在途上限**。
+		// 第二道是内存的硬约束——没有它，一条卡住的路径能让重传缓冲无限增长。
+		// 第三道见 inflightCapLocked：窗口开得远大于链路 BDP 时，多出来的字节
+		// 不会更快到达，只会堆在网络的缓冲里变成时延。
 		avail := int64(st.peerMaxOff) - int64(st.sendOff)
-		if cap := int64(st.window) - int64(st.sendOff-st.ackOff); cap < avail {
+		if cap := int64(st.inflightCapLocked()) - int64(st.sendOff-st.ackOff); cap < avail {
 			avail = cap
 		}
 		if avail > 0 {
@@ -600,16 +614,19 @@ func (st *Stream) onAck(ack, maxOff uint64) {
 		return // 对端确认了没发过的字节：协议违规，忽略
 	}
 	if ack > st.ackOff {
+		prevAck := st.ackOff
 		st.retx = st.retx[ack-st.ackOff:]
 		st.ackOff = ack
 		if st.pendOff < st.ackOff {
 			st.pendOff = st.ackOff
 		}
-		st.lastProgress.Store(time.Now().UnixNano())
+		now := time.Now()
+		st.lastProgress.Store(now.UnixNano())
 		// 对端真的确认了字节 —— 退避清零，下一次卡住时重新从一个 rto 起步。
 		// 清零点必须是"ackOff 前进"，不能是"发出去了"：发得再多没被确认都不算进展，
 		// 否则退避永远归零，等于没退避。
 		st.rewinds.Store(0)
+		st.noteDeliveredLocked(ack-prevAck, now)
 	}
 	if maxOff > st.peerMaxOff {
 		st.peerMaxOff = maxOff
@@ -676,3 +693,77 @@ func (st *Stream) failWrite(err error) {
 
 // isBulk 判断这条流该不该被迁到 QUIC 路径（spec §8：批量流迁走，交互流留在 TCP）。
 func (st *Stream) isBulk() bool { return st.bytesSent.Load() >= bulkThreshold }
+
+// ---------------------------------------------------------------------------
+// 按 BDP 自适应的在途上限
+// ---------------------------------------------------------------------------
+
+const (
+	// minInflightCap 是在途上限的下界。**必须有**：低于 BDP 的窗口会把吞吐直接掐死。
+	// 台架实测（166ms×2Mbit，BDP≈41KiB）：窗口 16 KiB 时 25 秒只送出 4 个块，
+	// 吞吐基本归零；64 KiB 则又快又稳。
+	minInflightCap = 64 * 1024
+	// bdpFactor 是留给突发与 ACK 抖动的余量倍数。2×BDP 是拥塞控制里的常见取值。
+	bdpFactor = 2
+)
+
+// inflightCapLocked 给出当前允许的在途（未确认）字节上限。调用方必须持 st.wmu。
+//
+// ★ 固定窗口在两个方向上都是错的。
+//
+// DefaultStreamWindow = 512 KiB 是按 100Mbps×40ms（BDP≈500KiB）定的，对那条链路是对的。
+// 可一旦 BDP 小得多，多出来的窗口不会让字节更快到达——它们只会堆在网络缓冲里，
+// 变成纯粹的排队时延，而且排队又会触发 RTO 重发，把本就不够的带宽再吃掉一块。
+//
+// 台架实测（166ms × 2Mbit，BDP≈41KiB，只改窗口这一个变量）：
+//
+//	窗口        吞吐        p50
+//	512 KiB    1.6 MiB    9.02 s     ← 默认值
+//	256 KiB    2.9 MiB    3.52 s
+//	 64 KiB    2.8 MiB    0.48 s
+//	 16 KiB    ~0         0.22 s     ← 低于 BDP，吞吐塌掉
+//
+// 也就是说默认值在这条链路上**同时**损失了 18.8 倍的时延和 43% 的吞吐——
+// 不是取舍曲线，是纯亏。所以窗口要跟着实测 BDP 走：
+// 上限仍是配置的 window（快链路完全不受影响），下限 minInflightCap（防吞吐塌掉）。
+func (st *Stream) inflightCapLocked() uint64 {
+	if st.deliveredRate <= 0 {
+		return st.window
+	}
+	// 用 minRTT（传播时延）而不是 srtt：见 path.MinRTT 的说明。
+	rtt := time.Duration(st.pathMinRTT.Load())
+	if rtt <= 0 {
+		rtt = time.Duration(st.pathRTT.Load())
+	}
+	if rtt <= 0 {
+		return st.window
+	}
+	bdp := st.deliveredRate * rtt.Seconds()
+	c := uint64(bdp * bdpFactor)
+	if c < minInflightCap {
+		c = minInflightCap
+	}
+	if c > st.window {
+		c = st.window
+	}
+	return c
+}
+
+// noteDeliveredLocked 用"这次确认了多少字节、距上次确认多久"更新交付速率估计。
+// 调用方必须持 st.wmu。
+//
+// 用**被确认的字节**而不是发出去的字节：发出去多少不代表链路能吃下多少，
+// 只有对端确认了的才是真实交付速率。这与 lastProgress 的判据是同一个道理。
+func (st *Stream) noteDeliveredLocked(n uint64, now time.Time) {
+	if !st.lastAckAt.IsZero() {
+		if dt := now.Sub(st.lastAckAt).Seconds(); dt > 0 {
+			r := float64(n) / dt
+			if st.deliveredRate <= 0 {
+				st.deliveredRate = r
+			} else {
+				st.deliveredRate = 0.75*st.deliveredRate + 0.25*r
+			}
+		}
+	}
+	st.lastAckAt = now
+}

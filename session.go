@@ -1004,8 +1004,12 @@ func (s *Session) retransmitLoop() {
 		s.mu.Lock()
 		var stuck []*Stream
 		for _, st := range s.streams {
+			// 顺手把这条流所在路径的 RTT 刷进去：inflightCapLocked 要用它算 BDP，
+			// 而那里持着 wmu，不能再回头去拿 s.mu（会形成反向加锁顺序）。
+			st.pathRTT.Store(int64(s.rttForStreamLocked(st)))
+			st.pathMinRTT.Store(int64(s.minRTTForStreamLocked(st)))
 			// 每条流按**它自己那条路径**的 RTT 判，不用全局最快值——理由见 rtoForStreamLocked。
-			if st.stalledFor(now, s.rtoForStreamLocked(st)) {
+			if st.stalledFor(now, rtoFromRTT(time.Duration(st.pathRTT.Load()))) {
 				stuck = append(stuck, st)
 			}
 		}
@@ -1045,19 +1049,44 @@ func (s *Session) fastestRTTLocked() time.Duration {
 //
 // 路径没绑定或已经消失时退回全局最快值（老行为），那时也没有更好的依据。
 func (s *Session) rtoForStreamLocked(st *Stream) time.Duration {
-	var r time.Duration
+	return rtoFromRTT(s.rttForStreamLocked(st))
+}
+
+// minRTTForStreamLocked 给出这条流所在路径的**最小**往返（传播时延）。
+// 专供 BDP 估算：见 path.MinRTT 的说明——用 SRTT 会把排队算进容量里。
+func (s *Session) minRTTForStreamLocked(st *Stream) time.Duration {
 	if id := st.pathID.Load(); id != 0 {
 		for _, p := range s.paths {
 			if p.id == id {
-				r = p.RTT()
+				if r := p.MinRTT(); r > 0 {
+					return r
+				}
 				break
 			}
 		}
 	}
-	if r == 0 {
-		r = s.fastestRTTLocked()
+	var best time.Duration
+	for _, p := range s.paths {
+		if r := p.MinRTT(); r > 0 && (best == 0 || r < best) {
+			best = r
+		}
 	}
-	return rtoFromRTT(r)
+	return best
+}
+
+// rttForStreamLocked 给出这条流所在路径的 RTT；没绑定或路径已消失时退回全局最快值。
+func (s *Session) rttForStreamLocked(st *Stream) time.Duration {
+	if id := st.pathID.Load(); id != 0 {
+		for _, p := range s.paths {
+			if p.id == id {
+				if r := p.RTT(); r > 0 {
+					return r
+				}
+				break
+			}
+		}
+	}
+	return s.fastestRTTLocked()
 }
 
 func rtoFromRTT(rtt time.Duration) time.Duration {

@@ -4012,3 +4012,37 @@ func TestRTOFollowsTheStreamsOwnPath(t *testing.T) {
 		t.Fatalf("快路径 RTO 涨到了 %v —— 不该为了迁就慢路径把快路径的恢复也拖慢", rFast)
 	}
 }
+
+// 在途上限必须跟着 BDP 走，而且两个方向都要对：
+// 小 BDP 链路要收紧（否则多出来的字节只是排队时延），大 BDP 链路不能被压慢。
+func TestInflightCapFollowsBDP(t *testing.T) {
+	mk := func(rateBytesPerSec float64, minRTT time.Duration) *Stream {
+		st := &Stream{window: DefaultStreamWindow}
+		st.deliveredRate = rateBytesPerSec
+		st.pathMinRTT.Store(int64(minRTT))
+		return st
+	}
+
+	// 小 BDP：2 Mbit ≈ 256000 B/s，minRTT 166ms → BDP ≈ 42 KiB，2×BDP ≈ 85 KiB。
+	slow := mk(256000, 166*time.Millisecond)
+	if c := slow.inflightCapLocked(); c >= DefaultStreamWindow {
+		t.Fatalf("小 BDP 链路上在途上限仍是 %d（等于没收紧）——多出来的字节不会更快到达，"+
+			"只会堆成排队时延，实测因此同时损失 18.8 倍时延和 43%% 吞吐", c)
+	}
+	// 大 BDP：100 Mbit ≈ 12.5 MB/s，minRTT 40ms → BDP ≈ 500 KiB，不该被压到窗口以下。
+	fast := mk(12_500_000, 40*time.Millisecond)
+	if c := fast.inflightCapLocked(); c != DefaultStreamWindow {
+		t.Fatalf("大 BDP 链路上在途上限被压到 %d（窗口是 %d）——这会直接掐掉快链路的吞吐",
+			c, DefaultStreamWindow)
+	}
+	// 下界：BDP 极小也不能把吞吐掐死（16 KiB 那档实测 25 秒只送出 4 个块）。
+	tiny := mk(1000, time.Millisecond)
+	if c := tiny.inflightCapLocked(); c < minInflightCap {
+		t.Fatalf("在途上限跌到 %d，低于下界 %d —— 会把吞吐掐死", c, minInflightCap)
+	}
+	// 没有速率样本时保持原窗口，不能瞎猜。
+	cold := &Stream{window: DefaultStreamWindow}
+	if c := cold.inflightCapLocked(); c != DefaultStreamWindow {
+		t.Fatalf("还没有交付速率样本就擅自收紧到 %d —— 冷启动会被无端限速", c)
+	}
+}

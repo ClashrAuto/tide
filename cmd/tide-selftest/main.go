@@ -59,6 +59,10 @@ func main() {
 		useH3      = flag.Bool("h3", false, "run the QUIC path over HTTP/3 (spec §12.6 masquerade)")
 		congestion = flag.String("congestion", "", "TCP congestion control for TIDE paths (\"-\" = leave system default)")
 		quicListen = flag.String("quic-listen", "", "server: also serve QUIC on this address")
+		// window 只为实验存在：单流发送窗口同时也是**排队上限**。默认 512 KiB 是按
+		// 100Mbps×40ms 的 BDP 定的；换到 BDP 小得多的链路（比如 2Mbit×166ms ≈ 41 KiB），
+		// 一条流就能把十几倍 BDP 塞进网里，排队时延全落到用户头上。
+		window = flag.Uint64("window", 0, "client: 单流发送窗口字节数（0 = 默认 512 KiB）")
 	)
 	flag.Parse()
 
@@ -77,7 +81,7 @@ func main() {
 	case "client":
 		err = doClient(clientOpts{
 			server: *server, pub: *key, password: *password, target: *target, dur: *dur, rate: *rate,
-			streams: *streams, redundancy: *redun, bare: *bare,
+			streams: *streams, redundancy: *redun, bare: *bare, window: *window,
 			grace: *grace, probe: *probe, insecure: *insecure, quic: *useQUIC,
 			congestion: *congestion, h3: *useH3,
 		})
@@ -466,6 +470,7 @@ type clientOpts struct {
 	target           string
 	dur              time.Duration
 	rate, streams    int
+	window           uint64
 	redundancy, bare bool
 	grace, probe     time.Duration
 	insecure, quic   bool
@@ -493,6 +498,7 @@ func doClient(o clientOpts) error {
 		Congestion:    o.congestion,
 		SessionGrace:  o.grace,
 		ProbeInterval: o.probe,
+		StreamWindow:  o.window,
 	})
 	if err != nil {
 		return err

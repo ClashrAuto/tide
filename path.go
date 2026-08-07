@@ -719,3 +719,15 @@ func (p *path) sendH3Datagram(buf []byte) error {
 	}
 	return err
 }
+
+// MinRTT 返回观测到的最小往返，即链路的传播时延（不含排队）。
+//
+// ★ 算 BDP 必须用它而不是 SRTT。SRTT 在拥塞时已经被排队时延撑大了，
+// 拿它算出来的 BDP 会把"队列里积压的字节"也算成"链路容量"，
+// 于是窗口越算越大、队列越排越长——正是要避免的那个正反馈。
+// BBR 用 min_rtt × delivery_rate 估 BDP，也是同一个道理。
+func (p *path) MinRTT() time.Duration {
+	p.hmu.Lock()
+	defer p.hmu.Unlock()
+	return p.minRTT
+}
