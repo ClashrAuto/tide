@@ -114,6 +114,24 @@ func (s *Server) serveH3Conn(conn *quic.Conn) {
 		// （§9.1：UDP MUST NOT 重传）。
 		EnableDatagrams: true,
 	}
+	// ★ 交给 ServeQUICConn 的连接**必须由调用方关**，这是 quic-go 明写的契约：
+	// "All connections passed to http3.Server.ServeQUICConn need to be closed by
+	// the caller, before calling http3.Server.Close."
+	//
+	// 从前没人关它。于是 Server.Close() 之后，quic-go 内部的 AcceptStream 一直挂着，
+	// ServeQUICConn 永远不返回——这条协程连同整条 QUIC 连接一起泄漏，
+	// 每来一条 h3 连接就漏一份。和第 36 轮 ServeQUIC 那个 Accept 是同一类：
+	// **停机信号到不了正在阻塞的那一层**。
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-s.stopped:
+			conn.CloseWithError(0, "")
+			h3.Close()
+		case <-done:
+		}
+	}()
 	_ = h3.ServeQUICConn(conn)
 	bind.close()
 }
@@ -228,8 +246,21 @@ func (b *h3Binding) close() {
 
 // recvH3Datagrams 收 RFC 9297 数据报并按普通帧分发（服务端侧）。
 func recvH3Datagrams(p *path, st *http3.Stream) {
+	// ★ 不能传 context.Background()。路径死掉时 serveControl 会 st.Close()，
+	// 但关流**并不会**唤醒一个正挂在 ReceiveDatagram 上的调用（实测如此），
+	// 于是这条收数据报的协程会一直挂着。绑到 p.dead 上才是可靠的。
+	// 与第 36 轮 ServeQUIC 的 Accept 同一个坑，只是换了个函数。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-p.dead:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	for {
-		b, err := st.ReceiveDatagram(context.Background())
+		b, err := st.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}

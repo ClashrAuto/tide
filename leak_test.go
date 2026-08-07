@@ -2,7 +2,9 @@ package tide
 
 import (
 	"context"
+	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,8 +28,8 @@ func residualTideGoroutines(skip string) []string {
 			continue // 用例自己那条
 		}
 		lines := strings.Split(strings.TrimSpace(g), "\n")
-		if len(lines) > 6 {
-			lines = lines[:6]
+		if len(lines) > 14 {
+			lines = lines[:14]
 		}
 		out = append(out, strings.Join(lines, " | "))
 	}
@@ -113,4 +115,81 @@ func TestNoGoroutineLeakAfterClose(t *testing.T) {
 		t.Logf("残留协程: %s", g)
 	}
 	t.Fatalf("客户端与服务端都关掉之后，本包还留着 %d 条协程", len(left))
+}
+
+// h3 数据面也不能漏协程。
+//
+// ★ 它有自己的一整套长命协程（ServeH3 的 Accept 循环、每条 QUIC 连接一个
+// http3.Server、h3Binding、recvH3Datagrams 的收数据报循环、每条流一个 readLoop），
+// 与原生 QUIC 那条路**不共用**代码。第 36 轮那个 bug 正是 Accept 传了
+// context.Background()，而 recvH3Datagrams 里也有一个同样形状的
+// `ReceiveDatagram(context.Background())` —— 同一个坑值得单独踩一遍。
+//
+// 而且这条路刚刚才对 Coast 可用（此前 clash 的入站没有 h3 开关，
+// ServeH3 根本调不到），所以它是"新上线、没被真正跑过"的那一类。
+func TestNoGoroutineLeakAfterCloseH3(t *testing.T) {
+	func() {
+		port := freeUDPPort(t)
+		h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+			cc.EnableQUIC = true
+			cc.H3 = true
+			cc.QUICPort = port
+			cc.ProbeInterval = 200 * time.Millisecond
+		})
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		go func() { _ = h.srv.ServeH3(addr) }()
+		time.Sleep(400 * time.Millisecond)
+
+		ctx := context.Background()
+		c, err := h.client.DialContext(ctx, "tcp", "echo.invalid:80")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write([]byte("hello"))
+		buf := make([]byte, 5)
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		c.Read(buf)
+		c.Close()
+
+		// UDP 走 RFC 9297 的 HTTP Datagram，那是 h3 专有的一条路。
+		ps, err := h.client.DialPacket(ctx, "10.0.0.1:53")
+		if err == nil {
+			ps.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			ps.WriteTo([]byte("q"), "10.0.0.1:53")
+			ps.ReadFrom()
+			ps.Close()
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sess, _ := h.client.Session(ctx)
+			if sess != nil {
+				for _, p := range sess.pathsSnapshot() {
+					if p.kind == "quic" {
+						deadline = time.Now()
+						break
+					}
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		h.client.Close()
+		h.srv.Close()
+		h.ln.Close()
+		h.cover.Close()
+	}()
+
+	var left []string
+	for i := 0; i < 80; i++ {
+		time.Sleep(100 * time.Millisecond)
+		left = residualTideGoroutines("TestNoGoroutineLeakAfterCloseH3")
+		if len(left) == 0 {
+			return
+		}
+	}
+	for _, g := range left {
+		t.Logf("残留协程: %s", g)
+	}
+	t.Fatalf("h3 模式下关掉之后，本包还留着 %d 条协程", len(left))
 }
