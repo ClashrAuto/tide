@@ -1000,12 +1000,12 @@ func (s *Session) retransmitLoop() {
 		case <-t.C:
 		}
 		now := time.Now()
-		rto := s.currentRTO()
 
 		s.mu.Lock()
 		var stuck []*Stream
 		for _, st := range s.streams {
-			if st.stalledFor(now, rto) {
+			// 每条流按**它自己那条路径**的 RTT 判，不用全局最快值——理由见 rtoForStreamLocked。
+			if st.stalledFor(now, s.rtoForStreamLocked(st)) {
 				stuck = append(stuck, st)
 			}
 		}
@@ -1021,18 +1021,55 @@ func (s *Session) retransmitLoop() {
 func (s *Session) currentRTO() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return rtoFromRTT(s.fastestRTTLocked())
+}
+
+func (s *Session) fastestRTTLocked() time.Duration {
 	best := time.Duration(0)
 	for _, p := range s.paths {
 		if r := p.RTT(); r > 0 && (best == 0 || r < best) {
 			best = r
 		}
 	}
-	rto := 2*best + 200*time.Millisecond
+	return best
+}
+
+// rtoForStreamLocked 用**这条流实际所在那条路径**的 RTT 算 RTO。
+//
+// ★ 拿全局最快路径的 RTT 去judge一条跑在慢路径上的流，是错的判据。
+// 2026-08-07 soak 实测：QUIC 路径 RTT 250ms、同时并存的 TCP 路径 8.2s。
+// 一条被钉在 TCP 上的流，却按 250ms 去算"多久没进展算卡住"，
+// 于是它**永远**处于卡住状态，每个 RTO 都要重发一次整窗——
+// 这正是那场 76 倍放大的风暴的判据来源。退避能把风暴压住，
+// 但判据本身错了就还是会一直做无用重发。
+//
+// 路径没绑定或已经消失时退回全局最快值（老行为），那时也没有更好的依据。
+func (s *Session) rtoForStreamLocked(st *Stream) time.Duration {
+	var r time.Duration
+	if id := st.pathID.Load(); id != 0 {
+		for _, p := range s.paths {
+			if p.id == id {
+				r = p.RTT()
+				break
+			}
+		}
+	}
+	if r == 0 {
+		r = s.fastestRTTLocked()
+	}
+	return rtoFromRTT(r)
+}
+
+func rtoFromRTT(rtt time.Duration) time.Duration {
+	rto := 2*rtt + 200*time.Millisecond
 	if rto < 500*time.Millisecond {
 		rto = 500 * time.Millisecond
 	}
-	if rto > 4*time.Second {
-		rto = 4 * time.Second
+	// ★ 上界从 4s 抬到 30s。4s 意味着任何 RTT 超过 1.9s 的路径上的流都**恒定**判为卡住
+	// （2×1.9+0.2 > 4），跨洲拥塞链路上这太容易达到了。真正防跑飞的是每条流的
+	// 指数退避（见 Stream.rewinds），不该再靠一个压得过死的上界。
+	if rto > 30*time.Second {
+		rto = 30 * time.Second
 	}
 	return rto
 }

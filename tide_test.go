@@ -3964,3 +3964,51 @@ func TestRewindBacksOffExponentially(t *testing.T) {
 			"链路恢复之后重发会一直用着最大退避，白白慢下去", n)
 	}
 }
+
+// RTO 必须按**流实际所在的那条路径**算，不能拿全局最快路径的 RTT 去判所有流。
+//
+// ★ 2026-08-07 soak 实测：QUIC 路径 RTT 250ms，同时并存的 TCP 路径 8.2s。
+// 一条被钉在慢路径上的流，若按最快路径的 250ms 去算"多久没进展算卡住"，
+// 就**永远**是卡住状态——每个 RTO 都重发一次整窗，正是那场 76 倍放大的判据来源。
+// 另外旧上界 4s 也不行：2×1.9s+0.2s 就已经越界，也就是任何 RTT 超过 1.9 秒的路径
+// 都会让流恒定判卡；跨洲拥塞链路上这太容易达到。
+func TestRTOFollowsTheStreamsOwnPath(t *testing.T) {
+	// 不 defer closeWith：这些 path 是只填了 RTT 的裸夹具，拆毁流程会去碰它们
+	// 没初始化的字段。newSession 本身不起协程（那些是 Client.newSession 起的），
+	// 所以这里不关也没有泄漏。
+	s := newSession([16]byte{}, true, DefaultStreamWindow, time.Minute, time.Second, 16)
+
+	fast := &path{id: 1, sess: s, dead: make(chan struct{})}
+	fast.srtt = 250 * time.Millisecond
+	slow := &path{id: 2, sess: s, dead: make(chan struct{})}
+	slow.srtt = 8 * time.Second
+
+	s.mu.Lock()
+	s.paths = append(s.paths, fast, slow)
+	s.mu.Unlock()
+
+	stFast := &Stream{}
+	stFast.pathID.Store(1)
+	stSlow := &Stream{}
+	stSlow.pathID.Store(2)
+
+	s.mu.Lock()
+	rFast := s.rtoForStreamLocked(stFast)
+	rSlow := s.rtoForStreamLocked(stSlow)
+	s.mu.Unlock()
+
+	if rSlow <= rFast {
+		t.Fatalf("慢路径上的流拿到的 RTO (%v) 不比快路径的 (%v) 大 —— "+
+			"说明判据还在用全局最快值，慢路径上的流会被恒定判为卡住并无休止重发",
+			rSlow, rFast)
+	}
+	// 8s 的路径应当得到 2×8+0.2 ≈ 16.2s，旧的 4s 上界会把它压掉。
+	if rSlow < 10*time.Second {
+		t.Fatalf("慢路径 RTO 只有 %v；8s 往返的路径至少该有十几秒，"+
+			"被上界压死的话流会一直误判为卡住", rSlow)
+	}
+	// 快路径仍然要快，别把所有流一起拖慢。
+	if rFast > 2*time.Second {
+		t.Fatalf("快路径 RTO 涨到了 %v —— 不该为了迁就慢路径把快路径的恢复也拖慢", rFast)
+	}
+}
