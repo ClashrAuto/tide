@@ -1,6 +1,7 @@
 package tide
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -678,3 +679,70 @@ type tempAcceptErr struct{}
 func (tempAcceptErr) Error() string   { return "accept: too many open files" }
 func (tempAcceptErr) Timeout() bool   { return false }
 func (tempAcceptErr) Temporary() bool { return true }
+
+// 前向保密的那一份临时材料**不能**被对端省掉。
+//
+// ★ ee（ephemeral-ephemeral）是第 22 轮补上的：没有它，整条会话的密钥都能由
+// "服务端静态私钥 + 一份录音"事后重算出来（对一个默认威胁模型里就包含
+// "服务器可能被查抄"的协议，这是最不该缺的一条）。
+//
+// 而它是**对端提供**的一段字节：客户端的那份在 kem_share / zero_seal.eph 里，
+// 服务端的那份在 ACCEPT.srv_eph 里。既然由对端提供，就必须问一句：
+// 对端能不能干脆不给、从而把整条会话降级成没有前向保密？
+//
+// 答案必须是不能，而且必须是**两侧**都不能——所以这条用例两边都验：
+// 少给、给全零、给一段无效点，都必须是硬失败，而不是"那就不做 ee 了"。
+// sessionSecret 的注释一度写着 ee 为空是"解析老对端"的兼容路径；
+// draft-02 已经把这两个字段改成必需，那条路早就不存在了，注释也已经改掉。
+func TestForwardSecrecyMaterialCannotBeOmitted(t *testing.T) {
+	// 服务端侧：客户端不给、或给不够长度，必须拒。
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"完全不给", nil},
+		{"空切片", []byte{}},
+		{"短一个字节", make([]byte, cliEphLen-1)},
+	} {
+		if _, _, err := serverEphemeral(tc.in); err == nil {
+			t.Fatalf("服务端接受了%s的客户端临时材料 —— 会话就此没有前向保密", tc.name)
+		}
+	}
+
+	// 服务端侧：长度够但内容无效（全零不是合法的 X25519 公钥）也必须拒，
+	// 不能"算出个全零共享值"就接着用。
+	if _, _, err := serverEphemeral(make([]byte, cliEphLen)); err == nil {
+		t.Fatal("服务端接受了全零的客户端临时材料")
+	}
+
+	// 客户端侧：服务端回一个全零 srv_eph 时也必须拒。
+	// 这是**恶意服务端**的降级尝试：它想让会话密钥只依赖它自己的长期私钥。
+	_, eph, err := newEphSecrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientEphemeralShared(eph, make([]byte, srvEphLen)); err == nil {
+		t.Fatal("客户端接受了全零的服务端临时材料 —— " +
+			"恶意服务端可以借此把会话降级成没有前向保密")
+	}
+
+	// 正路要通，否则上面几条"拒"可能只是因为函数根本不工作。
+	cliPub, cliEph, err := newEphSecrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvPub, srvEE, err := serverEphemeral(cliPub)
+	if err != nil {
+		t.Fatalf("正常握手的服务端侧失败了：%v", err)
+	}
+	cliEE, err := clientEphemeralShared(cliEph, srvPub)
+	if err != nil {
+		t.Fatalf("正常握手的客户端侧失败了：%v", err)
+	}
+	if !bytes.Equal(srvEE, cliEE) {
+		t.Fatal("两侧算出的 ee 不一致 —— 会话密钥根本对不上")
+	}
+	if len(srvEE) == 0 {
+		t.Fatal("ee 是空的")
+	}
+}

@@ -400,8 +400,14 @@ func handshakeKey(clientRandom, ikm, transcript []byte) ([]byte, error) {
 // 与 session_id 派生会话主密钥。
 //
 // ★ ee 必须混进来，否则整条会话的密钥都能由"服务端静态私钥 + 一份录音"重算出来
-// （见 serverEphemeral 上面那段）。ee 为空只在解析老对端时出现，
-// 那种情况下前向保密不成立，属于兼容性降级而不是正常路径。
+// （见 serverEphemeral 上面那段）。
+//
+// ⚠️ 这里曾经写着"ee 为空只在解析老对端时出现，属于兼容性降级"——那句话现在是错的，
+// 而且错得危险：draft-02 已经把两侧的临时材料都改成**必需**字段（线格式不兼容变更），
+// serverEphemeral 与 clientEphemeralShared 现在都对缺失/无效的材料硬失败。
+// 也就是说"ee 为空"这条路**不存在**，对端无法靠省略它把会话降级成没有前向保密。
+// 留着那句注释的风险是有人照着它去加一条"兼容老对端"的回退分支，
+// 那等于亲手把降级攻击装回去。
 func sessionSecret(base, ee []byte, sessionID []byte) ([]byte, error) {
 	ikm := make([]byte, 0, len(base)+len(ee))
 	ikm = append(ikm, base...)
