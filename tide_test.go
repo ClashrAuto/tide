@@ -4137,3 +4137,30 @@ func TestClosedWindowReopensWithoutWaitingForRTO(t *testing.T) {
 	}
 	t.Logf("1 MiB / %d KiB 窗口：%v", win/1024, elapsed)
 }
+
+// 在途下界必须盖得住 ACK 触发阈值，否则两边互相饿死。
+//
+// 发送方最多只能有 minInflightCap 字节未确认；接收方要累计 ackThreshold 字节
+// 才回一个 ACK。前者小于后者时，发送方发满就停下等 ACK，而接收方永远等不到
+// 那第 ackThreshold 个字节——链路是空的，双方各等各的，只能靠重传定时器
+// 一轮一轮往前挪。
+//
+// 这不是理论推演，是实测撞出来的（2026-08-22，pi5 → 192.168.20.239 千兆）：
+// 把下界按共用路径的流数摊薄到 16 KiB（< ackThreshold 32 KiB）之后，
+// 16 条流的吞吐从 645.3 MiB/12s 塌到 18.3 MiB/12s，p99 往返 22ms → 2.25s；
+// 4 条流 186.0 → 4.4 MiB。而单流（摊薄后仍是 64 KiB）毫发无损——
+// 正是这个"只有多流才坏"的形态让它看起来像并发问题，而不像常量取值问题。
+//
+// 所以：要削常驻队列就得让这两个常量**一起**下调，单独动一个必然踩这个坑。
+func TestInflightFloorCoversAckThreshold(t *testing.T) {
+	if minInflightCap < ackThreshold {
+		t.Fatalf("在途下界 %d < ACK 触发阈值 %d —— 发送方发满也凑不够让对端回 ACK 的量，"+
+			"两边互相饿死，只能靠重传定时器往前挪（实测吞吐掉 35 倍）",
+			minInflightCap, ackThreshold)
+	}
+	if minInflightCap < 2*ackThreshold {
+		t.Fatalf("在途下界 %d 只有 ACK 触发阈值 %d 的 %.1f 倍——余量不足，"+
+			"稍有乱序或重传就会退化成上面那种互等",
+			minInflightCap, ackThreshold, float64(minInflightCap)/float64(ackThreshold))
+	}
+}
