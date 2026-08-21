@@ -414,14 +414,16 @@ func (st *Stream) pump() {
 			n = MaxPayload
 		}
 		off := st.pendOff
-		chunk := make([]byte, n)
-		copy(chunk, st.retx[base:base+n])
+		// 直接拼出待发的 payload，而不是先复制一份 chunk 再拼一次：
+		// 那个中间副本唯一的作用就是"在放锁之后还拿得到这段字节"，
+		// 而在锁里一次拼好同样满足它，且每帧省下一次分配与一次 4 KiB 拷贝。
+		// 实测每 4 KiB 数据块原本要 5.4 次堆分配，pump 一个人占 36%。
+		payload := make([]byte, 0, VarintLen(off)+int(n))
+		payload = AppendVarint(payload, off)
+		payload = append(payload, st.retx[base:base+n]...)
 		st.pendOff += n
 		st.wmu.Unlock()
 
-		payload := make([]byte, 0, VarintLen(off)+len(chunk))
-		payload = AppendVarint(payload, off)
-		payload = append(payload, chunk...)
 		if err := st.sess.sendOnStream(st, FrameStreamData, 0, payload); err != nil {
 			// 发送失败意味着当前路径没了。把 pendOff 退回去，等新路径接管后重发。
 			// 这一步是"路径死亡对上层不可见"的全部秘密。

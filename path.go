@@ -265,9 +265,19 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 	return nil
 }
 
+// maxRecycledWriteBuf 是发送缓冲复用的上界，见 writeLoop 里的 spare。
+// 取 256 KiB：稳态批量远小于它，而超过它的只可能是一次性突发。
+const maxRecycledWriteBuf = 256 * 1024
+
 func (p *path) writeLoop() {
 	defer p.markDeadReason("write loop exited")
 	var out []byte
+	// spare 是上一轮已经发完的那块 wbuf。把它交还给发送侧复用，而不是每轮
+	// 置 nil 让 AppendFrame 从零重新长一遍——后者在分配 profile 里占 20.7%。
+	// 只有 writeLoop 碰 spare，交接点是下面那次持锁的交换，所以不需要额外同步：
+	// 换出去的是**上一轮**的数组（早已 seal 并写完），别人往它上面追加时
+	// 我们手里拿的是另一块。
+	var spare []byte
 	for {
 		p.wmu.Lock()
 		for len(p.wbuf) == 0 && !p.wclosed {
@@ -278,8 +288,15 @@ func (p *path) writeLoop() {
 			return
 		}
 		batch := p.wbuf
-		p.wbuf = nil
+		p.wbuf = spare[:0]
 		p.wmu.Unlock()
+		// 复用有上界：一次异常大的突发不该让这块缓冲永久占着高水位。
+		// 每条路径一块，服务端上路径数就是会话数，无上界的话是内存滞留。
+		if cap(batch) <= maxRecycledWriteBuf {
+			spare = batch
+		} else {
+			spare = nil
+		}
 
 		out = out[:0]
 		if p.sealer == nil {
