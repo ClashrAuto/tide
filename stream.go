@@ -52,7 +52,11 @@ type Stream struct {
 	finOff   uint64
 	rErr     error
 	ackedAdv uint64 // 上次通告出去的 ackOff
-	window   uint64
+	// ackedMaxOff 是上次通告出去的**接收上界**。它与 ackedAdv 是两个独立的量：
+	// 应用把 recvBuf 读空并不改变 recvOff，只把上界抬高——只看 ackedAdv 就永远
+	// 发现不了"窗口重新打开了"这件事。见 maybeAckLocked。
+	ackedMaxOff uint64
+	window      uint64
 
 	// ---- 路径亲和 ----
 	pathID    atomic.Uint32
@@ -513,6 +517,17 @@ func (st *Stream) drainReorderLocked() {
 	}
 }
 
+// advertisableLocked 算这一刻该通告的接收上界。flushAck 用同一个式子——
+// 判据与通告值必须同源，否则"该不该发"和"发出去多少"会各说各话。
+// 调用方必须持 st.rmu。
+func (st *Stream) advertisableLocked() uint64 {
+	free := int64(st.window) - int64(len(st.recvBuf)) - int64(st.reorderN)
+	if free < 0 {
+		free = 0
+	}
+	return st.recvOff + uint64(free)
+}
+
 // maybeAckLocked 在累计到阈值或被强制时回一个 STREAM_ACK。
 // 必须在 rmu 持有时调用。
 //
@@ -540,11 +555,57 @@ func (st *Stream) drainReorderLocked() {
 // 那边的原话是 writeFrame"排一帧、不施加反压——阻塞的是 handler，不是 serve 协程"；
 // 控制帧一律经通道交给别的协程写。这里同构：readLoop 只做一次原子置位，
 // 真正的写留给别的协程，它堵住也不影响读侧继续排空。
+// 三条判据，任一成立就发：
+//
+//	① 又连续收了 ≥ ackThreshold —— 让对端及时回收重传缓冲。
+//	② 通告上界又长了 ≥ ackThreshold —— 常规的窗口通告。
+//	③ 对端把上次给的额度用光了，而我们又腾出了空间 —— 见函数体末尾。
+//
+// ★ ② 不是锦上添花，缺了它是死锁。① 量的是 recvOff，而 Read 排空 recvBuf
+// **不改变 recvOff**：于是窗口一旦被填满，发送方停在 writeChunk 的
+// wcond.Wait 上等开窗，接收方读完了却因为 recvOff 没动而一个字节都不通告，
+// 双方谁也不会先动——直到重传定时器（下限 500ms，指数退避到秒级）把它踹开。
+// 实测（192.168.20.239 ↔ pi5，16 条流打满千兆）：把 window 调到与 ackThreshold
+// 同量级时，吞吐从 758 MiB/15s 塌到 9.2 MiB/15s（82 倍），p99 往返 1.47 秒，
+// 而这一整段时间里链路是空的。默认 window(512 KiB) ≫ ackThreshold(32 KiB)
+// 只是把它藏起来：任何"消费端比生产端慢"的真实流量——代理给慢客户端下发大文件
+// 正是这一类——照样会周期性撞上零窗口，每撞一次赔一个 RTO。
+//
+// ★ 两个水位在 flushAck 里一起复位，所以稳态下它们同步推进、由同一个 ACK 覆盖，
+// ACK 频率不会翻倍；只有窗口开合（也就是真正需要它的时候）②才单独触发。
 func (st *Stream) maybeAckLocked(force bool) {
-	if !force && st.recvOff-st.ackedAdv < ackThreshold {
+	if force {
+		st.scheduleAck()
 		return
 	}
-	st.scheduleAck()
+	if st.recvOff-st.ackedAdv >= ackThreshold {
+		st.scheduleAck()
+		return
+	}
+	// ⚠️ 无符号减法：上界会**回退**（乱序缓冲涨起来时 free 变小），
+	// 不先比大小的话一次回退就下溢成天文数字，判据恒真 → ACK 风暴。
+	adv := st.advertisableLocked()
+	if adv <= st.ackedMaxOff {
+		return
+	}
+	if adv-st.ackedMaxOff >= ackThreshold {
+		st.scheduleAck()
+		return
+	}
+	// ③ 兜底，也是这三条里唯一不能省的一条：对端已经把上次给的额度**用光**了
+	// （ackedMaxOff ≤ recvOff ⇔ 我们通告出去的上界已经全部收到）。这时它必然停在
+	// writeChunk 的 wcond.Wait 上，而它醒过来只有一条路——我们把新腾出的空间说出去。
+	// 于是哪怕只腾出几个字节也必须说：不说就是双方对等相等，谁都不会先动。
+	//
+	// ★ 只有 ② 而没有 ③ 是不够的，别把它当冗余删掉：② 要求上界长够 ackThreshold，
+	// 而窗口本身就可能只有那么大（实测 window=32 KiB 时照样死锁，
+	// 栈上是"客户端等开窗 / 服务端 io.Copy 等数据、收缓冲却是空的"）。
+	// ★ 会不会退化成 SWS（一个字节一个字节地通告）：不会退化到有害的程度——
+	// scheduleAck 的 ackBusy 保证一条流同时只有一个 ACK 在写，写的这段时间里
+	// 排空的字节会并进下一个 ACK，天然是一道阻尼。
+	if st.ackedMaxOff <= st.recvOff {
+		st.scheduleAck()
+	}
 }
 
 // forceAck 供 FIN、迁移完成等需要立刻同步状态的时机。
@@ -593,12 +654,9 @@ func (st *Stream) flushAck() {
 	ack := st.recvOff
 	// 通告上界 = 已连续接收 + 剩余缓冲空间。读得慢的应用会自然把窗口压小，
 	// 反压一路传回发送端，而不是让中间缓冲无限膨胀。
-	free := int64(st.window) - int64(len(st.recvBuf)) - int64(st.reorderN)
-	if free < 0 {
-		free = 0
-	}
-	maxOff := ack + uint64(free)
+	maxOff := st.advertisableLocked()
 	st.ackedAdv = ack
+	st.ackedMaxOff = maxOff
 	st.rmu.Unlock()
 
 	payload := make([]byte, 0, 16)

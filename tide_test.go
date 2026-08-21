@@ -4076,3 +4076,64 @@ func TestPathlessSessionIsNotHandedToNewConnections(t *testing.T) {
 		t.Fatalf("会话有路径时 pathlessFor 报了 %v —— 会无端把健康会话换掉", d)
 	}
 }
+
+// 窗口被填满之后，接收端把缓冲读空必须**当场**把重新打开的窗口通告出去。
+//
+// 回归的是一个死锁：判据从前只看 recvOff（收了多少），而 Read 排空 recvBuf
+// 不改变 recvOff，于是"窗口又开了"这件事一个字节都不会送出去；发送方停在
+// writeChunk 里等开窗，接收方等发送方，双方都不动，直到重传定时器（下限 500ms、
+// 指数退避到秒级）把它踹开。默认 window(512 KiB) ≫ ackThreshold(32 KiB) 把它藏住了，
+// 把两者调到同一量级就必现。
+//
+// 实测（192.168.20.239 ↔ pi5，16 条流打满千兆）：window 调到 32 KiB 时
+// 吞吐 758 MiB/15s → 9.2 MiB/15s，p99 往返 1.47 秒。
+//
+// 判据是**时间**而不是"传完没有"：坏版本最终也传得完，只是每 32 KiB 赔一个 RTO。
+func TestClosedWindowReopensWithoutWaitingForRTO(t *testing.T) {
+	const win = 32 * 1024 // 与 ackThreshold 同量级：窗口会反复关死
+	h := newHarness(t, func(cc *ClientConfig, sc *ServerConfig) {
+		cc.StreamWindow = win
+		sc.StreamWindow = win
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c, err := h.client.DialContext(ctx, "tcp", "example.invalid:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 1 MiB 要跨过 32 个窗口，坏版本每个至少赔 500ms ⇒ 16 秒起。
+	const total = 1 << 20
+	msg := make([]byte, total)
+	for i := range msg {
+		msg[i] = byte(i)
+	}
+
+	werr := make(chan error, 1)
+	go func() {
+		_, err := c.Write(msg)
+		werr <- err
+	}()
+
+	start := time.Now()
+	got := make([]byte, total)
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("读满 %d 字节失败（%v 之后）：%v", total, time.Since(start), err)
+	}
+	elapsed := time.Since(start)
+	if err := <-werr; err != nil {
+		t.Fatalf("写失败：%v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatal("回声内容不一致")
+	}
+	// 环回上这一趟是毫秒级；给 3 秒是留给 -race 和忙碌 CI 的余量，
+	// 而坏版本要 16 秒以上，两者之间隔着一个数量级，不会抖成假红。
+	if elapsed > 3*time.Second {
+		t.Fatalf("1 MiB 经 %d KiB 窗口用了 %v——窗口重开只能靠重传定时器兜底，"+
+			"说明 Read 之后没有通告新的接收上界", win/1024, elapsed)
+	}
+	t.Logf("1 MiB / %d KiB 窗口：%v", win/1024, elapsed)
+}

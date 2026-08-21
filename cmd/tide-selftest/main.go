@@ -29,7 +29,10 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -63,8 +66,25 @@ func main() {
 		// 100Mbps×40ms 的 BDP 定的；换到 BDP 小得多的链路（比如 2Mbit×166ms ≈ 41 KiB），
 		// 一条流就能把十几倍 BDP 塞进网里，排队时延全落到用户头上。
 		window = flag.Uint64("window", 0, "client: 单流发送窗口字节数（0 = 默认 512 KiB）")
+		// pprof 只在压测时用：TIDE 的 CPU 开销分布不看 profile 就只能猜，而
+		// 「猜错优化点」在这种协议里代价很高——改错的是数据面。
+		// 默认空 = 不监听，出货形态与此前逐字节相同。
+		pprofAddr = flag.String("pprof", "", "expose net/http/pprof on this address (debug only, e.g. 127.0.0.1:6060)")
 	)
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		// 锁竞争才是这个协议在多流下的主要时延来源，而 CPU profile 完全看不见它
+		// （阻塞的 goroutine 不占 CPU 样本）。两个采样率都只在 -pprof 打开时才生效。
+		runtime.SetMutexProfileFraction(5)
+		runtime.SetBlockProfileRate(10000) // 纳秒：只记 >10µs 的阻塞，开销可忽略
+		go func() {
+			fmt.Fprintf(os.Stderr, "pprof on http://%s/debug/pprof/\n", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "pprof: %v\n", err)
+			}
+		}()
+	}
 
 	var err error
 	switch *mode {
