@@ -86,10 +86,18 @@ type path struct {
 	// 写侧：帧先攒进 wbuf，由 writer goroutine 批量封装下发。
 	// 攒批不只是为了少几次 syscall——它让判决窗口里的多个小帧合成一个
 	// 长度落在 HTTPS 分布内的记录，单帧一记录反而会暴露帧边界。
-	wmu     sync.Mutex
-	wcond   *sync.Cond
+	wmu   sync.Mutex
+	wcond *sync.Cond
+	// wdrain 唤醒因为路径积压太多而等在 writeFrame 里的**数据帧**生产者。
+	// 单独一个条件变量而不是复用 wcond：后者一 Broadcast 就会把 writeLoop
+	// 也叫醒，让它空转一圈再睡回去。
+	wdrain  *sync.Cond
 	wbuf    []byte
 	wclosed bool
+	// 自适应发送预算：whw 是当前高水位，wthrottled 记「上一轮挡过生产者」。
+	// 见 pathSendBudgetMin/pathSendBudgetMax 与 writeLoop 开头的生长判据。
+	whw        int
+	wthrottled bool
 
 	// 健康
 	hmu     sync.Mutex
@@ -255,6 +263,29 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 	pad := p.pad.padFor(streamID, len(payload))
 
 	p.wmu.Lock()
+	// ★ 只对**数据帧**施加背压，控制帧与 ACK 一律直接入队。
+	//
+	// 这是 tide 里排队时延的真正闸门。从前唯一的闸门是每条流的在途上限
+	// （sendOff-ackOff ≤ inflightCap），而那个量按设计就滞后一个 ackThreshold，
+	// 于是下界不得不 ≥ 阈值，而下界又是**每条流**一份——N 条流共用一条路径时
+	// 常驻队列就是 N 份，与链路吃不吃得下毫无关系。
+	// 队列既然发生在路径上，就该在路径上量、在路径上挡。
+	//
+	// ⚠️ 绝不能对控制帧/ACK 阻塞：那条路是从 readLoop 下来的，堵住它等于
+	// "对端要开窗得靠我们把数据读走，而我们正等着对端开窗"——本文件
+	// maybeAckLocked 上方那段记的就是这个死锁。pump 只从应用协程和 rewind
+	// 自己的协程调用，不在 readLoop 链上，所以挡它是安全的。
+	if t == FrameStreamData {
+		if p.whw == 0 {
+			p.whw = pathSendBudgetMin
+		}
+		for len(p.wbuf) >= p.whw && !p.wclosed {
+			// 记下"这一轮挡过人"。writeLoop 若紧接着发现缓冲空了，
+			// 就说明预算比链路吃得下的还小，该长。
+			p.wthrottled = true
+			p.drainCondLocked().Wait()
+		}
+	}
 	if p.wclosed {
 		p.wmu.Unlock()
 		return ErrClosed
@@ -269,6 +300,44 @@ func (p *path) writeFrame(t FrameType, flags uint8, streamID uint64, payload []b
 // 取 256 KiB：稳态批量远小于它，而超过它的只可能是一次性突发。
 const maxRecycledWriteBuf = 256 * 1024
 
+// 发送预算：一条路径上"还没交给内核"的字节上界。
+//
+// ★ 它必须**自适应**，固定值做不到。预算要同时满足两个相反的要求：
+// 大到能盖住链路 BDP（小了就是欠载，掐吞吐），小到不把队列养起来（大了就是排队时延）。
+// 而 BDP 在本协议要跑的链路之间差着三个数量级——千兆 LAN 约 35 KB，
+// 而 100ms×1% 丢包那条在恢复期需要几百 KB 才不欠载。实测固定值两头不讨好
+// （pi5 → 192.168.20.239，16 条流，12 秒，各四对配对）：
+//
+//	预算        100ms 干净                 100ms + 1% 丢包
+//	不限(旧)    p50 340ms  262 MiB         p90 27~51s   均 10.1 MiB
+//	128 KiB     p50 172ms  258 MiB  ✓      p90 4.6~8.8s 均  3.1 MiB  ✗ 吞吐塌 69%
+//	384 KiB     p50 178ms  262 MiB  ✓      p90 6.4~13.8s 均  7.4 MiB ✗ 仍塌 ~50%
+//
+// 所以改成自己找：从下界起步，**只在"挡过生产者、可路径转头就空了"时翻倍**——
+// 那正是"预算比链路吃得下的还小"的直接证据。不主动衰减：路径是随连接生灭的，
+// 一条曾经需要大预算的路径没理由把它交回去，而上界把内存兜住了。
+const (
+	// pathSendBudgetMin 是起步值，也是下界。
+	pathSendBudgetMin = 128 * 1024
+	// pathSendBudgetMax 是上界。每条路径一份，服务端上路径数即会话数，
+	// 所以它同时是内存的闸门。1 MiB 与从前按流数累加出来的积压同量级，
+	// 也就是说最坏情况不比改动前更差。
+	pathSendBudgetMax = 1024 * 1024
+)
+
+// drainCondLocked 取（必要时建立）wdrain。调用方必须持 p.wmu。
+//
+// ★ 惰性建立而不是在 newPath 里一次建好：测试里有六处直接 &path{…} 构造，
+// 它们只设了 wcond。漏设一个字段的代价是 Broadcast 当场 nil panic，
+// 而那个 panic 会从 markDeadReason 的 defer 里翻出来，栈上看到的是
+// "写循环退出"，与真正的原因隔了两层——实测就是这么浪费了一轮。
+func (p *path) drainCondLocked() *sync.Cond {
+	if p.wdrain == nil {
+		p.wdrain = sync.NewCond(&p.wmu)
+	}
+	return p.wdrain
+}
+
 func (p *path) writeLoop() {
 	defer p.markDeadReason("write loop exited")
 	var out []byte
@@ -280,6 +349,19 @@ func (p *path) writeLoop() {
 	var spare []byte
 	for {
 		p.wmu.Lock()
+		// ★ 生长判据：上一轮挡过生产者，而现在缓冲是空的——我们把人挡住了，
+		// 链路却在空转。这是"预算太小"的直接证据，比任何速率估计都硬。
+		// 反过来，缓冲非空说明预算正好够用或有余，不动。
+		if len(p.wbuf) == 0 && p.wthrottled {
+			p.wthrottled = false
+			if p.whw < pathSendBudgetMax {
+				p.whw *= 2
+				if p.whw > pathSendBudgetMax {
+					p.whw = pathSendBudgetMax
+				}
+				p.drainCondLocked().Broadcast()
+			}
+		}
 		for len(p.wbuf) == 0 && !p.wclosed {
 			p.wcond.Wait()
 		}
@@ -289,6 +371,8 @@ func (p *path) writeLoop() {
 		}
 		batch := p.wbuf
 		p.wbuf = spare[:0]
+		// 缓冲刚被取空，放行等在高水位上的数据帧生产者。
+		p.drainCondLocked().Broadcast()
 		p.wmu.Unlock()
 		// 复用有上界：一次异常大的突发不该让这块缓冲永久占着高水位。
 		// 每条路径一块，服务端上路径数就是会话数，无上界的话是内存滞留。
@@ -665,6 +749,8 @@ func (p *path) markDeadReason(reason string) {
 		p.wmu.Lock()
 		p.wclosed = true
 		p.wcond.Broadcast()
+		// 挡在高水位上的生产者也要放行，否则路径死了它们还挂着。
+		p.drainCondLocked().Broadcast()
 		p.wmu.Unlock()
 		if p.qmux != nil {
 			p.qmux.close()
