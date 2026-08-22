@@ -107,6 +107,12 @@ func newPacketStream(s *Session, st *Stream) *PacketStream {
 // 上层协议（QUIC、DNS、游戏）自己的拥塞与超时行为，通常比丢包更糟。
 // 路径切换期间丢掉的数据报就是丢了——这与在真实网络上丢包没有区别，
 // 上层应用早就为此做好了准备。
+// User 返回这条包流所属会话认证到的用户 ID。见 `Stream.User`。
+//
+// ★ UDP 那一路同样要能归属：手机上的 QUIC（YouTube 之类）全走这里，
+//   缺了它「这台设备跑了多少流量」会只算 TCP，看起来像用得很少。
+func (ps *PacketStream) User() [16]byte { return ps.sess.User() }
+
 func (ps *PacketStream) WriteTo(b []byte, addr string) (int, error) {
 	if len(b) > MaxFrameBody-300 {
 		return 0, ErrFrameTooLarge

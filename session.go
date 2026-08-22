@@ -115,6 +115,16 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 // ID 返回会话标识。
 func (s *Session) ID() [16]byte { return s.id }
 
+// User 返回这条会话认证时用的用户 ID（`UserIDFromPassword` 的产物）。
+//
+// ★ 服务端拿它把连接归属到**具体哪一个客户端**。没有这个的话，一台服务端上
+//   所有客户端的连接在上层看起来完全一样 —— 而「哪台设备在线、它跑了多少流量」
+//   正是要按客户端分的。
+//
+// ⚠️ 客户端侧这个值是自己填的，别拿它做任何判断；只有**服务端**的会话上它才
+//   是认证过的结论（`accept` 时按 users 表比对出来的那个）。
+func (s *Session) User() [16]byte { return s.user }
+
 // LocalAddr 返回当前主路径的本地地址；无路径时返回一个占位值。
 func (s *Session) LocalAddr() net.Addr {
 	s.mu.Lock()

@@ -127,6 +127,13 @@ func newStream(s *Session, id uint64, dst string, window uint64) *Stream {
 
 // markOpenAcked 记下"对端确实知道这条流存在"。任何一个针对本流的帧都算证据——
 // 不需要专门的 OPEN_ACK 帧。
+// User 返回这条流所属会话认证到的用户 ID。
+//
+// ★ 上层（内核的 tide 监听器）据此把每一条连接归属到具体的客户端 —— 缺了它，
+//   服务端只知道「有人连进来了」，不知道是谁，于是「哪台设备在线」这类问题
+//   在上层只能靠猜。
+func (st *Stream) User() [16]byte { return st.sess.User() }
+
 func (st *Stream) markOpenAcked() { st.openAcked.Store(true) }
 
 func (st *Stream) needsOpenResend() bool {
