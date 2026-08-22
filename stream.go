@@ -530,6 +530,31 @@ func (st *Stream) advertisableLocked() uint64 {
 	return st.recvOff + uint64(free)
 }
 
+// hasAckWorkLocked：距离**上一次真的发出去的那个 ACK**，有没有新东西要说。
+// 必须在 rmu 持有时调用。
+//
+// ★★ 它存在的理由是一个死锁，而那个死锁的形状很容易再被造出来：
+//
+//	① 发送方把对端通告的窗口用光，停在 writeChunk 的 wcond.Wait 上；
+//	② 接收侧应用 Read 走一批数据 → maybeAckLocked 的条件③命中 → scheduleAck；
+//	③ 但此刻 ackBusy 已经是 true（上一个 ackFlushLoop 还在写），scheduleAck **直接返回**；
+//	④ 那个 ackFlushLoop 写完的是**读走数据之前**的上界，然后判「还有事吗」。
+//
+// 判据从前只看 `recvOff != ackedAdv`，也就是**只认"又收到了新数据"**。
+// 而这一幕里没有新数据 —— 变的是"应用把缓冲腾空了"，也就是**可通告的上界前进了**。
+// 于是它判无事、退出，新腾出来的空间永远没人说出去：
+// 发送方等开窗、接收方等数据，两边各等各的，只能靠重传定时器一轮一轮往前挪。
+// （2026-08-22 实测：`TestClosedWindowReopensWithoutWaitingForRTO` 约每两轮挂一次，
+// 栈上是"客户端 writeChunk 等窗口 / 服务端 Read 等数据 / 两条 path 的 writeLoop
+// 都在等有东西可发"——发送队列是空的，因为那一帧压根没生成。）
+//
+// ★ 判据只比「与上次通告相比有没有变化」，不比任何恒真的关系 ——
+// flushAck 刚把 ackedAdv/ackedMaxOff 赋成当时的值，所以没变化时它必然为 false，
+// 不会 spin。SWS 那一侧由 flushAck 自身的耗时做阻尼（见 scheduleAck 上方那段）。
+func (st *Stream) hasAckWorkLocked() bool {
+	return st.recvOff != st.ackedAdv || st.advertisableLocked() > st.ackedMaxOff
+}
+
 // maybeAckLocked 在累计到阈值或被强制时回一个 STREAM_ACK。
 // 必须在 rmu 持有时调用。
 //
@@ -633,10 +658,10 @@ func (st *Stream) ackFlushLoop() {
 	for {
 		st.flushAck()
 		st.ackBusy.Store(false)
-		// 写的这段时间里又来了新数据？自己接着发，别指望下一帧来触发——
+		// 写的这段时间里情况又变了？自己接着发，别指望下一帧来触发——
 		// 对端可能正等着这个 ACK 才敢继续发，没有"下一帧"。
 		st.rmu.Lock()
-		more := st.recvOff != st.ackedAdv
+		more := st.hasAckWorkLocked()
 		st.rmu.Unlock()
 		if !more {
 			return
