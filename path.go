@@ -527,12 +527,25 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		}
 		p.sendProbe()
 
-		d := interval
-		if p.sess.activeStreams() == 0 {
-			d = idleInterval
-		}
-		t.Reset(jitter(d))
+		t.Reset(jitter(probeDelay(interval, idleInterval,
+			p.sess.activeStreams(),
+			p.sess.payloadRecent(probeActivityWindow),
+			p.sess.Draining())))
 	}
+}
+
+// probeDelay 决定下一拍探测间隔。**纯函数，单测钉着。**
+//
+// ★★ 快档的判据是「有流开着 **且** 窗口内有真实载荷」——缺了后半句就是
+//   2026-08-29 真机那笔账：推送长连接 7×24 开着，每条路径永远 1s 一探，
+//   近零流量下 tide 链路 133 包/秒、手机核心 1300 唤醒/秒。
+//   细账见 probeActivityWindow 的注释。排水中的会话无条件慢档。
+func probeDelay(interval, idleInterval time.Duration,
+	streams int, payloadRecent, draining bool) time.Duration {
+	if draining || streams == 0 || !payloadRecent {
+		return idleInterval
+	}
+	return interval
 }
 
 func (p *path) sendProbe() {

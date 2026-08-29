@@ -15,6 +15,20 @@ const (
 	// 用户看到的卡顿越长。空闲时会自动退到 DefaultIdleProbeInterval。
 	DefaultProbeInterval     = 1 * time.Second
 	DefaultIdleProbeInterval = 15 * time.Second
+
+	// probeActivityWindow：最近这么久内有**真实载荷**（流数据/数据报，任一方向）
+	// 才算"活跃"，探测走快档。
+	//
+	// ★★ 判据必须是"有字节在走"，不能是"有流开着"——手机上推送长连接
+	//   （mtalk.google.com / Apple push）7×24 开着不关，按流数判的话每条路径
+	//   永远踩死在 1s 快档上。2026-08-29 真机实测（Android 日用机 ↔ macOS 配对电脑）：
+	//   tun 近乎零流量时 tide 链路仍有 133 包/秒、66 KB/s 纯协议流量，
+	//   手机核心 1300 唤醒/秒（成本模型预期的 35 倍）——正是这一档踩死的账。
+	// ★ 30s 的取值：交互流量的自然停顿（读网页、打字）大多在这个窗口内，
+	//   快档探测的意义（迁移判据要新鲜 RTT）在这段里保得住；超过 30s 没有一个
+	//   真实字节，"迁移判据的新鲜度"就没有服务对象了，退到 15s 慢档，
+	//   流量一回来下一拍立刻切回快档（最坏迟 15s 拿到新 RTT 样本）。
+	probeActivityWindow = 30 * time.Second
 	// DefaultProbeTimeout：单次探测判定丢失的时限。取 max(3×SRTT, 这个值)，
 	// 所以高延迟线路不会被误杀。
 	DefaultProbeTimeout = 2 * time.Second

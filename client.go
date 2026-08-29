@@ -200,6 +200,9 @@ func (c *Client) maintainQUIC(s *Session) {
 			default:
 			}
 		}
+		if s.Draining() {
+			return // 排水中的会话不再补 QUIC 路——理由同 maintainRedundancy
+		}
 		s.mu.Lock()
 		hasQUIC, hasAny := false, false
 		for _, p := range s.paths {
@@ -315,16 +318,22 @@ func (c *Client) maintainRedundancy(s *Session) {
 			return
 		case <-time.After(jitter(base)):
 		}
+		if s.Draining() {
+			return // 排水中的会话不再补路——它只等存量流走完
+		}
 		s.mu.Lock()
-		n := 0
+		n, total := 0, len(s.paths)
 		for _, p := range s.paths {
 			if p.usable() {
 				n++
 			}
 		}
 		s.mu.Unlock()
-		if n >= 2 {
-			base = nextRedundancyDelay(base, true)
+		if !redundancyShouldDial(n, total) {
+			// 够了按"好"退避；满员按"坏"退避——满员时拨了也会被 addPath
+			// 顶回来（完整 TCP+TLS 握手 → 被拒 → FIN），那正是 2026-08-29
+			// 真机上 ~8 SYN/分钟的握手空转，见 redundancyShouldDial 的注释。
+			base = nextRedundancyDelay(base, n >= 2)
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -334,6 +343,29 @@ func (c *Client) maintainRedundancy(s *Session) {
 		// 顶回来的那条已经被 markDead 关掉了，这一轮等于没补上。
 		ok := err == nil && p != nil && s.addPath(p)
 		base = nextRedundancyDelay(base, ok)
+	}
+}
+
+// redundancyShouldDial 这一轮要不要真的去拨新路径。**纯函数，单测钉着。**
+//
+// ★ 第二个条件挡的是"满员空转"：可用数 <2 但路径数已到 maxPathsPerSession 时，
+//   拨号必然被 addPath 顶回——白做一整套 TCP+TLS 握手、服务端陪跑一遍、
+//   然后吃一个 FIN，退避归零再来。泄漏的会话（见 Session.Drain 的注释）把
+//   这个循环乘了十倍，2026-08-29 真机上就是它在以 ~8 SYN/分钟持续制造新路径，
+//   每条新路径又重开一个填充判决窗口（64 KiB 预算）——66 KB/s 假流量的引擎。
+//   满员时正确的动作是等现有路径死掉腾位置（onPathDead 会摘），不是硬拨。
+func redundancyShouldDial(usable, total int) bool {
+	return usable < 2 && total < maxPathsPerSession
+}
+
+// Drain 让当前会话进入排水模式——被更新的客户端顶替时用（语义与理由见
+// Session.Drain 的注释）。对没有会话的客户端是 no-op。
+func (c *Client) Drain(hard time.Duration) {
+	c.mu.Lock()
+	s := c.sess
+	c.mu.Unlock()
+	if s != nil {
+		s.Drain(hard)
 	}
 }
 

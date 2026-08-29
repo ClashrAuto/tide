@@ -64,6 +64,12 @@ type Session struct {
 	resumes atomic.Uint64
 	// dgramBytes 是全会话所有 UDP 关联收队列里的载荷字节数（见 maxSessionDatagramBytes）。
 	dgramBytes atomic.Int64
+	// lastPayload 是最近一次**真实载荷**（流数据/数据报，任一方向）的 UnixNano。
+	// 探测分档的判据（见 path.probeLoop 与 probeActivityWindow 的注释）：
+	// "有流开着" ≠ "有流量在走"，推送长连接会把前者永远钉成真。
+	lastPayload atomic.Int64
+	// draining 见 Drain：被新会话顶替后进入排水模式，只等存量流自然结束。
+	draining atomic.Bool
 
 	// ctrlOut 是不能在读协程里写的**一次性**控制帧（目前只有拒绝流的 RST）。
 	// 满了就丢：丢一个 RST 只是让对端多等一个超时，而为了发它把读侧堵住，
@@ -139,6 +145,54 @@ func (s *Session) LocalAddr() net.Addr {
 }
 
 func (s *Session) activeStreams() int { return int(s.streamCount.Load()) }
+
+func (s *Session) notePayload() { s.lastPayload.Store(time.Now().UnixNano()) }
+
+// payloadRecent 报告窗口内有没有真实载荷流过（任一方向）。
+func (s *Session) payloadRecent(window time.Duration) bool {
+	t := s.lastPayload.Load()
+	return t != 0 && time.Since(time.Unix(0, t)) < window
+}
+
+// Draining 报告会话是否处于排水模式。
+func (s *Session) Draining() bool { return s.draining.Load() }
+
+// Drain 把会话切进「排水模式」——被新会话顶替、只等存量流自然结束。
+//
+// ★★★ 为什么需要它：mihomo 配置重载不杀存量连接，被换下的 tide 出站靠 GC
+//   finalizer 关——而推送长连接（mtalk/apsd）攥着旧会话的流几天不放，
+//   finalizer 永不触发。每次重载漏一个会话，每个会话带着冗余补路 + 探测循环
+//   永动（2026-08-29 真机：21 条 ESTABLISHED、66 KB/s 纯协议流量、
+//   核心 1300 唤醒/秒）。上层在"同一个服务端+用户又建了新客户端"那一刻调它。
+// ★ 排水语义：不再补路（maintainRedundancy / maintainQUIC / recoverLoop 见
+//   Draining 就收手）、探测一律慢档（probeDelay）；存量流清零即关，
+//   hard 到点强关兜底。**不立刻杀流**：正在跑的下载值得善终；推送流被关后
+//   app 会在秒级自己重连——落到新会话上。
+func (s *Session) Drain(hard time.Duration) {
+	if !s.draining.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		t := time.NewTimer(hard)
+		defer t.Stop()
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-s.closed:
+				return
+			case <-t.C:
+				s.closeWith(ErrSuperseded)
+				return
+			case <-tick.C:
+				if s.streamCount.Load() == 0 {
+					s.closeWith(ErrSuperseded)
+					return
+				}
+			}
+		}
+	}()
+}
 
 // Done 在会话彻底结束后关闭。
 func (s *Session) Done() <-chan struct{} { return s.closed }
@@ -551,6 +605,11 @@ func (s *Session) recoverLoop() {
 			return
 		default:
 		}
+		// 排水中的会话路径全断 = 它的使命结束了，别再把它拨回来。
+		if s.draining.Load() {
+			s.closeWith(ErrSuperseded)
+			return
+		}
 		if time.Now().After(deadline) {
 			s.closeWith(ErrSessionGone)
 			return
@@ -613,6 +672,11 @@ func (s *Session) recoverLoop() {
 // ---------------------------------------------------------------------------
 
 func (s *Session) sendOnStream(st *Stream, t FrameType, flags uint8, payload []byte) error {
+	// 只有真实载荷才算"活跃"（探测分档的判据）——STREAM_OPEN/ACK/FIN 这类
+	// 控制帧不算：推送长连接空闲时也在稀疏地 ACK，算进去判据就又被钉死了。
+	if t == FrameStreamData || t == FrameDatagram {
+		s.notePayload()
+	}
 	p := s.pickPath(st)
 	if p == nil {
 		return ErrNoPath
@@ -839,6 +903,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 	case FrameStreamOpen:
 		return s.onStreamOpen(p, f)
 	case FrameStreamData:
+		s.notePayload()
 		off, n := ReadVarint(f.Payload)
 		if n == 0 {
 			return ErrProtocol
@@ -894,6 +959,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 			st.pathID.Store(p.id)
 		}
 	case FrameDatagram:
+		s.notePayload()
 		return s.onDatagram(f)
 	case FrameTicketRepl:
 		if s.wallet != nil {

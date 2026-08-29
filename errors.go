@@ -28,6 +28,9 @@ var (
 	// 2026-08-07 树莓派实测：服务端重启后要连续失败 24 次才恢复，
 	// 而那 24 次几乎全是在等 grace 到期。
 	ErrSessionRefused = errors.New("tide: server refused the session (fail-closed)")
+	// ErrSuperseded：会话被同一服务端+用户的新客户端顶替（排水模式走完，
+	// 见 Session.Drain）。
+	ErrSuperseded     = errors.New("tide: session superseded by a newer one")
 	ErrFlowControl    = errors.New("tide: peer exceeded flow-control window")
 	ErrTooManyStreams = errors.New("tide: stream limit reached")
 )
