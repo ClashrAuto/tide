@@ -112,6 +112,12 @@ type path struct {
 
 	state    atomic.Uint32
 	lastRecv atomic.Int64 // UnixNano
+	// probeGap 是当前探测档位的间隔（纳秒），probeLoop 每拍更新。
+	// checkSilence 的判死窗口必须跟着它走：空闲档 15s 一探时,两拍之间
+	// **必然**有超过 8 秒收不到一个字节——拿固定的 DefaultPathDeadAfter 判,
+	// 每条空闲路径活不过两拍(真机实锤:引入慢档探测当晚,路径 ~30s 一换代,
+	// 每条新路径重开 45 秒的填充判决期,28 包/秒的假流量比修复前只降了一半)。
+	probeGap atomic.Int64
 	// lastSent 是最后一次真正把字节写上线的时刻，供 heartbeatLoop 判断"现在是不是静默"。
 	lastSent atomic.Int64 // UnixNano
 	created  time.Time
@@ -527,10 +533,12 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		}
 		p.sendProbe()
 
-		t.Reset(jitter(probeDelay(interval, idleInterval,
+		d := probeDelay(interval, idleInterval,
 			p.sess.activeStreams(),
 			p.sess.payloadRecent(probeActivityWindow),
-			p.sess.Draining())))
+			p.sess.Draining())
+		p.probeGap.Store(int64(d))
+		t.Reset(jitter(d))
 	}
 }
 
@@ -717,9 +725,28 @@ func (p *path) reapProbes() {
 // 而流数据永远不会来。静默计时器不看语义，只看物理层面有没有字节，是更硬的证据。
 func (p *path) checkSilence() {
 	last := time.Unix(0, p.lastRecv.Load())
-	if d := time.Since(last); d > DefaultPathDeadAfter {
+	dead := silenceDeadline(time.Duration(p.probeGap.Load()))
+	if d := time.Since(last); d > dead {
 		p.markDeadReason("silent for " + d.Round(time.Millisecond).String())
 	}
+}
+
+// silenceDeadline 静默判死窗口。**纯函数，单测钉着。**
+//
+// ★★★ 窗口必须 ≥「探测间隔 × 2 + 探测超时」：静默判据的证据是"收到字节"，
+//   而空闲路径两拍探测之间**本来就没有字节**。引入 15s 慢档探测的当晚就栽在
+//   固定 8s 窗口上：每条空闲路径在下一拍 checkSilence 时 since(lastRecv)≈15s>8s
+//   被误判死 → 重拨 → 新路径重开 45 秒填充判决期 → 再死——churn 从没停过，
+//   28 包/秒的假流量把慢档省下的又烧回去了。
+// ★ 快档(1s)下 max 取到 DefaultPathDeadAfter=8s，行为与从前逐字相同；
+//   慢档(15s)下 = 32s。代价：空闲路径真死时要 32s 才发现——空闲时没有用户
+//   数据在等它，检测慢是可以买的；一旦有流量,payloadRecent 把探测切回快档,
+//   判死窗口同拍回到 8s。
+func silenceDeadline(probeGap time.Duration) time.Duration {
+	if d := probeGap*2 + DefaultProbeTimeout; d > DefaultPathDeadAfter {
+		return d
+	}
+	return DefaultPathDeadAfter
 }
 
 func (p *path) setState(s pathState) {

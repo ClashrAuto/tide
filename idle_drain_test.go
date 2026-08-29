@@ -119,3 +119,24 @@ func TestDrainIdempotent(t *testing.T) {
 		t.Fatal("Draining 应保持为真")
 	}
 }
+
+// 静默判死窗口必须跟着探测档位走:空闲档两拍之间本来就没有字节,
+// 固定 8s 窗口会把每条空闲路径误判死(churn 引擎,真机实锤)。
+func TestSilenceDeadlineScalesWithProbeGap(t *testing.T) {
+	// 快档(1s):窗口 = 8s 原语义,行为不变。
+	if got := silenceDeadline(DefaultProbeInterval); got != DefaultPathDeadAfter {
+		t.Fatalf("快档窗口 %v,应保持 %v", got, DefaultPathDeadAfter)
+	}
+	// 未初始化(0):同快档。
+	if got := silenceDeadline(0); got != DefaultPathDeadAfter {
+		t.Fatalf("零值窗口 %v,应为 %v", got, DefaultPathDeadAfter)
+	}
+	// 空闲档(15s):窗口必须容得下两拍探测 + 超时,否则空闲路径必被误判死。
+	idle := silenceDeadline(DefaultIdleProbeInterval)
+	if idle <= DefaultIdleProbeInterval {
+		t.Fatalf("空闲档窗口 %v 连一拍探测间隔都容不下——每条空闲路径活不过两拍", idle)
+	}
+	if want := DefaultIdleProbeInterval*2 + DefaultProbeTimeout; idle != want {
+		t.Fatalf("空闲档窗口 %v,应为 %v", idle, want)
+	}
+}
