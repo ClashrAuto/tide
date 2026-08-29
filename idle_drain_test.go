@@ -140,3 +140,27 @@ func TestSilenceDeadlineScalesWithProbeGap(t *testing.T) {
 		t.Fatalf("空闲档窗口 %v,应为 %v", idle, want)
 	}
 }
+
+// 服务端只在会话有真实载荷时探测——空闲时对端是睡着的手机,主动探测唤醒它射频。
+// 客户端恒探(空闲放慢档),排水一律不探。
+func TestShouldSendProbeServerSilentWhenIdle(t *testing.T) {
+	cases := []struct {
+		name          string
+		isClient      bool
+		payloadRecent bool
+		draining      bool
+		want          bool
+	}{
+		{"client idle still probes", true, false, false, true},
+		{"client active probes", true, true, false, true},
+		{"server idle SILENT", false, false, false, false}, // 核心:不唤醒睡着的手机
+		{"server active probes", false, true, false, true},  // 送回程数据时要新鲜 RTT
+		{"client draining silent", true, true, true, false},
+		{"server draining silent", false, true, true, false},
+	}
+	for _, c := range cases {
+		if got := shouldSendProbe(c.isClient, c.payloadRecent, c.draining); got != c.want {
+			t.Fatalf("%s: shouldSendProbe=%v want %v", c.name, got, c.want)
+		}
+	}
+}

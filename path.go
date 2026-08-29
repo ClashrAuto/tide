@@ -514,7 +514,12 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 	// 只有 3 左右——于是新建的 QUIC 路径在拿到第一个样本之前**看起来比 TCP 差**，
 	// 调度器不会往它上面迁。实测这段窗口让每次会话开头有几秒钟的流量白白走在
 	// 慢一个数量级的路径上（单流 40 秒的测试里是 8.1MiB / 10%）。
-	p.sendProbe()
+	// ★ 服务端的首探也按下面那条规则跳过——新路径刚建、还没有回程数据要送，
+	//   此刻的 RTT 无人使用（选回程路径要等真有响应要发）。
+	if shouldSendProbe(p.sess.isClient, p.sess.payloadRecent(probeActivityWindow),
+		p.sess.Draining()) {
+		p.sendProbe()
+	}
 	t := time.NewTimer(jitter(interval))
 	defer t.Stop()
 	for {
@@ -531,7 +536,21 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		if p.State() == pathDead {
 			return
 		}
-		p.sendProbe()
+		// ★★★ **服务端空闲时一个探测都不发** —— 对端是手机，服务端主动探测
+		//   等于把睡着的手机射频从 doze 里唤醒。而服务端并不需要它：
+		//   · 判死：`checkSilence` 数的是"收到字节"，客户端的探测帧一直在喂它
+		//     （空闲也有 15s 一拍），所以服务端不发探测照样判得出客户端路径死没死；
+		//   · RTT：`updateRTTLocked` 只从 `onProbeAck` 来，也就是 RTT 只服务于
+		//     "发探测的那一方"选路。服务端只在**往回送数据**时才需要挑路
+		//     （TCP 还是 QUIC），而回程数据只在手机醒着请求时才有 —— 那时
+		//     `payloadRecent` 为真，探测自然打开，RTT 当场就新鲜。手机睡着、
+		//     没有回程流量时，陈旧的 RTT 无人读取，探它纯属浪费 + 唤醒手机。
+		//   客户端不受此约束：它要尽早发现路径死好重连（用户在等），且要为
+		//   "用户下一秒恢复使用"备好新鲜 RTT，所以空闲也照探（15s 慢档）。
+		if shouldSendProbe(p.sess.isClient,
+			p.sess.payloadRecent(probeActivityWindow), p.sess.Draining()) {
+			p.sendProbe()
+		}
 
 		d := probeDelay(interval, idleInterval,
 			p.sess.activeStreams(),
@@ -540,6 +559,24 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		p.probeGap.Store(int64(d))
 		t.Reset(jitter(d))
 	}
+}
+
+// shouldSendProbe 这一拍要不要真的发探测帧。**纯函数，单测钉着。**
+//
+// ★ 客户端恒发（空闲也发，只是档位放慢）：它靠探测尽早判死以便重连，
+//   并为用户恢复使用备新鲜 RTT。
+// ★ 服务端只在会话有真实载荷（`payloadRecent`）时发：它的 RTT 只在送回程数据
+//   时才被读，而回程数据 ⟺ 客户端醒着请求 ⟺ payloadRecent 为真。空闲时服务端
+//   主动探测只会唤醒睡着的手机、刷新一份无人读的 RTT。判死不受影响（见 probeLoop）。
+// ★ 排水中一律不发。
+func shouldSendProbe(isClient, payloadRecent, draining bool) bool {
+	if draining {
+		return false
+	}
+	if isClient {
+		return true
+	}
+	return payloadRecent
 }
 
 // probeDelay 决定下一拍探测间隔。**纯函数，单测钉着。**
