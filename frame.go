@@ -214,9 +214,22 @@ func newFrameReader(r io.Reader) *frameReader {
 	return &frameReader{r: r, buf: make([]byte, 0, 32*1024)}
 }
 
+// maxEmptyReads 与 bufio 的 maxConsecutiveEmptyReads 同值：下层连着这么多次
+// (0, nil) 就当它坏了，报 io.ErrNoProgress 让路径判死，而不是在这里空转。
+const maxEmptyReads = 100
+
 func (fr *frameReader) fill(need int) error {
+	empty := 0
 	for fr.end-fr.off < need {
-		if fr.off > 0 && fr.end-fr.off < cap(fr.buf)/2 {
+		// ★★ 尾部放不下这一帧也要挪，不能只看「剩余不到一半」。
+		//   只看一半时，「缓冲读满、剩余过半、下一帧又比剩余大（但不超过容量）」这一格
+		//   既不挪也不扩容，下面的 Read 拿到的是长度为 0 的切片 —— recordOpener 手里
+		//   还有明文时对空切片立刻回 (0, nil)，readLoop 就永久空转一个核，defer 里的
+		//   markDead 永远走不到，路径和整个会话被钉在这个栈上。满载 STREAM_DATA
+		//   （MaxPayload + 帧头）恰好比半个缓冲大几个字节，所以大流量下迟早撞上
+		//   （2026-10-04 真机：CoastTunnel 常驻 400% CPU）。挪完后 off+need ≤ cap，
+		//   或者下面扩容，Read 拿到的切片一定非空。
+		if fr.off > 0 && (fr.end-fr.off < cap(fr.buf)/2 || fr.off+need > cap(fr.buf)) {
 			copy(fr.buf[:cap(fr.buf)], fr.buf[fr.off:fr.end])
 			fr.end -= fr.off
 			fr.off = 0
@@ -239,6 +252,11 @@ func (fr *frameReader) fill(need int) error {
 				return io.EOF
 			}
 			return err
+		}
+		if n > 0 {
+			empty = 0
+		} else if empty++; empty >= maxEmptyReads {
+			return io.ErrNoProgress
 		}
 	}
 	return nil
