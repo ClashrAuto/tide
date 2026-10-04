@@ -326,7 +326,13 @@ func (st *Stream) Close() error {
 			buf = AppendVarint(buf, finOff)
 			st.sess.sendOnStream(st, FrameStreamFin, 0, buf)
 		}
-		st.failWrite(ErrStreamClosed)
+		// ★★ 读半边也要叫醒（net.Conn 的约定：Close 让阻塞中的 Read/Write 都返回）。
+		//   原来这里只 failWrite，而紧接着 removeStream 把流从会话里摘掉——之后对端的
+		//   FIN/RST、会话关闭时的 fail 都再也到不了这条流，卡在 Read 里的协程永远醒不过来，
+		//   连同它攥着的缓冲。HTTP 健康检查每次 CloseIdleConnections 漏一个 readLoop，
+		//   Relay 一侧出错关掉 tide 这头漏一个回程拷贝（2026-10-04 真机：六天 1.7 万个协程、
+		//   400 MB 堆，顶穿 512 MiB 上限后 GC 连轴转）。
+		st.fail(ErrStreamClosed)
 		st.sess.removeStream(st.id)
 	})
 	return nil

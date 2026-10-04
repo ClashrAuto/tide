@@ -154,6 +154,10 @@ func (c *Client) newSession(ctx context.Context) (*Session, error) {
 
 	p, err := c.dialPath(ctx, s, false)
 	if err != nil {
+		// ★ newSession 里已经起了 ctrlLoop，不关会话它就永远挂着、攥住整条会话
+		//   （2026-10-04 真机：拨号失败攒下 548 个）。用 closeWith 而不是 Close：
+		//   一条路径都没有，没有地方发 CLOSE 帧。
+		s.closeWith(err)
 		return nil, err
 	}
 	s.addPath(p)
