@@ -884,23 +884,38 @@ func (s *Server) replenish(sess *Session, user [16]byte) {
 // ★ 这是服务端这一半的"网络波动不断线"。客户端 Wi-Fi 切走的那一刻，
 // 服务端这边所有上游 TCP 连接都还开着、缓冲还在，等对方带着同一个 session_id 回来。
 // 没有它，客户端就算 0-RTT 重连成功也只能拿到一个空会话，用户的连接照样全断。
+//
+// ★ 有路径的时候它什么都不用做，所以不留周期定时器：路径变化由 pathEvent 通知，
+// 只有一条路径都不剩时才上一个到期定时器。原来 500ms 一轮，每条在线会话 2 拍/秒，
+// 折成唤醒约 7 次/秒（见 idle.go），而这个循环 99.9% 的时间什么都没做。
 func (s *Server) graceWatcher(sess *Session, sid [16]byte) {
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
+	grace := s.cfg.sessionGrace()
 	for {
+		ev := sess.pathEvent() // 先取事件再看状态，见 pathEvent
+		var expire <-chan time.Time
+		var t *time.Timer
+		if since := sess.noPathSince.Load(); since != 0 {
+			left := time.Until(time.Unix(0, since).Add(grace))
+			if left <= 0 {
+				sess.closeWith(ErrSessionGone)
+				return
+			}
+			t = time.NewTimer(left)
+			expire = t.C
+		}
+		done := false
 		select {
 		case <-sess.closed:
-			return
+			done = true
 		case <-s.stopped:
-			return
-		case <-t.C:
+			done = true
+		case <-ev:
+		case <-expire:
 		}
-		since := sess.noPathSince.Load()
-		if since == 0 {
-			continue
+		if t != nil {
+			t.Stop()
 		}
-		if time.Since(time.Unix(0, since)) > s.cfg.sessionGrace() {
-			sess.closeWith(ErrSessionGone)
+		if done {
 			return
 		}
 	}

@@ -68,6 +68,11 @@ type Session struct {
 	// 探测分档的判据（见 path.probeLoop 与 probeActivityWindow 的注释）：
 	// "有流开着" ≠ "有流量在走"，推送长连接会把前者永远钉成真。
 	lastPayload atomic.Int64
+	// rtoGate / rebalGate 让重传扫描与 rebalance 在没活时停掉定时器，见 idle.go。
+	rtoGate   idleGate
+	rebalGate idleGate
+	// pathEv 在路径集合或路径状态变化时关闭并换新，见 pathEvent。受 mu 保护。
+	pathEv chan struct{}
 	// draining 见 Drain：被新会话顶替后进入排水模式，只等存量流自然结束。
 	draining atomic.Bool
 
@@ -105,7 +110,10 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 		ticketReq: make(chan struct{}, 1),
 		ctrlOut:   make(chan pendingCtrl, 64),
 		closed:    make(chan struct{}),
+		pathEv:    make(chan struct{}),
 	}
+	s.rtoGate.init()
+	s.rebalGate.init()
 	go s.ctrlLoop()
 	s.pathCond = sync.NewCond(&s.mu)
 	// 流号奇偶分家（同 HTTP/2）：客户端用奇数、服务端用偶数，
@@ -146,7 +154,33 @@ func (s *Session) LocalAddr() net.Addr {
 
 func (s *Session) activeStreams() int { return int(s.streamCount.Load()) }
 
-func (s *Session) notePayload() { s.lastPayload.Store(time.Now().UnixNano()) }
+func (s *Session) notePayload() {
+	s.lastPayload.Store(time.Now().UnixNano())
+	s.rebalGate.kick()
+}
+
+// pathEvent 返回一个在路径集合或路径状态**下一次**变化时关闭的通道。
+//
+// 给那些「只有路径变了才需要重新判断」的循环用（补路、宽限看门狗、服务端等重连），
+// 它们不必再按固定周期起来数一遍路径。可以有多个消费者，所以用关闭广播而不是 idleGate。
+//
+// ⚠️ 必须**先取通道、再看状态**。反过来的话，看完到睡下之间发生的变化就错过了。
+func (s *Session) pathEvent() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pathEv
+}
+
+func (s *Session) firePathEvent() {
+	s.mu.Lock()
+	s.firePathEventLocked()
+	s.mu.Unlock()
+}
+
+func (s *Session) firePathEventLocked() {
+	close(s.pathEv)
+	s.pathEv = make(chan struct{})
+}
 
 // payloadRecent 报告窗口内有没有真实载荷流过（任一方向）。
 func (s *Session) payloadRecent(window time.Duration) bool {
@@ -172,6 +206,7 @@ func (s *Session) Drain(hard time.Duration) {
 	if !s.draining.CompareAndSwap(false, true) {
 		return
 	}
+	s.firePathEvent() // 补路循环可能正睡在路径事件上，让它现在就看到排水
 	go func() {
 		t := time.NewTimer(hard)
 		defer t.Stop()
@@ -270,6 +305,7 @@ func (s *Session) addPath(p *path) bool {
 
 	s.mu.Lock()
 	s.pathCond.Broadcast()
+	s.firePathEventLocked()
 	s.mu.Unlock()
 	return true
 }
@@ -287,6 +323,8 @@ func (s *Session) pathIDInUse(id uint32) bool {
 }
 
 func (s *Session) onPathDead(p *path) {
+	// defer：宽限看门狗要看 noPathSince，事件必须发在它落定之后。
+	defer s.firePathEvent()
 	s.deadLog.add(p.kind + "#" + itoa(int(p.id)) + " " + p.DeadReason())
 	s.mu.Lock()
 	for i, q := range s.paths {
@@ -310,6 +348,7 @@ func (s *Session) onPathDead(p *path) {
 }
 
 func (s *Session) onPathState(p *path, from, to pathState) {
+	defer s.firePathEvent() // 变差的路径不算可用，补路循环要重新数
 	if to == pathDegraded || to == pathSuspect {
 		// 这条路径变差了：批量流迁到更好的路径上去，交互流留着——
 		// QUIC 的优势在丢包下的批量吞吐，不在小包延迟，把交互流也迁走反而更糟。
@@ -459,13 +498,25 @@ func (s *Session) migrateBulkAway(bad *path) {
 // 却一个字节都拿不到——实测 tx=0.1MiB vs TCP 的 52.2MiB。
 // 迁移判据必须建立在**能观测到的量**上，也就是路径之间的相对评分。
 func (s *Session) rebalanceLoop() {
-	t := time.NewTicker(2 * time.Second)
+	const tick = 2 * time.Second
+	t := time.NewTicker(tick)
 	defer t.Stop()
+	// 迁移的是「正在走字节的流」，没有载荷就没有东西可迁，定时器一起停掉（见 idle.go）。
+	// 路径变差、判死不靠这里：那两件事 onPathState / onPathDead 当场处理。
+	busy := func() bool { return s.payloadRecent(probeActivityWindow) }
 	for {
 		select {
 		case <-s.closed:
 			return
 		case <-t.C:
+		}
+		if !busy() {
+			t.Stop()
+			if !s.rebalGate.park(s.closed, nil, busy) {
+				return
+			}
+			t.Reset(tick)
+			continue
 		}
 		s.rebalance()
 	}
@@ -616,16 +667,24 @@ func (s *Session) recoverLoop() {
 		}
 		s.mu.Lock()
 		have := len(s.paths)
+		ev := s.pathEv
 		s.mu.Unlock()
 		if have > 0 {
 			return // 别的地方（比如冗余路径）已经补上了
 		}
 		if s.redial == nil {
 			// 服务端：只能等客户端带着 session_id 回来。
+			//
+			// ★ 这里原来是 200ms 一轮的轮询。客户端走掉之后孤儿会话要在宽限期里挂一两分钟，
+			// 服务端一个人就是 50 次/秒的唤醒。回来这件事 addPath 会说，不用去问。
+			t := time.NewTimer(time.Until(deadline))
 			select {
 			case <-s.closed:
+				t.Stop()
 				return
-			case <-time.After(200 * time.Millisecond):
+			case <-ev:
+				t.Stop()
+			case <-t.C:
 			}
 			continue
 		}
@@ -674,12 +733,20 @@ func (s *Session) recoverLoop() {
 func (s *Session) sendOnStream(st *Stream, t FrameType, flags uint8, payload []byte) error {
 	// 只有真实载荷才算"活跃"（探测分档的判据）——STREAM_OPEN/ACK/FIN 这类
 	// 控制帧不算：推送长连接空闲时也在稀疏地 ACK，算进去判据就又被钉死了。
-	if t == FrameStreamData || t == FrameDatagram {
+	isPayload := t == FrameStreamData || t == FrameDatagram
+	if isPayload {
 		s.notePayload()
+	}
+	// 这两种帧发出去就得等确认。放在选路之前：没路径时这些字节照样算在途，要靠重传扫描收尾。
+	if t == FrameStreamData || t == FrameStreamOpen {
+		s.rtoGate.kick()
 	}
 	p := s.pickPath(st)
 	if p == nil {
 		return ErrNoPath
+	}
+	if isPayload {
+		p.notePayload()
 	}
 	if err := p.writeFrame(t, flags, st.id, payload); err != nil {
 		return err
@@ -904,6 +971,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 		return s.onStreamOpen(p, f)
 	case FrameStreamData:
 		s.notePayload()
+		p.notePayload()
 		off, n := ReadVarint(f.Payload)
 		if n == 0 {
 			return ErrProtocol
@@ -960,6 +1028,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 		}
 	case FrameDatagram:
 		s.notePayload()
+		p.notePayload()
 		return s.onDatagram(f)
 	case FrameTicketRepl:
 		if s.wallet != nil {
@@ -1066,8 +1135,12 @@ func (s *Session) onStreamOpen(p *path, f Frame) error {
 // 而丢帧可以在路径完全健康时发生——比如 STREAM_OPEN 恰好落在路径断掉的那一刻，
 // 或者对端因为流表满而丢弃了帧。没有 RTO，这类情况表现为一条永远卡住的连接，
 // 且两端都认为自己没问题。这是弱网下最难查的一类故障，必须有兜底。
+//
+// ★ 它只服务「有字节在等确认」的流。一条都没有时（空闲会话、开着不说话的推送长连接）
+// 连定时器一起停掉，下一帧要确认的数据发出时由 sendOnStream 叫醒，见 idle.go。
 func (s *Session) retransmitLoop() {
-	t := time.NewTicker(250 * time.Millisecond)
+	const tick = 250 * time.Millisecond
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
@@ -1079,11 +1152,18 @@ func (s *Session) retransmitLoop() {
 
 		s.mu.Lock()
 		var stuck []*Stream
+		busy := false
 		for _, st := range s.streams {
 			// 顺手把这条流所在路径的 RTT 刷进去：inflightCapLocked 要用它算 BDP，
 			// 而那里持着 wmu，不能再回头去拿 s.mu（会形成反向加锁顺序）。
-			st.pathRTT.Store(int64(s.rttForStreamLocked(st)))
-			st.pathMinRTT.Store(int64(s.minRTTForStreamLocked(st)))
+			// 一条路径都没有时这两个量算出来是 0，留着上次的值：0 在 inflightCapLocked 里
+			// 表示「没量过」，会把在途上限放到整个窗口，断网期间写侧白灌几百 KiB 进重传缓冲。
+			if r := s.rttForStreamLocked(st); r > 0 {
+				st.pathRTT.Store(int64(r))
+			}
+			if r := s.minRTTForStreamLocked(st); r > 0 {
+				st.pathMinRTT.Store(int64(r))
+			}
 			// 每条流按**它自己那条路径**的 RTT 判，不用全局最快值。
 			//
 			// ★ 拿全局最快路径的 RTT 去 judge 一条跑在慢路径上的流，是错的判据。
@@ -1095,6 +1175,7 @@ func (s *Session) retransmitLoop() {
 			if st.stalledFor(now, rtoFromRTT(time.Duration(st.pathRTT.Load()))) {
 				stuck = append(stuck, st)
 			}
+			busy = busy || st.unacked()
 		}
 		s.mu.Unlock()
 
@@ -1102,7 +1183,26 @@ func (s *Session) retransmitLoop() {
 			st.noteRewind(now)
 			s.resumeStream(st)
 		}
+		if !busy {
+			t.Stop()
+			if !s.rtoGate.park(s.closed, nil, s.anyUnacked) {
+				return
+			}
+			t.Reset(tick)
+		}
 	}
+}
+
+// anyUnacked 报告有没有流还有字节在等确认。
+func (s *Session) anyUnacked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.streams {
+		if st.unacked() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) fastestRTTLocked() time.Duration {

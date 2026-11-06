@@ -29,6 +29,10 @@ const (
 	//   真实字节，"迁移判据的新鲜度"就没有服务对象了，退到 15s 慢档，
 	//   流量一回来下一拍立刻切回快档（最坏迟 15s 拿到新 RTT 样本）。
 	probeActivityWindow = 30 * time.Second
+	// heartbeatActivityWindow：一条路径上最后一个真实载荷之后，判决窗口的心跳还填多久。
+	// 心跳填的是「请求—等待—响应」之间的静默，3 秒盖得住一次交互里的等待；
+	// 再往后路径就是真空闲了，见 path.heartbeatLoop。
+	heartbeatActivityWindow = 3 * time.Second
 	// DefaultProbeTimeout：单次探测判定丢失的时限。取 max(3×SRTT, 这个值)，
 	// 所以高延迟线路不会被误杀。
 	DefaultProbeTimeout = 2 * time.Second

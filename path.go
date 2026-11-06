@@ -120,7 +120,11 @@ type path struct {
 	probeGap atomic.Int64
 	// lastSent 是最后一次真正把字节写上线的时刻，供 heartbeatLoop 判断"现在是不是静默"。
 	lastSent atomic.Int64 // UnixNano
-	created  time.Time
+	// lastPayload 是这条路径上最近一次真实载荷（任一方向）的时刻，hbGate 是心跳停着等它的地方。
+	// 见 heartbeatLoop：会话级的那个 lastPayload 不够用，空着的冗余路径也会被它算成活跃。
+	lastPayload atomic.Int64 // UnixNano
+	hbGate      idleGate
+	created     time.Time
 	// 收发字节数。调度器的决策（哪条流走哪条路）除了看这个没有别的办法验证——
 	// "QUIC 路径建起来了"和"数据真的走了 QUIC"是两件事。
 	//
@@ -166,6 +170,7 @@ func newPath(s *Session, id uint32, kind string, conn net.Conn, sealKey, openKey
 		dead:    make(chan struct{}),
 	}
 	p.wcond = sync.NewCond(&p.wmu)
+	p.hbGate.init()
 	p.lastRecv.Store(time.Now().UnixNano())
 
 	var src io.Reader = conn
@@ -480,9 +485,21 @@ func jitter(d time.Duration) time.Duration {
 //
 // 学术上这套叫 adaptive padding（WTF-PAD 及 Tor 的 circuit padding 框架都基于它）：
 // 往包间隔里注入假流量，而不是恒定速率发送——后者能根治但会毁掉低延迟。
+//
+// ★★ 只填**有载荷的路径**上的静默（2026-11-06）。它要藏的是交互的节奏，没有交互就没有
+// 节奏可藏，而空闲时照跳的代价有三笔：
+//  1. 判决预算白烧：空闲路径约 14 秒就把 64 KiB 花在假帧上，等真流量来时已经过了判决窗口，
+//     真正要保护的那几百个包反而一个都没填。冗余路径上更是纯浪费。
+//  2. 一条连接什么都没传却以 2 帧/秒的节奏发随机长度的记录，这比静默更不像 HTTPS。
+//  3. 手机上的账：每条路径两端各 6.7 拍/秒，加上假帧本身，新会话头 15 秒约 130 次/秒的
+//     唤醒、每条路径 13 KB/s，服务端的假帧还会把睡着的手机射频叫醒。每次解锁都来一遍。
 func (p *path) heartbeatLoop() {
 	const nominal = 150 * time.Millisecond
+	busy := func() bool { return p.payloadRecent(heartbeatActivityWindow) }
 	for {
+		if !busy() && !p.hbGate.park(p.dead, p.sess.closed, busy) {
+			return
+		}
 		d := jitter(nominal)
 		select {
 		case <-p.dead:
@@ -506,6 +523,17 @@ func (p *path) heartbeatLoop() {
 		// 接收方 MUST 丢弃（spec §2.2），所以它对上层完全透明。
 		p.writeFrame(FramePadding, FlagPush, 0, nil)
 	}
+}
+
+// notePayload 记下这条路径上刚走过真实载荷，并叫醒停着的心跳。
+func (p *path) notePayload() {
+	p.lastPayload.Store(time.Now().UnixNano())
+	p.hbGate.kick()
+}
+
+func (p *path) payloadRecent(window time.Duration) bool {
+	t := p.lastPayload.Load()
+	return t != 0 && time.Since(time.Unix(0, t)) < window
 }
 
 func (p *path) probeLoop(interval, idleInterval time.Duration) {

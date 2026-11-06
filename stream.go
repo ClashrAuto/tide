@@ -88,6 +88,8 @@ type Stream struct {
 	// 损失时延和吞吐。
 	deliveredRate float64
 	lastAckAt     time.Time
+	// deliveredSince 是 lastAckAt 之后已确认、还没算进样本的字节，见 noteDeliveredLocked。
+	deliveredSince uint64
 	// pathRTT 是这条流所在路径的 RTT（纳秒），由 retransmitLoop 每轮刷新。
 	// 做成 atomic 是为了让 inflightCapLocked 在持 wmu 时能直接读，
 	// 不必再去拿 s.mu —— 那会形成 wmu→s.mu 的反向加锁顺序。
@@ -105,6 +107,8 @@ type Stream struct {
 	closed          atomic.Bool
 	// ackBusy：这条流当前是否已有一个协程在写 ACK。见 scheduleAck。
 	ackBusy atomic.Bool
+	// ackDelayed：这条流当前有没有延迟确认的定时器在跑。见 ackDelay。
+	ackDelayed atomic.Bool
 }
 
 func newStream(s *Session, id uint64, dst string, window uint64) *Stream {
@@ -173,6 +177,17 @@ func (st *Stream) stalledFor(now time.Time, rto time.Duration) bool {
 	if lr := st.lastRewind.Load(); lr != 0 && now.Sub(time.Unix(0, lr)) < wait {
 		return false
 	}
+	return st.unacked()
+}
+
+// unacked 报告这条流有没有东西在等对端确认（开流帧或字节）。流已失败时不算。
+func (st *Stream) unacked() bool {
+	st.rmu.Lock()
+	failed := st.rErr != nil
+	st.rmu.Unlock()
+	if failed {
+		return false
+	}
 	if st.needsOpenResend() {
 		return true
 	}
@@ -205,6 +220,21 @@ func minU32(a, b uint32) uint32 {
 // 32 KiB 在"ACK 帧开销"与"发送方重传缓冲占用"之间取平衡：太大则发送方缓冲长期打满、
 // 迁移时要重发更多；太小则小包泛滥，反而给分类器提供节奏特征。
 const ackThreshold = 32 * 1024
+
+// ackDelay：攒不够 ackThreshold 的尾巴最多压多久就要确认。
+//
+// ★★ 没有它，小写操作**永远等不到确认**（2026-11-06 查明，协议从第一版起就是这样）：
+// 累积确认只看阈值，一条长连接上写几百字节然后安静下来（推送、IM、SSH 全是这个形状），
+// 那几百字节就一直挂在发送方的 sendOff-ackOff 里。于是：
+//  1. retransmitLoop 把它判成卡住，整段尾巴（最多 32 KiB）重发一遍，退避到 60 秒一轮，
+//     **永不收敛**：接收方收到重复段不回话（见 onData），发送方永远不知道对方早收到了。
+//  2. 重发走的是 sendOnStream，算「真实载荷」，于是 payloadRecent 被顶回去，
+//     所有路径回到 1 秒快档。2026-08-29 修的「推送长连接把探测钉在快档」从这里漏了回来。
+//  3. 重传扫描、心跳都因此停不下来，手机上就是挂着空闲会话时的 200 次/秒。
+//
+// 取值要小于 RTO 下界（500ms），否则确认赶不上第一次误判；200ms 是 RFC 1122 给延迟确认的
+// 习惯值。量级上每条在收的流最多多 5 个 ACK/秒，批量传输里相比阈值 ACK 可以忽略。
+const ackDelay = 200 * time.Millisecond
 
 // ---------------------------------------------------------------------------
 // net.Conn
@@ -283,6 +313,12 @@ func (st *Stream) writeChunk(p []byte) (int, error) {
 				n = MaxPayload
 			}
 			st.retx = append(st.retx, p[:n]...)
+			// RTO 的钟从第一个在途字节开始走。lastProgress 平时只在 ACK 前进时更新，
+			// 流空闲过之后它是旧的，不重置的话刚写的字节在下一拍扫描里就算「卡了很久」，
+			// RTT 只要盖过 ackDelay 到那一拍的余量（实网 50ms 就够），每次写都白重发一遍。
+			if st.sendOff == st.ackOff {
+				st.lastProgress.Store(time.Now().UnixNano())
+			}
 			st.sendOff += uint64(n)
 			st.wmu.Unlock()
 			st.bytesSent.Add(uint64(n))
@@ -485,7 +521,11 @@ func (st *Stream) onData(off uint64, data []byte) error {
 
 	end := off + uint64(len(data))
 	if end <= st.recvOff {
-		return nil // 迁移后的重复段，正常现象
+		// 迁移后的重复段，正常现象。但对端重发就说明它没看到确认（确认丢在死路径上了），
+		// 这时必须回话：累积确认是它唯一的收手条件，不回它就退避着一直重发下去。
+		// 与 TCP 收到重复段立刻回 dup ACK 同理。ackBusy 保证这里不会变成风暴。
+		st.scheduleAck()
+		return nil
 	}
 	if off > st.recvOff {
 		// 乱序：只可能发生在跨路径迁移的窗口期，正常路径内 TCP/QUIC 已经保序。
@@ -613,24 +653,46 @@ func (st *Stream) hasAckWorkLocked() bool {
 //
 // ★ 两个水位在 flushAck 里一起复位，所以稳态下它们同步推进、由同一个 ACK 覆盖，
 // ACK 频率不会翻倍；只有窗口开合（也就是真正需要它的时候）②才单独触发。
+//
+// ④ 三条都不成立、但手里有没确认的字节：上一个定时器，见 ackDelay。
 func (st *Stream) maybeAckLocked(force bool) {
-	if force {
+	if force || st.ackDueLocked() {
 		st.scheduleAck()
 		return
 	}
-	if st.recvOff-st.ackedAdv >= ackThreshold {
-		st.scheduleAck()
+	if st.recvOff != st.ackedAdv {
+		st.armDelayedAckLocked()
+	}
+}
+
+// armDelayedAckLocked 一条流同时最多一个定时器，到点时已经被别的 ACK 带走了就什么都不发。
+func (st *Stream) armDelayedAckLocked() {
+	if st.ackDelayed.Swap(true) {
 		return
+	}
+	time.AfterFunc(ackDelay, func() {
+		st.ackDelayed.Store(false)
+		st.rmu.Lock()
+		due := st.rErr == nil && st.recvOff != st.ackedAdv
+		st.rmu.Unlock()
+		if due {
+			st.scheduleAck()
+		}
+	})
+}
+
+func (st *Stream) ackDueLocked() bool {
+	if st.recvOff-st.ackedAdv >= ackThreshold {
+		return true
 	}
 	// ⚠️ 无符号减法：上界会**回退**（乱序缓冲涨起来时 free 变小），
 	// 不先比大小的话一次回退就下溢成天文数字，判据恒真 → ACK 风暴。
 	adv := st.advertisableLocked()
 	if adv <= st.ackedMaxOff {
-		return
+		return false
 	}
 	if adv-st.ackedMaxOff >= ackThreshold {
-		st.scheduleAck()
-		return
+		return true
 	}
 	// ③ 兜底，也是这三条里唯一不能省的一条：对端已经把上次给的额度**用光**了
 	// （ackedMaxOff ≤ recvOff ⇔ 我们通告出去的上界已经全部收到）。这时它必然停在
@@ -643,9 +705,7 @@ func (st *Stream) maybeAckLocked(force bool) {
 	// ★ 会不会退化成 SWS（一个字节一个字节地通告）：不会退化到有害的程度——
 	// scheduleAck 的 ackBusy 保证一条流同时只有一个 ACK 在写，写的这段时间里
 	// 排空的字节会并进下一个 ACK，天然是一道阻尼。
-	if st.ackedMaxOff <= st.recvOff {
-		st.scheduleAck()
-	}
+	return st.ackedMaxOff <= st.recvOff
 }
 
 // forceAck 供 FIN、迁移完成等需要立刻同步状态的时机。
@@ -867,16 +927,28 @@ func (st *Stream) inflightCapLocked() uint64 {
 //
 // 用**被确认的字节**而不是发出去的字节：发出去多少不代表链路能吃下多少，
 // 只有对端确认了的才是真实交付速率。这与 lastProgress 的判据是同一个道理。
+//
+// ★ 一个样本的跨度不能短于 ackDelay。确认现在有两个来源（攒够阈值、延迟定时器），
+// 两个挨着到达时间隔只有零点几毫秒，拿它当分母算出来是几十 MB/s，一个样本就能把
+// EWMA 顶到真实值的百倍，在途上限（inflightCapLocked）随之撑到整个窗口。
+// 实测（40ms、256 KiB/s）：20 秒断网时灌进去的块多了 400 个，p90 从 40ms 到 10 秒。
+// 所以挨得太近的确认只攒字节，等够跨度再一起算。
 func (st *Stream) noteDeliveredLocked(n uint64, now time.Time) {
-	if !st.lastAckAt.IsZero() {
-		if dt := now.Sub(st.lastAckAt).Seconds(); dt > 0 {
-			r := float64(n) / dt
-			if st.deliveredRate <= 0 {
-				st.deliveredRate = r
-			} else {
-				st.deliveredRate = 0.75*st.deliveredRate + 0.25*r
-			}
-		}
+	if st.lastAckAt.IsZero() {
+		st.lastAckAt = now
+		return
 	}
+	st.deliveredSince += n
+	d := now.Sub(st.lastAckAt)
+	if d < ackDelay {
+		return
+	}
+	r := float64(st.deliveredSince) / d.Seconds()
+	if st.deliveredRate <= 0 {
+		st.deliveredRate = r
+	} else {
+		st.deliveredRate = 0.75*st.deliveredRate + 0.25*r
+	}
+	st.deliveredSince = 0
 	st.lastAckAt = now
 }

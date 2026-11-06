@@ -922,7 +922,8 @@ func TestIdleTimingIsNotAMetronome(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	if _, err := h.client.Session(ctx); err != nil {
+	sess, err := h.client.Session(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
 	// 开一条流让路径处于"有活跃流"状态，然后**什么都不发**。
@@ -931,6 +932,22 @@ func TestIdleTimingIsNotAMetronome(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	// 心跳只填有载荷的路径（见 heartbeatLoop），这里量的是跳起来之后的节奏，
+	// 所以替应用层把「近期有载荷」顶住。不顶的话线上一个包都没有，下面直接 Skip，
+	// 这条门禁就悄悄失效了。
+	p := sess.pathsSnapshot()[0]
+	stopNudge := make(chan struct{})
+	defer close(stopNudge)
+	go func() {
+		for {
+			p.notePayload()
+			select {
+			case <-stopNudge:
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
 	time.Sleep(300 * time.Millisecond)
 	mu.Lock()
 	at = at[:0]

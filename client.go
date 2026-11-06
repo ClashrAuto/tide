@@ -276,6 +276,9 @@ func (c *Client) maintainQUIC(s *Session) {
 const (
 	redundancyCheckInterval = 2 * time.Second
 	redundancyBackoffMax    = 30 * time.Second
+	// redundancyIdleRecheck 是路径够用时的兜底复查间隔。平时靠 pathEvent，
+	// 这一拍只防「有什么状态变化没走事件」，所以可以很稀。
+	redundancyIdleRecheck = 30 * time.Second
 )
 
 // nextRedundancyDelay 给出下一次检查/补路之前要等的**基准**间隔（真正睡的时候还要过
@@ -325,6 +328,7 @@ func (c *Client) maintainRedundancy(s *Session) {
 		if s.Draining() {
 			return // 排水中的会话不再补路——它只等存量流走完
 		}
+		ev := s.pathEvent() // 先取事件再数路径，见 pathEvent
 		s.mu.Lock()
 		n, total := 0, len(s.paths)
 		for _, p := range s.paths {
@@ -338,6 +342,17 @@ func (c *Client) maintainRedundancy(s *Session) {
 			// 顶回来（完整 TCP+TLS 握手 → 被拒 → FIN），那正是 2026-08-29
 			// 真机上 ~8 SYN/分钟的握手空转，见 redundancyShouldDial 的注释。
 			base = nextRedundancyDelay(base, n >= 2)
+			if n >= 2 {
+				// 两条都好：睡到路径有变化，不用每 2 秒起来数一遍（见 idle.go）。
+				// 醒来之后回到循环顶上再等一拍抖动才补路：波动往往是整片网络的，
+				// 所有客户端在路径断掉的同一刻重拨正是抖动要防的惊群。
+				select {
+				case <-s.closed:
+					return
+				case <-ev:
+				case <-time.After(jitter(redundancyIdleRecheck)):
+				}
+			}
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
