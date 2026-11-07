@@ -118,6 +118,9 @@ type path struct {
 	// 每条空闲路径活不过两拍(真机实锤:引入慢档探测当晚,路径 ~30s 一换代,
 	// 每条新路径重开 45 秒的填充判决期,28 包/秒的假流量比修复前只降了一半)。
 	probeGap atomic.Int64
+	// silenceHold 之前不判静默（UnixNano）：刚从慢档切上快档时，上一个字节本来就是
+	// 十几秒前的，要等这一拍的探测回来才有证据，见 probeLoop。
+	silenceHold atomic.Int64
 	// lastSent 是最后一次真正把字节写上线的时刻，供 heartbeatLoop 判断"现在是不是静默"。
 	lastSent atomic.Int64 // UnixNano
 	// lastPayload 是这条路径上最近一次真实载荷（任一方向）的时刻，hbGate 是心跳停着等它的地方。
@@ -544,19 +547,21 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 	// 慢一个数量级的路径上（单流 40 秒的测试里是 8.1MiB / 10%）。
 	// ★ 服务端的首探也按下面那条规则跳过——新路径刚建、还没有回程数据要送，
 	//   此刻的 RTT 无人使用（选回程路径要等真有响应要发）。
-	if shouldSendProbe(p.sess.isClient, p.sess.payloadRecent(probeActivityWindow),
-		p.sess.Draining()) {
+	if shouldSendProbe(p.sess.isClient, p.sess.payloadBusy(), p.sess.Draining()) {
 		p.sendProbe()
 	}
 	t := time.NewTimer(jitter(interval))
 	defer t.Stop()
 	for {
+		// 忙起来的那一刻不等慢档这一拍：要迁移的话 RTT 得是新的，要判死的话窗口得收回来。
+		busyEv := p.sess.busyEvent()
 		select {
 		case <-p.dead:
 			return
 		case <-p.sess.closed:
 			return
 		case <-t.C:
+		case <-busyEv:
 		}
 
 		p.reapProbes()
@@ -571,19 +576,23 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 		//   · RTT：`updateRTTLocked` 只从 `onProbeAck` 来，也就是 RTT 只服务于
 		//     "发探测的那一方"选路。服务端只在**往回送数据**时才需要挑路
 		//     （TCP 还是 QUIC），而回程数据只在手机醒着请求时才有 —— 那时
-		//     `payloadRecent` 为真，探测自然打开，RTT 当场就新鲜。手机睡着、
+		//     `payloadBusy` 为真，探测自然打开，RTT 当场就新鲜。手机睡着、
 		//     没有回程流量时，陈旧的 RTT 无人读取，探它纯属浪费 + 唤醒手机。
 		//   客户端不受此约束：它要尽早发现路径死好重连（用户在等），且要为
 		//   "用户下一秒恢复使用"备好新鲜 RTT，所以空闲也照探（15s 慢档）。
-		if shouldSendProbe(p.sess.isClient,
-			p.sess.payloadRecent(probeActivityWindow), p.sess.Draining()) {
+		if shouldSendProbe(p.sess.isClient, p.sess.payloadBusy(), p.sess.Draining()) {
 			p.sendProbe()
 		}
 
 		d := probeDelay(interval, idleInterval,
 			p.sess.activeStreams(),
-			p.sess.payloadRecent(probeActivityWindow),
+			p.sess.payloadBusy(),
 			p.sess.Draining())
+		// ★ 换到更短的档位时先留出一个探测超时。不留的话，下一拍判死窗口已经是 8 秒，
+		//   而上一个字节还是慢档那一拍的，活路径也会被判死。
+		if prev := p.probeGap.Load(); prev != 0 && int64(d) < prev {
+			p.silenceHold.Store(time.Now().Add(p.probeTimeout()).UnixNano())
+		}
 		p.probeGap.Store(int64(d))
 		t.Reset(jitter(d))
 	}
@@ -593,29 +602,29 @@ func (p *path) probeLoop(interval, idleInterval time.Duration) {
 //
 // ★ 客户端恒发（空闲也发，只是档位放慢）：它靠探测尽早判死以便重连，
 //   并为用户恢复使用备新鲜 RTT。
-// ★ 服务端只在会话有真实载荷（`payloadRecent`）时发：它的 RTT 只在送回程数据
-//   时才被读，而回程数据 ⟺ 客户端醒着请求 ⟺ payloadRecent 为真。空闲时服务端
+// ★ 服务端只在会话忙（`payloadBusy`）时发：它的 RTT 只在送回程数据时才被读，
+//   零星的回程数据用旧 RTT 选路没有代价。空闲时服务端
 //   主动探测只会唤醒睡着的手机、刷新一份无人读的 RTT。判死不受影响（见 probeLoop）。
 // ★ 排水中一律不发。
-func shouldSendProbe(isClient, payloadRecent, draining bool) bool {
+func shouldSendProbe(isClient, busy, draining bool) bool {
 	if draining {
 		return false
 	}
 	if isClient {
 		return true
 	}
-	return payloadRecent
+	return busy
 }
 
 // probeDelay 决定下一拍探测间隔。**纯函数，单测钉着。**
 //
-// ★★ 快档的判据是「有流开着 **且** 窗口内有真实载荷」——缺了后半句就是
+// ★★ 快档的判据是「有流开着 **且** 窗口内有成量的流量」——缺了后半句就是
 //   2026-08-29 真机那笔账：推送长连接 7×24 开着，每条路径永远 1s 一探，
 //   近零流量下 tide 链路 133 包/秒、手机核心 1300 唤醒/秒。
 //   细账见 probeActivityWindow 的注释。排水中的会话无条件慢档。
 func probeDelay(interval, idleInterval time.Duration,
-	streams int, payloadRecent, draining bool) time.Duration {
-	if draining || streams == 0 || !payloadRecent {
+	streams int, busy, draining bool) time.Duration {
+	if draining || streams == 0 || !busy {
 		return idleInterval
 	}
 	return interval
@@ -789,6 +798,9 @@ func (p *path) reapProbes() {
 // 已经丢了（比如服务端重启后 session_id 不认识了），探测可能仍然被回复，
 // 而流数据永远不会来。静默计时器不看语义，只看物理层面有没有字节，是更硬的证据。
 func (p *path) checkSilence() {
+	if time.Now().UnixNano() < p.silenceHold.Load() {
+		return
+	}
 	last := time.Unix(0, p.lastRecv.Load())
 	dead := silenceDeadline(time.Duration(p.probeGap.Load()))
 	if d := time.Since(last); d > dead {
@@ -805,8 +817,8 @@ func (p *path) checkSilence() {
 //   28 包/秒的假流量把慢档省下的又烧回去了。
 // ★ 快档(1s)下 max 取到 DefaultPathDeadAfter=8s，行为与从前逐字相同；
 //   慢档(15s)下 = 32s。代价：空闲路径真死时要 32s 才发现——空闲时没有用户
-//   数据在等它，检测慢是可以买的；一旦有流量,payloadRecent 把探测切回快档,
-//   判死窗口同拍回到 8s。
+//   数据在等它，检测慢是可以买的；一旦成量或者有流卡过 RTO，payloadBusy 把探测
+//   切回快档，判死窗口回到 8s。
 func silenceDeadline(probeGap time.Duration) time.Duration {
 	if d := probeGap*2 + DefaultProbeTimeout; d > DefaultPathDeadAfter {
 		return d

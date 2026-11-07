@@ -14,6 +14,39 @@ import "sync/atomic"
 // 所以这里的原则是：**循环只在有活的时候才有定时器**，没活就睡在 idleGate 上。
 // 判死、切网走的是路径探测（probeLoop），那条定时器一直在，不受这里影响。
 
+// busyMeter 判「真有成量的流量在走」。**不加锁**：note 在发送热路径上，
+// 窗口切换时的竞争最多让一次判定差几帧，门槛本来就是个量级。
+type busyMeter struct {
+	start  atomic.Int64 // 当前采样窗的起点（UnixNano）
+	weight atomic.Int64 // 窗内累计重量
+	last   atomic.Int64 // 最近一次判忙的时刻（UnixNano）
+}
+
+// note 记一帧载荷。返回 true 表示这一帧让会话从不忙变成忙。
+func (m *busyMeter) note(now int64, n int) bool {
+	if now-m.start.Load() > int64(probeBusySample) {
+		m.start.Store(now)
+		m.weight.Store(0)
+	}
+	if m.weight.Add(int64(n)+probeFrameWeight) < probeBusyWeight {
+		return false
+	}
+	return m.mark(now)
+}
+
+// mark 无条件判忙，返回 true 表示这是从不忙到忙的边沿。
+func (m *busyMeter) mark(now int64) bool {
+	was := m.active(now)
+	m.last.Store(now)
+	return !was
+}
+
+// active 报告 probeActivityWindow 内判过忙没有。零值恒 false。
+func (m *busyMeter) active(now int64) bool {
+	t := m.last.Load()
+	return t != 0 && now-t < int64(probeActivityWindow)
+}
+
 // idleGate 给**单个**消费者用：循环发现没活就 park，生产者有活就 kick。
 //
 // 生产方在发送热路径上（每帧一次），所以 kick 在循环醒着时只有一次原子读。

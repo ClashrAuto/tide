@@ -64,10 +64,13 @@ type Session struct {
 	resumes atomic.Uint64
 	// dgramBytes 是全会话所有 UDP 关联收队列里的载荷字节数（见 maxSessionDatagramBytes）。
 	dgramBytes atomic.Int64
-	// lastPayload 是最近一次**真实载荷**（流数据/数据报，任一方向）的 UnixNano。
+	// busy 量**真实载荷**（流数据/数据报，任一方向）够不够量。
 	// 探测分档的判据（见 path.probeLoop 与 probeActivityWindow 的注释）：
-	// "有流开着" ≠ "有流量在走"，推送长连接会把前者永远钉成真。
-	lastPayload atomic.Int64
+	// "有流开着" ≠ "有流量在走"，推送长连接会把前者永远钉成真，心跳同理。
+	busy busyMeter
+	// busyEv 在从不忙变成忙的那一刻关闭并换新，见 busyEvent。
+	busyMu sync.Mutex
+	busyEv chan struct{}
 	// rtoGate / rebalGate 让重传扫描与 rebalance 在没活时停掉定时器，见 idle.go。
 	rtoGate   idleGate
 	rebalGate idleGate
@@ -111,6 +114,7 @@ func newSession(id [16]byte, isClient bool, window uint64, grace, probeIvl time.
 		ctrlOut:   make(chan pendingCtrl, 64),
 		closed:    make(chan struct{}),
 		pathEv:    make(chan struct{}),
+		busyEv:    make(chan struct{}),
 	}
 	s.rtoGate.init()
 	s.rebalGate.init()
@@ -154,8 +158,33 @@ func (s *Session) LocalAddr() net.Addr {
 
 func (s *Session) activeStreams() int { return int(s.streamCount.Load()) }
 
-func (s *Session) notePayload() {
-	s.lastPayload.Store(time.Now().UnixNano())
+func (s *Session) notePayload(n int) {
+	if s.busy.note(time.Now().UnixNano(), n) {
+		s.fireBusy()
+	}
+}
+
+// noteStalled 记下有流卡过了 RTO：不管流量多小，这时候都有人在等，当场切快档。
+// 路径如果真死了，探测回不来，判死窗口也跟着快档收回到 8 秒。
+func (s *Session) noteStalled() {
+	if s.busy.mark(time.Now().UnixNano()) {
+		s.fireBusy()
+	}
+}
+
+// busyEvent 返回一个在会话下一次忙起来时关闭的通道。⚠️ 先取通道、再看状态。
+func (s *Session) busyEvent() <-chan struct{} {
+	s.busyMu.Lock()
+	defer s.busyMu.Unlock()
+	return s.busyEv
+}
+
+// ★ 用自己的锁，不用 s.mu：这里从发送路径上来，调用方可能拿着流的锁。
+func (s *Session) fireBusy() {
+	s.busyMu.Lock()
+	close(s.busyEv)
+	s.busyEv = make(chan struct{})
+	s.busyMu.Unlock()
 	s.rebalGate.kick()
 }
 
@@ -182,11 +211,8 @@ func (s *Session) firePathEventLocked() {
 	s.pathEv = make(chan struct{})
 }
 
-// payloadRecent 报告窗口内有没有真实载荷流过（任一方向）。
-func (s *Session) payloadRecent(window time.Duration) bool {
-	t := s.lastPayload.Load()
-	return t != 0 && time.Since(time.Unix(0, t)) < window
-}
+// payloadBusy 报告最近有没有成量的流量，见 busyMeter 与 probeActivityWindow。
+func (s *Session) payloadBusy() bool { return s.busy.active(time.Now().UnixNano()) }
 
 // Draining 报告会话是否处于排水模式。
 func (s *Session) Draining() bool { return s.draining.Load() }
@@ -503,7 +529,7 @@ func (s *Session) rebalanceLoop() {
 	defer t.Stop()
 	// 迁移的是「正在走字节的流」，没有载荷就没有东西可迁，定时器一起停掉（见 idle.go）。
 	// 路径变差、判死不靠这里：那两件事 onPathState / onPathDead 当场处理。
-	busy := func() bool { return s.payloadRecent(probeActivityWindow) }
+	busy := s.payloadBusy
 	for {
 		select {
 		case <-s.closed:
@@ -735,7 +761,7 @@ func (s *Session) sendOnStream(st *Stream, t FrameType, flags uint8, payload []b
 	// 控制帧不算：推送长连接空闲时也在稀疏地 ACK，算进去判据就又被钉死了。
 	isPayload := t == FrameStreamData || t == FrameDatagram
 	if isPayload {
-		s.notePayload()
+		s.notePayload(len(payload))
 	}
 	// 这两种帧发出去就得等确认。放在选路之前：没路径时这些字节照样算在途，要靠重传扫描收尾。
 	if t == FrameStreamData || t == FrameStreamOpen {
@@ -970,7 +996,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 	case FrameStreamOpen:
 		return s.onStreamOpen(p, f)
 	case FrameStreamData:
-		s.notePayload()
+		s.notePayload(len(f.Payload))
 		p.notePayload()
 		off, n := ReadVarint(f.Payload)
 		if n == 0 {
@@ -1027,7 +1053,7 @@ func (s *Session) handleFrame(p *path, f Frame) error {
 			st.pathID.Store(p.id)
 		}
 	case FrameDatagram:
-		s.notePayload()
+		s.notePayload(len(f.Payload))
 		p.notePayload()
 		return s.onDatagram(f)
 	case FrameTicketRepl:
@@ -1179,6 +1205,9 @@ func (s *Session) retransmitLoop() {
 		}
 		s.mu.Unlock()
 
+		if len(stuck) > 0 {
+			s.noteStalled()
+		}
 		for _, st := range stuck {
 			st.noteRewind(now)
 			s.resumeStream(st)

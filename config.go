@@ -16,19 +16,30 @@ const (
 	DefaultProbeInterval     = 1 * time.Second
 	DefaultIdleProbeInterval = 15 * time.Second
 
-	// probeActivityWindow：最近这么久内有**真实载荷**（流数据/数据报，任一方向）
-	// 才算"活跃"，探测走快档。
+	// probeActivityWindow：最近这么久内**判过忙**（见 busyMeter）才算"活跃"，探测走快档。
 	//
 	// ★★ 判据必须是"有字节在走"，不能是"有流开着"——手机上推送长连接
 	//   （mtalk.google.com / Apple push）7×24 开着不关，按流数判的话每条路径
 	//   永远踩死在 1s 快档上。2026-08-29 真机实测（Android 日用机 ↔ macOS 配对电脑）：
 	//   tun 近乎零流量时 tide 链路仍有 133 包/秒、66 KB/s 纯协议流量，
 	//   手机核心 1300 唤醒/秒（成本模型预期的 35 倍）——正是这一档踩死的账。
+	// ★★ 「有字节」也不够：2026-11-07 真机（Mac 隧道静态）每 10 秒只走两三百字节的心跳，
+	//   就把 4 条路径钉在 1s 快档上。来回的探测占了每秒 28 簇活动里的 12 簇，
+	//   而每簇要付 8 次线程唤醒。所以这里要的是「量」，心跳不算数。
+	//   有流量但不够量时，路径死了靠 retransmitLoop 发现：有流卡过 RTO 当场切快档。
 	// ★ 30s 的取值：交互流量的自然停顿（读网页、打字）大多在这个窗口内，
-	//   快档探测的意义（迁移判据要新鲜 RTT）在这段里保得住；超过 30s 没有一个
-	//   真实字节，"迁移判据的新鲜度"就没有服务对象了，退到 15s 慢档，
-	//   流量一回来下一拍立刻切回快档（最坏迟 15s 拿到新 RTT 样本）。
+	//   快档探测的意义（迁移判据要新鲜 RTT）在这段里保得住；超过 30s 没有成量的流量，
+	//   "迁移判据的新鲜度"就没有服务对象了，退到 15s 慢档，
+	//   流量一回来当场切回快档。
 	probeActivityWindow = 30 * time.Second
+
+	// probeBusySample / probeBusyWeight：一个采样窗内累计到这个重量才算「忙」。
+	// 64 KiB / 5s：比单次页面请求小得多，比真机上最大的心跳毛刺（22~27 KB/10s）大。
+	probeBusySample = 5 * time.Second
+	probeBusyWeight = 64 << 10
+	// probeFrameWeight：每帧另记的重量。语音这类小包高频的流字节不多，但用户在等它，
+	// 25 帧/秒就够得着门槛；心跳的帧数差着几个数量级。
+	probeFrameWeight = 512
 	// heartbeatActivityWindow：一条路径上最后一个真实载荷之后，判决窗口的心跳还填多久。
 	// 心跳填的是「请求—等待—响应」之间的静默，3 秒盖得住一次交互里的等待；
 	// 再往后路径就是真空闲了，见 path.heartbeatLoop。

@@ -44,11 +44,11 @@ func TestProbeDelayJudgesPayloadNotStreamCount(t *testing.T) {
 func TestPayloadRecentZeroValueIsIdle(t *testing.T) {
 	s := newSession([16]byte{1}, true, 1<<20, time.Minute, time.Second, 64)
 	defer s.closeWith(ErrClosed)
-	if s.payloadRecent(time.Hour) {
+	if s.payloadBusy() {
 		t.Fatal("从没有过载荷的会话不该被判成活跃")
 	}
-	s.notePayload()
-	if !s.payloadRecent(time.Second) {
+	s.notePayload(probeBusyWeight)
+	if !s.payloadBusy() {
 		t.Fatal("刚记过载荷却判成空闲")
 	}
 }

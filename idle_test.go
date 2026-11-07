@@ -291,9 +291,10 @@ func TestSmallWriteIsAckedNotRetransmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	srvs := onlyServerSession(t, h)
+	cp, sp := sess.pathsSnapshot()[0], onlyServerPath(t, h)
 	time.Sleep(300 * time.Millisecond)
 	echoOnce(t, c, 64)
-	last, srvLast := sess.lastPayload.Load(), srvs.lastPayload.Load()
+	last, srvLast := cp.lastPayload.Load(), sp.lastPayload.Load()
 
 	// 第一次 RTO 在 500ms 上下，这段时间足够旧行为重发两三轮。
 	time.Sleep(2 * time.Second)
@@ -301,7 +302,7 @@ func TestSmallWriteIsAckedNotRetransmitted(t *testing.T) {
 	if n := sess.resumes.Load() + srvs.resumes.Load(); n != 0 {
 		t.Fatalf("没有丢任何东西，却重发了 %d 次：小写操作没有被确认", n)
 	}
-	if sess.lastPayload.Load() != last || srvs.lastPayload.Load() != srvLast {
+	if cp.lastPayload.Load() != last || sp.lastPayload.Load() != srvLast {
 		t.Fatal("没有新数据，lastPayload 却在涨：重发被算成了真实载荷，探测会被钉回快档")
 	}
 }
@@ -552,7 +553,7 @@ func TestRebalanceLoopParksAndWakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "rebalance 没停", 3*time.Second, sess.rebalGate.parked.Load)
-	sess.notePayload()
+	sess.notePayload(probeBusyWeight)
 	waitFor(t, "rebalance 没有被载荷叫醒", time.Second, func() bool { return !sess.rebalGate.parked.Load() })
 }
 
